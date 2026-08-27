@@ -32,10 +32,11 @@ class ModelSpec:
 
 def load_model_specs(config: dict[str, Any]) -> dict[str, ModelSpec]:
     """将 JSON 配置转换为强类型模型定义。"""
-    defaults = config.get("defaults", {}).get("model", {})
     result: dict[str, ModelSpec] = {}
     for model_id, raw in config.get("models", {}).items():
-        values = {**defaults, **raw}
+        if not isinstance(raw, dict):
+            raise ValueError(f"模型 {model_id} 配置必须是对象")
+        values = dict(raw)
         known = {key: values.pop(key) for key in list(values) if key in {
             "path", "engine", "model_type", "quantization", "dtype", "max_model_len",
             "tensor_parallel_size", "trust_remote_code", "estimated_vram_mb", "lora",

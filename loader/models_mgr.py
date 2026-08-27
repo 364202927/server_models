@@ -8,11 +8,12 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any
 
-from ..hardware import detect_hardware
+from ..hardware import check_gpu_memory, check_ram, detect_hardware
 from ..utils.common import readFile
 from .base import GenerationResult, ModelLoader
 from .factory import create_loader
 from .cache import save_snapshot
+from .lora import load_lora
 from .model_spec import ModelSpec, load_model_specs
 
 
@@ -68,17 +69,16 @@ class ModelsMgr:
         required = spec.estimated_vram_mb
         if required is None:
             return True
-        hardware = detect_hardware()
-        free = sum(gpu.memory_free_mb for gpu in hardware.gpus)
         reserve = int(self.settings.get("sleep", {}).get("gpu_reserve_mb", 512))
-        return free >= required + reserve
+        return check_gpu_memory(required, reserve).allowed
 
     def _reclaim(self, exclude: str) -> None:
         candidates = [item for key, item in self.runtime.items()
                       if key != exclude and item.loader and not item.active and item.state == "RUNNING"]
         candidates.sort(key=lambda item: (item.last_used_at, -(item.loader.memory_usage().gpu_allocated_mb)))
         for item in candidates:
-            if item.loader and item.loader.sleep_to_ram():
+            ram_reserve = int(self.settings.get("sleep", {}).get("ram_reserve_mb", 8192))
+            if item.loader and self.settings.get("sleep", {}).get("ram_enabled", True) and check_ram(int(item.spec.estimated_vram_mb or 0), ram_reserve).allowed and item.loader.sleep_to_ram():
                 item.state = "SLEEPING_RAM"
                 item.sleep_location = "ram"
             else:
@@ -110,6 +110,7 @@ class ModelsMgr:
                     tensor_parallel_size=runtime.spec.tensor_parallel_size,
                     trust_remote_code=runtime.spec.trust_remote_code,
                 )
+                load_lora(runtime.loader, runtime.spec.lora)
                 runtime.state, runtime.error = "RUNNING", None
                 runtime.last_used_at = time.time()
                 return runtime

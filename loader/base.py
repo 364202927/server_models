@@ -144,6 +144,14 @@ class ModelLoader(ABC):
     def supports_kv_cache_persistence(self) -> bool:
         return False
 
+    def load_lora(self, paths: list[str]) -> None:
+        """加载适配器；具体引擎不支持时显式报告，避免静默误用。"""
+        raise NotImplementedError("当前模型引擎不支持 LoRA")
+
+    def unload_lora(self) -> None:
+        """卸载已加载的适配器。"""
+        return None
+
     def memory_usage(self, verbose: bool = False) -> MemoryUsage:
         """
         检测当前模型内存/显存占用

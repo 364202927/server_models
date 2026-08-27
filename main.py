@@ -19,11 +19,12 @@ if __package__ in (None, ""):
 else:
     from .hardware import detect_hardware
     from .loader import ModelsMgr
-    from .utils.server import ChatRequest, response
+from .utils.server import ChatRequest, response
+from .utils.request_queue import RequestQueue
 
 
 manager = ModelsMgr(str(Path(__file__).resolve().parent / "assets" / "models.json"))
-_queue_lock = asyncio.Lock()
+_queue = RequestQueue()
 
 
 def _check_key(provided: str | None) -> None:
@@ -58,9 +59,11 @@ async def chat(request: ChatRequest, x_api_key: str | None = Header(default=None
     _check_key(x_api_key)
     if request.stream:
         return response(request.model, request.special, "error", "stream 暂未实现")
-    async with _queue_lock:  # 单用户串行：避免生成期间切换模型或竞争 KV Cache。
+    async def operation() -> dict:
         if request.special == 1001:
-            return response(request.model, request.special, "ok", manager.status())
+            value = manager.status()
+            value["queue_length"] = _queue.length
+            return response(request.model, request.special, "ok", value)
         if request.special == 1002:
             return response(request.model, request.special, "ok", detect_hardware().to_dict())
         if request.special == 1003:
@@ -91,6 +94,7 @@ async def chat(request: ChatRequest, x_api_key: str | None = Header(default=None
                                    "time_seconds": result.time_seconds, "tokens_per_second": result.tokens_per_second})
         except (KeyError, RuntimeError, MemoryError) as exc:
             return response(request.model, 0, "error", str(exc))
+    return await _queue.run(operation)
 
 
 if __name__ == "__main__":

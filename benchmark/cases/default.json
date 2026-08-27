@@ -1,0 +1,10 @@
+{
+  "cases": [
+    {
+      "id": "json_output",
+      "prompt": "Return a JSON object with a field named signal.",
+      "checks": [{"type": "json"}],
+      "pass_score": 60
+    }
+  ]
+}

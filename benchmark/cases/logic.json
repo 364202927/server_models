@@ -1,0 +1,1 @@
+{"cases": [{"id": "logic_001", "prompt": "Explain the implication clearly.", "checks": [{"type": "min_length", "value": 20}], "pass_score": 60}]}

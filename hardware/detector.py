@@ -94,7 +94,19 @@ def detect_memory() -> MemoryInfo:
         mem = psutil.virtual_memory()
         return MemoryInfo(int(mem.total / (1024 ** 2)), int(mem.available / (1024 ** 2)))
     except ImportError:
-        return MemoryInfo(0, 0)
+        pass
+    if platform.system() == "Linux":
+        try:
+            values: dict[str, int] = {}
+            with open("/proc/meminfo", encoding="utf-8") as file:
+                for line in file:
+                    key, value = line.split(":", 1)
+                    if key in {"MemTotal", "MemAvailable"}:
+                        values[key] = int(value.split()[0])
+            return MemoryInfo(values.get("MemTotal", 0), values.get("MemAvailable", 0))
+        except (OSError, ValueError):
+            pass
+    return MemoryInfo(0, 0)
 
 
 def detect_hardware() -> HardwareInfo:
