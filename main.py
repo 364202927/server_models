@@ -6,7 +6,7 @@ import asyncio
 import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import AsyncIterator
+from typing import AsyncGenerator
 
 from fastapi import FastAPI, Header, HTTPException
 
@@ -34,7 +34,7 @@ def _check_key(provided: str | None) -> None:
 
 
 @asynccontextmanager
-async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+async def lifespan(_: FastAPI) -> AsyncGenerator[None, None]:
     async def reaper() -> None:
         while True:
             await asyncio.sleep(30)
