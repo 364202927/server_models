@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import sys
 from pathlib import Path
-
 if __package__ in (None, ""):
     # 直接执行 ``python main.py`` 时把项目父目录加入导入路径。
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
