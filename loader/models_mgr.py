@@ -120,11 +120,14 @@ class ModelsMgr:
                                     quantization=runtime.spec.quantization,
                                     **runtime.spec.load.loader_kwargs())
                 load_lora(runtime.loader, runtime.spec.lora)
-                # 引擎可能从模型文件解析真实上下文长度；将最终生效值写回 load。
+                # 引擎可能从模型文件解析真实上下文长度；仅在未配置 load 时
+                # 记录这次成功加载所采用的参数，避免每次请求都改写 models.json。
                 info = runtime.loader.model_info
                 if info and runtime.spec.load.context_length is None and info.context_length:
                     runtime.spec.load.context_length = info.context_length
-                self._persist_spec(runtime.spec)
+                if not runtime.spec.load_configured:
+                    self._persist_spec(runtime.spec)
+                    runtime.spec.load_configured = True
                 runtime.state, runtime.error = "RUNNING", None
                 runtime.last_used_at = time.time()
                 return runtime

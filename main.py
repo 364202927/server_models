@@ -10,15 +10,15 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     from ai.loader import ModelsMgr
     from ai.utils.paths import MODELS_FILE
-    from ai.utils.server import ModelServer
+    from ai.utils.serverApi import serverApi
 else:
     from .loader import ModelsMgr
     from .utils.paths import MODELS_FILE
-    from .utils.server import ModelServer
+    from .utils.serverApi import serverApi
 
 
 manager = ModelsMgr(str(MODELS_FILE))
-server = ModelServer(manager)
+server = serverApi(manager)
 app = server.app
 
 

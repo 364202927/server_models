@@ -1,4 +1,4 @@
-from ai.utils.server import ChatRequest
+from ai.utils.serverApi import ChatRequest
 
 
 def test_request_defaults() -> None:

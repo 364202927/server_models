@@ -8,8 +8,9 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
+from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, TypeVar
 
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -17,7 +18,33 @@ from pydantic import BaseModel, Field
 
 from ..hardware import detect_hardware
 from ..loader.models_mgr import ModelsMgr
-from .request_queue import RequestQueue
+
+
+T = TypeVar("T")
+
+
+class RequestQueue:
+    """单用户 FIFO 请求队列。
+
+    队列和 API 生命周期绑定，确保模型加载、休眠、卸载及生成不会并发
+    操作同一个 GPU/CPU 资源。这样可以避免单用户场景下的竞态和显存峰值。
+    """
+
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._pending = 0
+
+    @property
+    def length(self) -> int:
+        return self._pending
+
+    async def run(self, operation: Callable[[], Awaitable[T]]) -> T:
+        self._pending += 1
+        try:
+            async with self._lock:
+                return await operation()
+        finally:
+            self._pending -= 1
 
 
 class ChatRequest(BaseModel):
@@ -35,7 +62,7 @@ def response(model: str, special: int, status: str, value: Any, **extra: Any) ->
             "special": special, "response": payload, **extra}
 
 
-class ModelServer:
+class serverApi:
     """可嵌入或独立运行的 FastAPI 服务，写法对应旧项目 ``webPort.web``。"""
 
     def __init__(self, manager: ModelsMgr) -> None:
@@ -105,6 +132,8 @@ class ModelServer:
                 await asyncio.to_thread(self.manager.ensure_loaded, request.model)
                 return response(request.model, request.special, "ok", "操作成功")
 
+            # API 层只负责解析 deploy 并交给 ModelsMgr；models.json 的首次加载
+            # 参数回写只发生在 ModelsMgr.ensure_loaded 的成功路径。
             load_changes = {key: value for key, value in request.deploy.items() if key in {
                 "engine", "dtype", "context_length", "gpu_offload_layers", "batch_size",
                 "flash_attention", "draft_model", "speculative_decoding", "tensor_parallel",
@@ -131,7 +160,7 @@ class ModelServer:
             return response(request.model, request.special, "error", str(exc))
 
     async def run(self) -> None:
-        """按照配置启动 Uvicorn，供 ``asyncio.run(ModelServer.run())`` 调用。"""
+        """按照配置启动 Uvicorn，供 ``asyncio.run(serverApi.run())`` 调用。"""
         import uvicorn
 
         settings = self.manager.settings.get("server", {})
@@ -141,5 +170,6 @@ class ModelServer:
         await self._server.serve()
 
 
-# 兼容旧 webPort 模块以小写 web 表示服务对象的调用习惯。
-web = ModelServer
+# 兼容旧代码：新入口使用 ``serverApi``，旧调用仍可使用 ``ModelServer``/``web``。
+ModelServer = serverApi
+web = serverApi

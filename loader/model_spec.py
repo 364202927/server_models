@@ -59,6 +59,9 @@ class ModelSpec:
     lora: list[dict[str, Any]] = field(default_factory=list)
     load: ModelLoadConfig = field(default_factory=ModelLoadConfig)
     extra: dict[str, Any] = field(default_factory=dict)
+    # 仅用于决定是否在首次成功加载后回写 ``load``；不写入 JSON。
+    # 放在末尾以保持既有位置参数调用的兼容性。
+    load_configured: bool = True
 
     @property
     def path_obj(self) -> Path:
@@ -96,6 +99,7 @@ def load_model_specs(config: dict[str, Any]) -> dict[str, ModelSpec]:
             raise ValueError(f"模型 {model_id} 配置必须是对象")
         if not raw.get("path"):
             raise ValueError(f"模型 {model_id} 缺少 path 配置")
+        raw_load = raw.get("load")
         result[str(model_id)] = ModelSpec(
             model_id=str(model_id),
             path=str(raw["path"]),
@@ -103,7 +107,14 @@ def load_model_specs(config: dict[str, Any]) -> dict[str, ModelSpec]:
             quantization=raw.get("quantization"),
             estimated_vram_mb=raw.get("estimated_vram_mb"),
             lora=list(raw.get("lora", [])),
-            load=ModelLoadConfig.from_dict(raw.get("load")),
+            load=ModelLoadConfig.from_dict(raw_load),
+            # 只有明确提供了至少一个 load 参数，才视为固定配置。
+            # 缺失或空对象表示让引擎读取模型默认值，成功后由 ModelsMgr 回写实际参数。
+            load_configured=isinstance(raw_load, dict)
+            and any(
+                key in ModelLoadConfig.__dataclass_fields__ and raw_load[key] is not None
+                for key in raw_load
+            ),
             extra={key: value for key, value in raw.items() if key not in known},
         )
     return result
