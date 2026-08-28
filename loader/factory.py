@@ -8,8 +8,9 @@ from .vllm_loader import VLLMLoader
 
 def create_loader(spec: ModelSpec) -> ModelLoader:
     """根据模型引擎创建统一 Loader。"""
-    if spec.engine.lower() in {"hf", "transformers", "huggingface"}:
+    engine = spec.load.engine.lower()
+    if engine in {"hf", "transformers", "huggingface"}:
         return HFLoader()
-    if spec.engine.lower() == "vllm":
+    if engine == "vllm":
         return VLLMLoader()
-    raise ValueError(f"不支持的模型引擎: {spec.engine}")
+    raise ValueError(f"不支持的模型引擎: {spec.load.engine}")

@@ -6,15 +6,16 @@ import threading
 import time
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
-from ..hardware import check_gpu_memory, check_ram, detect_hardware
-from ..utils.common import readFile
+from ..hardware import check_gpu_memory, check_ram
+from ..utils.common import readFile, writeFile
 from .base import GenerationResult, ModelLoader
 from .factory import create_loader
 from .cache import save_snapshot
 from .lora import load_lora
-from .model_spec import ModelSpec, load_model_specs
+from .model_spec import ModelLoadConfig, ModelSpec, load_model_specs
 
 
 @dataclass
@@ -32,7 +33,7 @@ class RuntimeModel:
         return {
             "id": self.spec.model_id,
             "state": self.state,
-            "engine": self.spec.engine,
+            "engine": self.spec.load.engine,
             "path": self.spec.path,
             "last_used_at": datetime.fromtimestamp(self.last_used_at, tz=timezone.utc).isoformat(),
             "gpu_memory_mb": usage.gpu_allocated_mb if usage else 0,
@@ -45,11 +46,15 @@ class ModelsMgr:
     """串行场景下的模型注册表和运行时实例管理器。"""
 
     def __init__(self, config_path: str = "assets/models.json") -> None:
-        config = readFile(config_path) or {}
+        self.config_path = Path(config_path)
+        config = readFile(str(self.config_path)) or {}
+        if not isinstance(config, dict):
+            raise ValueError("models.json 根节点必须是对象")
+        self._config: dict[str, Any] = config
         self.settings: dict[str, Any] = config.get("defaults", {})
         self.specs: dict[str, ModelSpec] = load_model_specs(config)
         self.runtime: dict[str, RuntimeModel] = {}
-        self.asset_root = str(config_path).rsplit("/", 1)[0] or "."
+        self.asset_root = str(self.config_path.parent)
         self._lock = threading.RLock()
 
     def list_models(self) -> list[dict[str, Any]]:
@@ -71,6 +76,15 @@ class ModelsMgr:
             return True
         reserve = int(self.settings.get("sleep", {}).get("gpu_reserve_mb", 512))
         return check_gpu_memory(required, reserve).allowed
+
+    def _persist_spec(self, spec: ModelSpec) -> None:
+        """原子更新该模型配置，避免加载成功但 JSON 被半写入。"""
+        models = self._config.setdefault("models", {})
+        models[spec.model_id] = spec.to_config_dict()
+        # 临时文件保留 .json 后缀，复用 writeFile 的 JSON 序列化分支。
+        tmp_path = self.config_path.with_name(f".{self.config_path.stem}.tmp.json")
+        writeFile(self._config, str(tmp_path))
+        tmp_path.replace(self.config_path)
 
     def _reclaim(self, exclude: str) -> None:
         candidates = [item for key, item in self.runtime.items()
@@ -102,15 +116,15 @@ class ModelsMgr:
                 if not self._free_for(runtime.spec):
                     raise MemoryError(f"模型 {model_id} 预计显存不足，拒绝加载")
                 runtime.loader = create_loader(runtime.spec)
-                runtime.loader.load(
-                    runtime.spec.path,
-                    quantization=runtime.spec.quantization,
-                    dtype=runtime.spec.dtype,
-                    max_model_len=runtime.spec.max_model_len,
-                    tensor_parallel_size=runtime.spec.tensor_parallel_size,
-                    trust_remote_code=runtime.spec.trust_remote_code,
-                )
+                runtime.loader.load(runtime.spec.path,
+                                    quantization=runtime.spec.quantization,
+                                    **runtime.spec.load.loader_kwargs())
                 load_lora(runtime.loader, runtime.spec.lora)
+                # 引擎可能从模型文件解析真实上下文长度；将最终生效值写回 load。
+                info = runtime.loader.model_info
+                if info and runtime.spec.load.context_length is None and info.context_length:
+                    runtime.spec.load.context_length = info.context_length
+                self._persist_spec(runtime.spec)
                 runtime.state, runtime.error = "RUNNING", None
                 runtime.last_used_at = time.time()
                 return runtime
@@ -135,8 +149,9 @@ class ModelsMgr:
 
     def reconfigure(self, model_id: str, changes: dict[str, Any]) -> RuntimeModel:
         """应用会影响模型创建的参数；如模型正在运行则先安全卸载再加载。"""
-        load_keys = {"engine", "dtype", "quantization", "max_model_len", "tensor_parallel_size",
-                     "trust_remote_code"}
+        load_keys = {"engine", "dtype", "context_length", "gpu_offload_layers", "batch_size",
+                     "flash_attention", "draft_model", "speculative_decoding", "tensor_parallel", "gpu_split",
+                     "trust_remote_code", "quantization"}
         if not changes or not load_keys.intersection(changes):
             return self._get_runtime(model_id)
         with self._lock:
@@ -145,7 +160,11 @@ class ModelsMgr:
                 raise RuntimeError("模型当前正在生成，不能修改加载参数")
             self._unload_runtime(model_id)
             spec = self.specs[model_id]
-            self.specs[model_id] = replace(spec, **{key: changes[key] for key in load_keys if key in changes})
+            load_values = {key: changes[key] for key in load_keys if key in changes and key != "quantization"}
+            changed_spec = replace(spec,
+                                   quantization=changes.get("quantization", spec.quantization),
+                                   load=replace(spec.load, **load_values))
+            self.specs[model_id] = changed_spec
             try:
                 return self.ensure_loaded(model_id)
             except Exception:
@@ -158,6 +177,9 @@ class ModelsMgr:
             if runtime.active or not runtime.loader:
                 return False
             if runtime.loader.sleep_to_ram():
+                if self.settings.get("cache", {}).get("state_snapshot_enabled", True):
+                    save_snapshot(self.asset_root, runtime.spec, state="SLEEPING_RAM",
+                                  last_used_at=runtime.last_used_at)
                 runtime.state, runtime.sleep_location = "SLEEPING_RAM", "ram"
                 return True
             return self.unload(model_id)

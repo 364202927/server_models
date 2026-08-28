@@ -49,6 +49,28 @@ def readFile(pathFile: str, model: str = "r") -> Any:
     return readers[fileType]() if fileType in readers else False
 
 
+def writeFile(data: Any, pathFile: str, model: str = "w") -> bool:
+    """写入项目配置文件；目前 JSON/JSONL/TXT 为主要用途。"""
+    directory = os.path.dirname(pathFile)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    fileType, _ = getFileExtension(pathFile)
+    if fileType == "json":
+        with open(pathFile, model, encoding="utf-8") as file:
+            json.dump(data, file, ensure_ascii=False, indent=2)
+        return True
+    if fileType == "jsonl":
+        with open(pathFile, model, encoding="utf-8") as file:
+            for item in data:
+                file.write(json.dumps(item, ensure_ascii=False, default=str) + "\n")
+        return True
+    if fileType == "txt":
+        with open(pathFile, model, encoding="utf-8") as file:
+            file.write(str(data))
+        return True
+    return False
+
+
 def _read_json(pathFile: str, model: str) -> Any:
     with open(pathFile, model, encoding="utf-8") as file:
         return json.load(file)

@@ -37,15 +37,26 @@ class MemoryInfo:
 
 
 @dataclass(frozen=True)
+class CPUInfo:
+    name: str
+    cores: int
+    threads: int
+    architecture: str
+
+
+@dataclass(frozen=True)
 class HardwareInfo:
     gpus: list[GPUInfo]
     memory: MemoryInfo
     platform: str
-    cpu_name: str
-    cpu_cores: int
+    cpu: CPUInfo
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+    @property
+    def cpu_cores(self) -> int:
+        return self.cpu.cores
 
 
 def detect_gpu() -> list[GPUInfo]:
@@ -110,8 +121,9 @@ def detect_memory() -> MemoryInfo:
 
 
 def detect_hardware() -> HardwareInfo:
-    return HardwareInfo(detect_gpu(), detect_memory(), f"{platform.system()} {platform.release()}",
-                        platform.processor() or "Unknown", os.cpu_count() or 1)
+    threads = os.cpu_count() or 1
+    cpu = CPUInfo(platform.processor() or "Unknown", threads, threads, platform.machine())
+    return HardwareInfo(detect_gpu(), detect_memory(), f"{platform.system()} {platform.release()}", cpu)
 
 
 def print_hardware_info(info: HardwareInfo | None = None) -> None:
