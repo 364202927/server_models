@@ -86,7 +86,7 @@ class MsgHandler:
             if deploy:
                 load_keys = {"engine", "dtype", "context_length", "gpu_offload_layers", "batch_size",
                              "flash_attention", "draft_model", "speculative_decoding", "tensor_parallel",
-                             "gpu_split", "trust_remote_code", "quantization"}
+                             "gpu_split", "trust_remote_code"}
                 changes = {key: value for key, value in deploy.items() if key in load_keys}
                 if changes:
                     await asyncio.to_thread(self.manager.reconfigure, model, changes)

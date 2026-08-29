@@ -9,8 +9,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from ..hardware import check_gpu_memory, check_ram
-from ..utils.common import readFile, writeFile
+from ..hardware import check_gpu_memory, check_ram, detect_gpu
+from ..utils.common import info as log_info, readFile, writeFile
 from .base import GenerationResult, ModelLoader
 from .factory import create_loader
 from .cache import save_snapshot
@@ -33,8 +33,8 @@ class RuntimeModel:
         return {
             "id": self.spec.model_id,
             "state": self.state,
-            "engine": self.spec.load.engine,
             "path": self.spec.path,
+            "estimated_vram_mb": self.spec.estimated_vram_mb,
             "last_used_at": datetime.fromtimestamp(self.last_used_at, tz=timezone.utc).isoformat(),
             "gpu_memory_mb": usage.gpu_allocated_mb if usage else 0,
             "sleep_location": self.sleep_location,
@@ -52,6 +52,12 @@ class ModelsMgr:
             raise ValueError("models.json 根节点必须是对象")
         self._config: dict[str, Any] = config
         self.settings: dict[str, Any] = config.get("defaults", {})
+        if not isinstance(self.settings, dict):
+            self.settings = {}
+        # 兼容旧配置：缓存现在按模型配置，sleep.enabled 由 idle_timeout_sec 是否为 0 决定。
+        self.settings.pop("cache", None)
+        if isinstance(self.settings.get("sleep"), dict):
+            self.settings["sleep"].pop("enabled", None)
         self.specs: dict[str, ModelSpec] = load_model_specs(config)
         self.runtime: dict[str, RuntimeModel] = {}
         self.asset_root = str(self.config_path.parent)
@@ -73,6 +79,9 @@ class ModelsMgr:
     def _free_for(self, spec: ModelSpec) -> bool:
         required = spec.estimated_vram_mb
         if required is None:
+            return True
+        # 无 CUDA/NVIDIA 环境时允许后端自行决定 CPU 加载，不能因显存估算阻断调试运行。
+        if not detect_gpu():
             return True
         reserve = int(self.settings.get("sleep", {}).get("gpu_reserve_mb", 512))
         return check_gpu_memory(required, reserve).allowed
@@ -116,21 +125,31 @@ class ModelsMgr:
                 if not self._free_for(runtime.spec):
                     raise MemoryError(f"模型 {model_id} 预计显存不足，拒绝加载")
                 runtime.loader = create_loader(runtime.spec)
-                runtime.loader.load(runtime.spec.path,
-                                    quantization=runtime.spec.quantization,
-                                    **runtime.spec.load.loader_kwargs())
+                runtime.loader.load(runtime.spec.path, **runtime.spec.load.loader_kwargs())
                 load_lora(runtime.loader, runtime.spec.lora)
-                # Loader 返回实际生效值；只补全用户没有明确指定的字段，避免覆盖手工调优。
-                info = runtime.loader.model_info
+                # 缺少 load 节点时写入完整实际参数；已有节点内容保持不变。
+                model_info = runtime.loader.model_info
                 effective = runtime.loader.effective_load
-                if info:
-                    effective.setdefault("context_length", info.context_length)
-                    effective.setdefault("dtype", info.dtype)
-                if "engine" not in runtime.spec.load_fields:
-                    runtime.spec.load.engine = str(effective.get("engine", runtime.spec.load.engine))
-                for field_name, value in effective.items():
-                    if field_name in runtime.spec.load.__dataclass_fields__ and field_name not in runtime.spec.load_fields:
-                        setattr(runtime.spec.load, field_name, value)
+                if model_info:
+                    effective.setdefault("context_length", model_info.context_length)
+                    effective.setdefault("dtype", model_info.dtype)
+                    # 量化方式不写入配置，只输出诊断信息。
+                    log_info("模型量化信息", runtime.spec.model_id,
+                             model_info.quantization or model_info.extra.get("quantization", "未检测到"))
+                if not runtime.spec.load_present:
+                    for field_name, value in effective.items():
+                        if field_name in runtime.spec.load.__dataclass_fields__:
+                            setattr(runtime.spec.load, field_name, value)
+                    runtime.spec.load_data = runtime.spec.load.to_dict()
+                try:
+                    measured = runtime.loader.memory_usage().gpu_allocated_mb
+                    if measured > 0:
+                        # 该字段每次成功加载都使用最新显存测量值同步。
+                        runtime.spec.estimated_vram_mb = int(measured + 0.5)
+                except Exception:
+                    pass
+                if not runtime.spec.cache_present:
+                    runtime.spec.cache_data = dict(runtime.spec.cache)
                 self._persist_spec(runtime.spec)
                 runtime.state, runtime.error = "RUNNING", None
                 runtime.last_used_at = time.time()
@@ -156,9 +175,9 @@ class ModelsMgr:
 
     def reconfigure(self, model_id: str, changes: dict[str, Any]) -> RuntimeModel:
         """应用会影响模型创建的参数；如模型正在运行则先安全卸载再加载。"""
-        load_keys = {"engine", "dtype", "context_length", "gpu_offload_layers", "batch_size",
+        load_keys = {"dtype", "context_length", "gpu_offload_layers", "batch_size",
                      "flash_attention", "draft_model", "speculative_decoding", "tensor_parallel", "gpu_split",
-                     "trust_remote_code", "quantization"}
+                     "trust_remote_code"}
         if not changes or not load_keys.intersection(changes):
             return self._get_runtime(model_id)
         with self._lock:
@@ -167,11 +186,11 @@ class ModelsMgr:
                 raise RuntimeError("模型当前正在生成，不能修改加载参数")
             self._unload_runtime(model_id)
             spec = self.specs[model_id]
-            load_values = {key: changes[key] for key in load_keys if key in changes and key != "quantization"}
-            changed_spec = replace(spec,
-                                   quantization=changes.get("quantization", spec.quantization),
-                                   load=replace(spec.load, **load_values))
+            load_values = {key: changes[key] for key in load_keys if key in changes}
+            changed_spec = replace(spec, load=replace(spec.load, **load_values))
             changed_spec.load_fields = set(spec.load_fields) | set(load_values)
+            changed_spec.load_present = True
+            changed_spec.load_data = changed_spec.load.to_dict()
             self.specs[model_id] = changed_spec
             try:
                 return self.ensure_loaded(model_id)
@@ -185,7 +204,7 @@ class ModelsMgr:
             if runtime.active or not runtime.loader:
                 return False
             if runtime.loader.sleep_to_ram():
-                if self.settings.get("cache", {}).get("state_snapshot_enabled", True):
+                if runtime.spec.cache.get("state_snapshot_enabled", False):
                     save_snapshot(self.asset_root, runtime.spec, state="SLEEPING_RAM",
                                   last_used_at=runtime.last_used_at)
                 runtime.state, runtime.sleep_location = "SLEEPING_RAM", "ram"
@@ -197,7 +216,7 @@ class ModelsMgr:
         if not runtime or runtime.active:
             return
         if runtime.loader:
-            if self.settings.get("cache", {}).get("state_snapshot_enabled", True):
+            if runtime.spec.cache.get("state_snapshot_enabled", False):
                 save_snapshot(self.asset_root, runtime.spec, state=runtime.state,
                               last_used_at=runtime.last_used_at)
             runtime.loader.unload()
@@ -215,9 +234,9 @@ class ModelsMgr:
 
     def reap_idle(self) -> list[str]:
         sleep_cfg = self.settings.get("sleep", {})
-        if not sleep_cfg.get("enabled", True):
+        timeout = int(sleep_cfg.get("idle_timeout_sec", 0))
+        if timeout <= 0:
             return []
-        timeout = int(sleep_cfg.get("idle_timeout_sec", 600))
         now = time.time()
         changed: list[str] = []
         for model_id, runtime in list(self.runtime.items()):

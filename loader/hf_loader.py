@@ -87,7 +87,7 @@ class HFLoader(ModelLoader):
         self._effective_load = {
             "engine": "hf", "dtype": actual_dtype,
             "context_length": self._model_info.context_length if self._model_info else max_model_len,
-            "gpu_offload_layers": kwargs.get("gpu_offload_layers", 0),
+            "gpu_offload_layers": kwargs.get("gpu_offload_layers") if kwargs.get("gpu_offload_layers") is not None else -1,
             "batch_size": kwargs.get("batch_size", 1),
             "flash_attention": kwargs.get("flash_attention", True),
             "draft_model": kwargs.get("draft_model"),

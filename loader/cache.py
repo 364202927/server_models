@@ -16,9 +16,8 @@ def snapshot_path(root: str | Path, model_id: str) -> Path:
 def save_snapshot(root: str | Path, spec: ModelSpec, **runtime: Any) -> Path:
     path = snapshot_path(root, spec.model_id)
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {"model_id": spec.model_id, "path": spec.path, "engine": spec.load.engine,
-               "model_type": spec.model_type, "dtype": spec.load.dtype,
-               "quantization": spec.quantization, "runtime": runtime}
+    payload = {"model_id": spec.model_id, "path": spec.path,
+               "dtype": spec.load.dtype, "cache": spec.cache, "runtime": runtime}
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     return path
 

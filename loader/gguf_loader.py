@@ -19,7 +19,6 @@ class GGUFLoader(ModelLoader):
         self,
         model_path: str,
         *,
-        quantization: str | None = None,
         dtype: str = "float16",
         max_model_len: int | None = None,
         tensor_parallel_size: int = 1,
@@ -43,7 +42,7 @@ class GGUFLoader(ModelLoader):
         llm_kwargs: dict[str, Any] = {
             "model_path": str(source),
             # n_gpu_layers 决定有多少层放入 GPU；-1 表示尽可能全部 offload。
-            "n_gpu_layers": int(kwargs.get("gpu_offload_layers", 0)),
+            "n_gpu_layers": int(kwargs.get("gpu_offload_layers") if kwargs.get("gpu_offload_layers") is not None else -1),
             "n_batch": int(kwargs.get("batch_size", 1)),
             "verbose": bool(kwargs.get("verbose", False)),
         }
@@ -55,14 +54,14 @@ class GGUFLoader(ModelLoader):
             # tensor_split 用每张卡的相对分配比例；None 表示 llama.cpp 自动分配。
             llm_kwargs["tensor_split"] = kwargs["gpu_split"]
         self._model = Llama(**llm_kwargs)
-        self._model_info = self._extract_model_info(str(source), quantization=quantization, dtype=dtype)
+        self._model_info = self._extract_model_info(str(source), dtype=dtype)
 
         metadata = getattr(self._model, "metadata", {}) or {}
         context = max_model_len or metadata.get("llama.context_length") or metadata.get("n_ctx_train")
         if context:
             self._model_info.context_length = int(context)
         self._effective_load = {
-            "engine": "gguf", "dtype": dtype,
+            "dtype": dtype,
             "context_length": self._model_info.context_length,
             "gpu_offload_layers": llm_kwargs["n_gpu_layers"],
             "batch_size": llm_kwargs["n_batch"],
@@ -128,4 +127,3 @@ class GGUFLoader(ModelLoader):
         self._model_info = None
         self._effective_load = {}
         self.release_cache()
-
