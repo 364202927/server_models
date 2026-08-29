@@ -1,34 +1,51 @@
 {
   "defaults": {
-    "server": {"host": "0.0.0.0", 
-              "port": 8000, 
-              "api_key": ""},
-    "sleep": {"enabled": true, 
-            "idle_timeout_sec": 600, 
-            "ram_enabled": true, 
-            "disk_enabled": true, 
-            "ram_reserve_mb": 8192, 
-            "gpu_reserve_mb": 512},
-    "cache": {"state_snapshot_enabled": true, 
-              "prompt_cache_enabled": true, 
-              "kv_cache_enabled": false, 
-              "cache_dir": "assets/cache"},
-              "generation": {
-                "temperature": 0.3, 
-                 "top_p": 0.95, 
-                "top_k": 50, 
-                "repetition_penalty": 1.05, 
-                "max_tokens": 512, 
-                "stop_sequences": [], 
-                "mirostat": 0, 
-                "system_prompt": ""}
+    "server": {
+      "host": "0.0.0.0",
+      "port": 8000,
+      "api_key": ""
+    },
+    "sleep": {
+      "enabled": true,
+      "idle_timeout_sec": 600,
+      "ram_enabled": true,
+      "disk_enabled": true,
+      "ram_reserve_mb": 8192,
+      "gpu_reserve_mb": 512
+    },
+    "cache": {
+      "state_snapshot_enabled": true,
+      "prompt_cache_enabled": true,
+      "kv_cache_enabled": false,
+      "cache_dir": "assets/cache"
+    },
+    "generation": {
+      "temperature": 0.3,
+      "top_p": 0.95,
+      "top_k": 50,
+      "repetition_penalty": 1.05,
+      "max_tokens": 512,
+      "stop_sequences": [],
+      "mirostat": 0,
+      "system_prompt": ""
+    }
   },
   "models": {
-      "qwen3.8-27B":{
-          "path":"D:/ai/models/Qwen3.8-27B-Uncensored-GGUF",
-          "model_type":"auto",
-          "quantization":null,
-          "estimated_vram_mb":null
+    "qwen3.8-27B": {
+      "path": "/mnt/d/ai/models/Qwen3.8-27B-Uncensored-GGUF/Qwen3.8-27B-Uncensored-IQ4_XS.gguf",
+      "load": {
+        "engine": "gguf",
+        "dtype": "float16",
+        "context_length": 4096,
+        "gpu_offload_layers": -1,
+        "batch_size": 1,
+        "flash_attention": true,
+        "draft_model": null,
+        "speculative_decoding": false,
+        "tensor_parallel": 1,
+        "gpu_split": null,
+        "trust_remote_code": true
       }
+    }
   }
 }

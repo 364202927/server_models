@@ -111,5 +111,5 @@ class serverApi:
 
 
 # 兼容旧代码：新入口使用 ``serverApi``，旧调用仍可使用 ``ModelServer``/``web``。
-ModelServer = serverApi
+# ModelServer = serverApi
 web = serverApi
