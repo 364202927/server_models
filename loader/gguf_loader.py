@@ -100,11 +100,13 @@ class GGUFLoader(ModelLoader):
         context = max_model_len or metadata.get("llama.context_length") or metadata.get("n_ctx_train")
         if context:
             self._model_info.context_length = int(context)
-        quantization = (
-            metadata.get("general.quantization")
-            or metadata.get("general.file_type")
-            or self._guess_quantization(source.name)
-        )
+        # 转换器通常把 ``general.file_type`` 写成数字枚举（例如 30），
+        # 它不是用户可读的量化名称；优先使用 metadata 字符串或文件名标记。
+        quantization = metadata.get("general.quantization") or self._guess_quantization(source.name)
+        if not quantization:
+            file_type = metadata.get("general.file_type")
+            if isinstance(file_type, str) and not file_type.isdigit():
+                quantization = file_type
         if quantization:
             self._model_info.quantization = str(quantization)
         log_info("GGUF加载结果", str(source),

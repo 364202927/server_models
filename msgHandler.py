@@ -86,6 +86,8 @@ class MsgHandler:
                     model = str(data[0])
                 if not prompt and len(data) > 1:
                     prompt = str(data[1])
+            info("请求参数解析", "id=", message_id, "model=", model,
+                 "prompt_chars=", len(prompt), "data_type=", type(data).__name__)
             deploy = {**dict(payload.get("deploy", {})), **deploy}
             if deploy:
                 load_keys = {"dtype", "context_length", "gpu_offload_layers", "batch_size",
