@@ -44,7 +44,20 @@ class HFLoader(ModelLoader):
                 raise ValueError(".safetensors 文件旁缺少 tokenizer 元数据，无法完成文本生成")
             model_path = str(source)
 
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        cuda_available = bool(torch.cuda.is_available())
+        if not cuda_available:
+            # nvidia-smi 可能仍能发现 GPU，但 CPU 版 PyTorch 无法把权重放入显存；
+            # 继续静默加载会导致权重落到 RAM，直到推理时才暴露问题。
+            try:
+                from ..hardware import detect_gpu
+                if detect_gpu():
+                    raise RuntimeError(
+                        "检测到 NVIDIA GPU，但当前 PyTorch 未启用 CUDA；请安装 CUDA 版 torch，"
+                        "否则模型会加载到系统内存。"
+                    )
+            except ImportError:
+                pass
+        device = "cuda:0" if cuda_available else "cpu"
         torch_dtype = getattr(torch, dtype, torch.float16)
 
         # 加载tokenizer
@@ -70,12 +83,41 @@ class HFLoader(ModelLoader):
                 bnb_4bit_compute_dtype=torch_dtype,
                 bnb_4bit_use_double_quant=True,
             )
-            model_kwargs["device_map"] = "auto"
-        else:
-            model_kwargs["device_map"] = device
+            # auto 可能因显存估算不足而把层悄悄放到 CPU；固定到首张 GPU。
+            model_kwargs["device_map"] = {"": "cuda:0"} if cuda_available else {"": "cpu"}
+        elif cuda_available:
+            # 使用映射字典显式整模型放入显存，避免字符串设备触发自动分层。
+            model_kwargs["device_map"] = {"": "cuda:0"}
 
         # 加载模型
         self._model = AutoModelForCausalLM.from_pretrained(model_path, **model_kwargs)
+        if cuda_available:
+            # accelerate 会在 hf_device_map 中标记被卸载到 CPU/disk 的层。
+            device_map = getattr(self._model, "hf_device_map", None)
+            if isinstance(device_map, dict):
+                offloaded = {
+                    str(location).lower() for location in device_map.values()
+                    if str(location).lower() in {"cpu", "disk", "meta"}
+                }
+                if offloaded:
+                    del self._model
+                    self._model = None
+                    raise MemoryError(
+                        "模型无法完整加载到 GPU，检测到 CPU/disk 分层；"
+                        "请释放显存或降低 context_length/batch_size。"
+                    )
+            try:
+                devices = {
+                    str(device).lower()
+                    for param in self._model.parameters()
+                    if (device := getattr(param, "device", None)) is not None
+                }
+                if devices and any(name.startswith("cpu") or name.startswith("meta") for name in devices):
+                    del self._model
+                    self._model = None
+                    raise MemoryError("模型包含位于 CPU/RAM 的权重，未完整加载到 GPU 显存")
+            except StopIteration:
+                pass
         self._model_info = self._extract_model_info(model_path, quantization=quantization, dtype=dtype)
 
         # 提取模型元信息
@@ -210,7 +252,7 @@ class HFLoader(ModelLoader):
         if not self.is_loaded:
             raise RuntimeError("模型尚未加载")
         import torch
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        device = "cuda:0" if torch.cuda.is_available() else "cpu"
         self._model.to(device)
 
     def _get_gpu_device_index(self) -> int:

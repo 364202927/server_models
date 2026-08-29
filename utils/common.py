@@ -67,10 +67,11 @@ def str2time(mode: str = "strNow", value: datetime | None = None) -> str:
     """
     current = value or datetime.now().astimezone()
     if mode == "strNow":
-        return current.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        # 日志打印精确到秒；毫秒会让 Console 输出难以阅读且没有业务价值。
+        return current.strftime("%Y-%m-%d %H:%M:%S")
     if mode == "date":
         return current.strftime("%Y-%m-%d")
-    return current.isoformat(timespec="milliseconds")
+    return current.isoformat(timespec="seconds")
 
 
 def listFind(lists: Iterable[Any], fnJudge: Callable[[Any], bool]) -> Any | None:

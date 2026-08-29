@@ -27,6 +27,13 @@ class GGUFLoader(ModelLoader):
     ) -> "GGUFLoader":
         try:
             from llama_cpp import Llama
+            try:
+                from llama_cpp import llama_supports_gpu_offload
+            except ImportError:
+                try:
+                    from llama_cpp.llama_cpp import llama_supports_gpu_offload
+                except ImportError:
+                    llama_supports_gpu_offload = None
         except ImportError as exc:
             raise RuntimeError("GGUF 模型需要安装 llama-cpp-python（建议按 CUDA 架构安装）") from exc
 
@@ -39,10 +46,33 @@ class GGUFLoader(ModelLoader):
         if not source.is_file() or source.suffix.lower() != ".gguf":
             raise ValueError(f"不是有效的 GGUF 文件: {model_path}")
 
+        gpu_layers = int(
+            kwargs.get("gpu_offload_layers")
+            if kwargs.get("gpu_offload_layers") is not None else -1
+        )
+        # n_gpu_layers 只有 CUDA 编译版本才真正生效；CPU 版会静默把 GGUF
+        # 留在 RAM，因此在检测到 NVIDIA GPU 时提前给出明确错误。
+        if gpu_layers != 0:
+            try:
+                from ..hardware import detect_gpu
+                gpu_present = bool(detect_gpu())
+            except ImportError:
+                gpu_present = False
+            if gpu_present and callable(llama_supports_gpu_offload):
+                try:
+                    if not llama_supports_gpu_offload():
+                        raise RuntimeError(
+                            "当前 llama-cpp-python 未启用 CUDA，GGUF 将加载到系统内存；"
+                            "请安装带 CUDA 支持的构建版本。"
+                        )
+                except TypeError:
+                    # 旧版本检测函数签名不同，交给构造器处理。
+                    pass
+
         llm_kwargs: dict[str, Any] = {
             "model_path": str(source),
             # n_gpu_layers 决定有多少层放入 GPU；-1 表示尽可能全部 offload。
-            "n_gpu_layers": int(kwargs.get("gpu_offload_layers") if kwargs.get("gpu_offload_layers") is not None else -1),
+            "n_gpu_layers": gpu_layers,
             "n_batch": int(kwargs.get("batch_size", 1)),
             "verbose": bool(kwargs.get("verbose", False)),
         }

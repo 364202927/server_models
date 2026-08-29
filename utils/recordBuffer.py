@@ -12,7 +12,8 @@ from typing import Any
 
 
 def _now_string() -> str:
-    return datetime.now().astimezone().isoformat(timespec="milliseconds")
+    # 与 Console 日志保持一致，记录时间精确到秒即可。
+    return datetime.now().astimezone().isoformat(timespec="seconds")
 
 
 class recordBuffer:
