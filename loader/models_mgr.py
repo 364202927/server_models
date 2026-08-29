@@ -120,14 +120,18 @@ class ModelsMgr:
                                     quantization=runtime.spec.quantization,
                                     **runtime.spec.load.loader_kwargs())
                 load_lora(runtime.loader, runtime.spec.lora)
-                # 引擎可能从模型文件解析真实上下文长度；仅在未配置 load 时
-                # 记录这次成功加载所采用的参数，避免每次请求都改写 models.json。
+                # Loader 返回实际生效值；只补全用户没有明确指定的字段，避免覆盖手工调优。
                 info = runtime.loader.model_info
-                if info and runtime.spec.load.context_length is None and info.context_length:
-                    runtime.spec.load.context_length = info.context_length
-                if not runtime.spec.load_configured:
-                    self._persist_spec(runtime.spec)
-                    runtime.spec.load_configured = True
+                effective = runtime.loader.effective_load
+                if info:
+                    effective.setdefault("context_length", info.context_length)
+                    effective.setdefault("dtype", info.dtype)
+                if "engine" not in runtime.spec.load_fields:
+                    runtime.spec.load.engine = str(effective.get("engine", runtime.spec.load.engine))
+                for field_name, value in effective.items():
+                    if field_name in runtime.spec.load.__dataclass_fields__ and field_name not in runtime.spec.load_fields:
+                        setattr(runtime.spec.load, field_name, value)
+                self._persist_spec(runtime.spec)
                 runtime.state, runtime.error = "RUNNING", None
                 runtime.last_used_at = time.time()
                 return runtime
@@ -167,6 +171,7 @@ class ModelsMgr:
             changed_spec = replace(spec,
                                    quantization=changes.get("quantization", spec.quantization),
                                    load=replace(spec.load, **load_values))
+            changed_spec.load_fields = set(spec.load_fields) | set(load_values)
             self.specs[model_id] = changed_spec
             try:
                 return self.ensure_loaded(model_id)

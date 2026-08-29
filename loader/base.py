@@ -65,6 +65,7 @@ class ModelLoader(ABC):
         self._model = None
         self._tokenizer = None
         self._model_info: ModelInfo | None = None
+        self._effective_load: dict[str, Any] = {}
 
     @property
     def model_info(self) -> ModelInfo | None:
@@ -73,6 +74,11 @@ class ModelLoader(ABC):
     @property
     def is_loaded(self) -> bool:
         return self._model is not None
+
+    @property
+    def effective_load(self) -> dict[str, Any]:
+        """返回本次加载实际采用的参数，供 ModelsMgr 同步到 models.json。"""
+        return dict(self._effective_load)
 
     @abstractmethod
     def load(

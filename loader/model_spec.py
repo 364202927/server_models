@@ -59,9 +59,13 @@ class ModelSpec:
     lora: list[dict[str, Any]] = field(default_factory=list)
     load: ModelLoadConfig = field(default_factory=ModelLoadConfig)
     extra: dict[str, Any] = field(default_factory=dict)
-    # 仅用于决定是否在首次成功加载后回写 ``load``；不写入 JSON。
-    # 放在末尾以保持既有位置参数调用的兼容性。
-    load_configured: bool = True
+    # JSON 中实际出现的 load 字段；不把 dataclass 默认值误认为用户配置。
+    load_fields: set[str] = field(default_factory=set, repr=False, compare=False)
+
+    @property
+    def load_configured(self) -> bool:
+        """兼容旧调用：只要至少有一个 load 字段即视为已配置。"""
+        return bool(self.load_fields)
 
     @property
     def path_obj(self) -> Path:
@@ -108,13 +112,10 @@ def load_model_specs(config: dict[str, Any]) -> dict[str, ModelSpec]:
             estimated_vram_mb=raw.get("estimated_vram_mb"),
             lora=list(raw.get("lora", [])),
             load=ModelLoadConfig.from_dict(raw_load),
-            # 只有明确提供了至少一个 load 参数，才视为固定配置。
-            # 缺失或空对象表示让引擎读取模型默认值，成功后由 ModelsMgr 回写实际参数。
-            load_configured=isinstance(raw_load, dict)
-            and any(
-                key in ModelLoadConfig.__dataclass_fields__ and raw_load[key] is not None
-                for key in raw_load
-            ),
+            load_fields={
+                key for key, value in (raw_load.items() if isinstance(raw_load, dict) else [])
+                if key in ModelLoadConfig.__dataclass_fields__ and value is not None
+            },
             extra={key: value for key, value in raw.items() if key not in known},
         )
     return result

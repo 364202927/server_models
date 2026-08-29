@@ -12,6 +12,7 @@ from .common import (
     info,
     joinPath,
     kError,
+    kApi,
     kInfo,
     kLog,
     kWarn,
@@ -37,5 +38,5 @@ __all__ = [
     "joinPath", "str2time", "ASSETS_DIR", "CACHE_DIR", "CHAT_HISTORY_DIR", "MODELS_FILE",
     "RUNTIME_DIR", "ensure_asset_dirs", "RecordBuffer", "recordBuffer", "get_log_buffer", "save_logs",
     "set_console_active", "configure_logging", "get_logger", "log", "info", "warn", "err",
-    "error", "logFormat", "logJson", "kLog", "kInfo", "kWarn", "kError", "Console", "console",
+    "error", "logFormat", "logJson", "kLog", "kInfo", "kWarn", "kError", "kApi", "Console", "console",
 ]

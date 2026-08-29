@@ -157,6 +157,9 @@ class Console:
 
     async def run(self) -> None:
         """启动交互式监控；Ctrl+C 交由主进程执行统一停机。"""
+        if not sys.stdin.isatty():
+            warn("Console 未检测到交互式 TTY，跳过终端监听")
+            return
         self._write("\n=== Console Monitor Started ===\n")
         self._write("输入 h 查看帮助，Ctrl+C 退出。\n")
         loop = asyncio.get_running_loop()

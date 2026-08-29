@@ -21,6 +21,9 @@ kInfo = "info"
 kWarn = "warn"
 kError = "error"
 
+# True 时在 main.py 额外启动 FastAPI；Console 始终启动。可用 AI_KAPI=false 覆盖。
+kApi = os.getenv("AI_KAPI", "true").strip().lower() not in {"0", "false", "no", "off"}
+
 _LOG_LEVEL_TAGS = {
     logging.DEBUG: kLog,
     logging.INFO: kInfo,

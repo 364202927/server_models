@@ -6,6 +6,7 @@ HuggingFace Transformers 模型加载器
 """
 
 import time
+from pathlib import Path
 from typing import Any
 
 from .base import ModelLoader, ModelInfo, GenerationResult, MemoryUsage
@@ -25,8 +26,23 @@ class HFLoader(ModelLoader):
         trust_remote_code: bool = True,
         **kwargs: Any
     ) -> "HFLoader":
-        import torch
-        from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+        try:
+            import torch
+            from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+        except ImportError as exc:
+            raise RuntimeError("HF 模型需要安装 torch、transformers（以及 safetensors）") from exc
+
+        source = Path(model_path)
+        if source.is_file() and source.suffix.lower() == ".safetensors":
+            # Transformers 需要 config/tokenizer 元数据；单独权重文件不能直接完成文本生成。
+            source = source.parent
+            if not (source / "config.json").is_file():
+                raise ValueError(".safetensors 文件旁缺少 config.json，无法按 HuggingFace 模型加载")
+            tokenizer_files = ("tokenizer.json", "tokenizer_config.json", "tokenizer.model",
+                               "special_tokens_map.json", "vocab.json")
+            if not any((source / name).is_file() for name in tokenizer_files):
+                raise ValueError(".safetensors 文件旁缺少 tokenizer 元数据，无法完成文本生成")
+            model_path = str(source)
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
         torch_dtype = getattr(torch, dtype, torch.float16)
@@ -42,6 +58,8 @@ class HFLoader(ModelLoader):
         model_kwargs: dict = {
             "trust_remote_code": trust_remote_code,
             "torch_dtype": torch_dtype,
+            # 优先读取 safetensors，避免 pickle 权重反序列化风险并提升加载稳定性。
+            "use_safetensors": True,
         }
 
         # BitsAndBytes量化配置
@@ -62,6 +80,22 @@ class HFLoader(ModelLoader):
 
         # 提取模型元信息
         self._update_model_metadata()
+        try:
+            actual_dtype = str(next(self._model.parameters()).dtype).replace("torch.", "")
+        except StopIteration:
+            actual_dtype = dtype
+        self._effective_load = {
+            "engine": "hf", "dtype": actual_dtype,
+            "context_length": self._model_info.context_length if self._model_info else max_model_len,
+            "gpu_offload_layers": kwargs.get("gpu_offload_layers", 0),
+            "batch_size": kwargs.get("batch_size", 1),
+            "flash_attention": kwargs.get("flash_attention", True),
+            "draft_model": kwargs.get("draft_model"),
+            "speculative_decoding": kwargs.get("speculative_decoding", False),
+            "tensor_parallel": tensor_parallel_size,
+            "gpu_split": kwargs.get("gpu_split"),
+            "trust_remote_code": trust_remote_code,
+        }
 
         return self
 

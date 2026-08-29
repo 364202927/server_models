@@ -5,7 +5,8 @@ __version__ = "0.1.0"
 
 from .config import BenchmarkConfig, TestDimension
 from .hardware import detect_hardware, print_hardware_info, HardwareInfo
-from .loader import ModelLoader, MemoryUsage, HFLoader, VLLMLoader
+from .loader import ModelLoader, MemoryUsage, HFLoader, GGUFLoader, VLLMLoader
+from .msgHandler import MsgHandler
 from .benchmark import BenchmarkRunner, BenchmarkResult, Scorer, ReportGenerator
 
 __all__ = [
@@ -20,7 +21,9 @@ __all__ = [
     "ModelLoader",
     "MemoryUsage",
     "HFLoader",
+    "GGUFLoader",
     "VLLMLoader",
+    "MsgHandler",
     # Benchmark
     "BenchmarkRunner",
     "BenchmarkResult",
