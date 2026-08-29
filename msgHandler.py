@@ -106,6 +106,11 @@ class MsgHandler:
         except (KeyError, RuntimeError, MemoryError, ValueError, FileNotFoundError) as exc:
             log("消息处理失败:", exc)
             return self._response(model, message_id, "error", str(exc))
+        except Exception as exc:
+            # 推理后端可能抛出自定义异常；统一转成可见的错误响应，避免
+            # Console/FastAPI 只看到“消息处理开始”却没有结束结果。
+            log("消息处理异常:", type(exc).__name__, exc)
+            return self._response(model, message_id, "error", f"推理失败: {exc}")
 
     @staticmethod
     def _model_from(data: Any) -> str:

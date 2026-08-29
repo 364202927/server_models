@@ -146,8 +146,12 @@ class ModelsMgr:
                     if measured > 0:
                         # 该字段每次成功加载都使用最新显存测量值同步。
                         runtime.spec.estimated_vram_mb = int(measured + 0.5)
+                        log_info("模型显存占用同步", runtime.spec.model_id,
+                                 f"{runtime.spec.estimated_vram_mb} MB")
+                    else:
+                        log_info("模型显存占用未检测到", runtime.spec.model_id)
                 except Exception:
-                    pass
+                    log_info("模型显存占用检测失败", runtime.spec.model_id)
                 if not runtime.spec.cache_present:
                     runtime.spec.cache_data = dict(runtime.spec.cache)
                 self._persist_spec(runtime.spec)
