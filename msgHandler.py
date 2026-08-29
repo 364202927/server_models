@@ -49,8 +49,12 @@ class MsgHandler:
         try:
             async with self._lock:
                 info("消息处理", source, message_id, model)
-                return await self._dispatch(message_id, data, model=model, prompt=prompt,
-                                            think=think, deploy=deploy or {})
+                result = await self._dispatch(message_id, data, model=model, prompt=prompt,
+                                              think=think, deploy=deploy or {})
+                info("消息处理完成", source, message_id,
+                     "status=", result.get("status", "unknown"),
+                     "response_chars=", len(str(result.get("response", ""))))
+                return result
         finally:
             self._pending -= 1
 

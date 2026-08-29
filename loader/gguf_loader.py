@@ -7,10 +7,12 @@ from __future__ import annotations
 
 import time
 import subprocess
+import re
 from pathlib import Path
 from typing import Any
 
 from .base import GenerationResult, MemoryUsage, ModelLoader
+from ..utils.common import info as log_info
 
 
 class GGUFLoader(ModelLoader):
@@ -87,6 +89,8 @@ class GGUFLoader(ModelLoader):
         if kwargs.get("gpu_split"):
             # tensor_split 用每张卡的相对分配比例；None 表示 llama.cpp 自动分配。
             llm_kwargs["tensor_split"] = kwargs["gpu_split"]
+        log_info("GGUF加载参数", str(source), llm_kwargs,
+                 "gpu_used_before_mb=", gpu_used_before)
         self._model = Llama(**llm_kwargs)
         self._gpu_used_baseline_mb = gpu_used_before
         self._gpu_used_after_load_mb = self._query_gpu_used_mb()
@@ -96,6 +100,18 @@ class GGUFLoader(ModelLoader):
         context = max_model_len or metadata.get("llama.context_length") or metadata.get("n_ctx_train")
         if context:
             self._model_info.context_length = int(context)
+        quantization = (
+            metadata.get("general.quantization")
+            or metadata.get("general.file_type")
+            or self._guess_quantization(source.name)
+        )
+        if quantization:
+            self._model_info.quantization = str(quantization)
+        log_info("GGUF加载结果", str(source),
+                 "gpu_used_after_mb=", self._gpu_used_after_load_mb,
+                 "metadata_keys=", list(metadata)[:20],
+                 "context=", self._model_info.context_length,
+                 "quantization=", self._model_info.quantization or "未检测到")
         self._effective_load = {
             "dtype": dtype,
             "context_length": self._model_info.context_length,
@@ -135,7 +151,8 @@ class GGUFLoader(ModelLoader):
             usage = result.get("usage", {})
             prompt_tokens = int(usage.get("prompt_tokens", 0))
             tokens = int(usage.get("completion_tokens", 0))
-        except (AttributeError, TypeError, KeyError, ValueError):
+        except (AttributeError, TypeError, KeyError, ValueError) as exc:
+            log_info("GGUF聊天接口不可用，回退普通生成", type(exc).__name__, exc)
             result = self._model(
                 prompt, max_tokens=max_new_tokens, temperature=max(temperature, 0.01),
                 top_p=top_p, top_k=top_k, repeat_penalty=repetition_penalty, stop=stop_sequences,
@@ -145,6 +162,12 @@ class GGUFLoader(ModelLoader):
             prompt_tokens = len(self._model.tokenize(prompt.encode("utf-8")))
         elapsed = time.perf_counter() - start
         return GenerationResult(text, tokens, elapsed, tokens / elapsed if elapsed else 0.0, prompt_tokens)
+
+    @staticmethod
+    def _guess_quantization(filename: str) -> str | None:
+        """部分 GGUF 转换器不会写量化 metadata，从文件名补充常见量化标记。"""
+        match = re.search(r"(?i)(IQ\d+[_A-Z]*|Q\d+[_A-Z0-9]*|F16|F32|BF16)", filename)
+        return match.group(1) if match else None
 
     def memory_usage(self, verbose: bool = False) -> MemoryUsage:
         usage = super().memory_usage(verbose)

@@ -109,23 +109,56 @@ class ModelsMgr:
             if self._free_for(self.specs[exclude]):
                 return
 
+    def _sync_memory_estimate(self, runtime: RuntimeModel) -> None:
+        """刷新运行中模型的显存估算，并立即持久化到 models.json。"""
+        if runtime.loader is None:
+            return
+        try:
+            measured = runtime.loader.memory_usage().gpu_allocated_mb
+            if measured > 0:
+                runtime.spec.estimated_vram_mb = int(measured + 0.5)
+                log_info("模型显存占用同步", runtime.spec.model_id,
+                         f"{runtime.spec.estimated_vram_mb} MB")
+                self._persist_spec(runtime.spec)
+            else:
+                log_info("模型显存占用未检测到", runtime.spec.model_id)
+        except Exception as exc:
+            log_info("模型显存占用检测失败", runtime.spec.model_id, type(exc).__name__, exc)
+
     def ensure_loaded(self, model_id: str) -> RuntimeModel:
         with self._lock:
             runtime = self._get_runtime(model_id)
             if runtime.loader and runtime.state in {"RUNNING", "SLEEPING_RAM"}:
+                log_info("模型已存在，跳过加载", model_id, runtime.state)
                 if runtime.state == "SLEEPING_RAM":
                     runtime.loader.wake()
                 runtime.state = "RUNNING"
                 runtime.last_used_at = time.time()
+                self._sync_memory_estimate(runtime)
                 return runtime
             runtime.state = "LOADING"
             try:
+                log_info("模型加载配置", model_id,
+                         "source_path=", runtime.spec.source_path,
+                         "path=", runtime.spec.path,
+                         "path_exists=", runtime.spec.path_obj.exists(),
+                         "suffix=", runtime.spec.path_obj.suffix.lower(),
+                         "estimated_vram_mb=", runtime.spec.estimated_vram_mb,
+                         "load=", runtime.spec.load.to_dict())
+                detected = detect_gpu()
+                log_info("加载前GPU状态", model_id,
+                         [{"index": item.index, "free_mb": item.memory_free_mb,
+                           "total_mb": item.memory_total_mb} for item in detected])
                 if not self._free_for(runtime.spec):
                     self._reclaim(model_id)
                 if not self._free_for(runtime.spec):
                     raise MemoryError(f"模型 {model_id} 预计显存不足，拒绝加载")
                 runtime.loader = create_loader(runtime.spec)
+                log_info("选择模型Loader", model_id, type(runtime.loader).__name__)
                 runtime.loader.load(runtime.spec.path, **runtime.spec.load.loader_kwargs())
+                log_info("模型Loader加载完成", model_id,
+                         "effective_load=", runtime.loader.effective_load,
+                         "model_info=", runtime.loader.model_info)
                 load_lora(runtime.loader, runtime.spec.lora)
                 # 缺少 load 节点时写入完整实际参数；已有节点内容保持不变。
                 model_info = runtime.loader.model_info
@@ -141,17 +174,8 @@ class ModelsMgr:
                         if field_name in runtime.spec.load.__dataclass_fields__:
                             setattr(runtime.spec.load, field_name, value)
                     runtime.spec.load_data = runtime.spec.load.to_dict()
-                try:
-                    measured = runtime.loader.memory_usage().gpu_allocated_mb
-                    if measured > 0:
-                        # 该字段每次成功加载都使用最新显存测量值同步。
-                        runtime.spec.estimated_vram_mb = int(measured + 0.5)
-                        log_info("模型显存占用同步", runtime.spec.model_id,
-                                 f"{runtime.spec.estimated_vram_mb} MB")
-                    else:
-                        log_info("模型显存占用未检测到", runtime.spec.model_id)
-                except Exception:
-                    log_info("模型显存占用检测失败", runtime.spec.model_id)
+                # 该字段每次成功加载都使用最新显存测量值同步。
+                self._sync_memory_estimate(runtime)
                 if not runtime.spec.cache_present:
                     runtime.spec.cache_data = dict(runtime.spec.cache)
                 self._persist_spec(runtime.spec)
@@ -170,10 +194,16 @@ class ModelsMgr:
             if runtime.loader is None:
                 raise RuntimeError(f"模型 {model_id} 未加载")
             runtime.active = True
+            log_info("开始生成", model_id, "prompt_chars=", len(prompt), "params=", kwargs)
             try:
                 result = runtime.loader.generate(prompt, **kwargs)
                 runtime.last_used_at = time.time()
+                log_info("生成完成", model_id, "tokens=", result.tokens_generated,
+                         "seconds=", round(result.time_seconds, 2))
                 return result
+            except Exception as exc:
+                log_info("生成失败", model_id, type(exc).__name__, exc)
+                raise
             finally:
                 runtime.active = False
 
