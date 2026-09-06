@@ -8,8 +8,15 @@ import uuid
 from typing import Any
 
 from .hardware import detect_hardware
+from .loader.model_spec import LOAD_KEYS
 from .loader.models_mgr import ModelsMgr
 from .utils.common import info, log
+
+# 每次请求可覆盖的采样参数；``max_tokens`` 在传给 Loader 前改名为 ``max_new_tokens``。
+GENERATION_KEYS = frozenset({
+    "temperature", "top_p", "top_k", "repetition_penalty",
+    "max_tokens", "stop_sequences", "system_prompt",
+})
 
 
 class MsgHandler:
@@ -77,6 +84,15 @@ class MsgHandler:
                 target = model or self._model_from(data)
                 await asyncio.to_thread(self.manager.ensure_loaded, target)
                 return self._response(target, message_id, "ok", "操作成功")
+            if message_id == 1007:
+                # 持久化生成参数；请求里的 deploy 只影响当次，改常驻值走这里。
+                payload = data if isinstance(data, dict) else {}
+                target = model or str(payload.get("model", ""))
+                changes = {key: value for key, value in
+                           dict(payload.get("generation", payload.get("deploy", {}))).items()
+                           if key in GENERATION_KEYS}
+                merged = await asyncio.to_thread(self.manager.update_generation, target, changes)
+                return self._response(target, message_id, "ok", merged)
 
             payload = data if isinstance(data, dict) else {}
             model = model or str(payload.get("model", ""))
@@ -90,16 +106,14 @@ class MsgHandler:
                  "prompt_chars=", len(prompt), "data_type=", type(data).__name__)
             deploy = {**dict(payload.get("deploy", {})), **deploy}
             if deploy:
-                load_keys = {"dtype", "context_length", "gpu_offload_layers", "batch_size",
-                             "flash_attention", "draft_model", "speculative_decoding", "tensor_parallel",
-                             "gpu_split", "trust_remote_code"}
-                changes = {key: value for key, value in deploy.items() if key in load_keys}
+                # reconfigure 内部会与当前 load 值 diff，值没变就不会重载模型。
+                changes = {key: value for key, value in deploy.items() if key in LOAD_KEYS}
                 if changes:
                     await asyncio.to_thread(self.manager.reconfigure, model, changes)
-            params = dict(self.manager.settings.get("generation", {}))
-            params.update({key: value for key, value in deploy.items() if key in {
-                "temperature", "top_p", "top_k", "repetition_penalty", "max_tokens", "stop_sequences",
-            }})
+            # defaults.generation ← 模型 generation ← 本次 deploy（不落盘）。
+            params = self.manager.generation_params(model)
+            params.update({key: value for key, value in deploy.items() if key in GENERATION_KEYS})
+            params = {key: value for key, value in params.items() if key in GENERATION_KEYS}
             if "max_tokens" in params:
                 params["max_new_tokens"] = params.pop("max_tokens")
             if think:

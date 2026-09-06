@@ -106,9 +106,10 @@ class ModelLoader(ABC):
         top_k: int = 50,
         repetition_penalty: float = 1.05,
         stop_sequences: list[str] | None = None,
+        system_prompt: str = "",
         **kwargs: Any
     ) -> GenerationResult:
-        """生成文本，返回GenerationResult"""
+        """生成文本，返回GenerationResult；system_prompt 非空时作为系统角色注入"""
         pass
 
     def generate_with_params(

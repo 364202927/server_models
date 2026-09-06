@@ -165,6 +165,7 @@ class HFLoader(ModelLoader):
         top_k: int = 50,
         repetition_penalty: float = 1.05,
         stop_sequences: list[str] | None = None,
+        system_prompt: str = "",
         **kwargs: Any
     ) -> GenerationResult:
         import torch
@@ -173,7 +174,7 @@ class HFLoader(ModelLoader):
             raise RuntimeError("Model not loaded. Call load() first.")
 
         # 编码输入
-        inputs = self._tokenizer(prompt, return_tensors="pt")
+        inputs = self._tokenizer(self._build_prompt(prompt, system_prompt), return_tensors="pt")
         input_ids = inputs["input_ids"].to(self._model.device)
         prompt_tokens = input_ids.shape[1]
 
@@ -210,6 +211,18 @@ class HFLoader(ModelLoader):
             tokens_per_second=tokens_generated / elapsed if elapsed > 0 else 0,
             prompt_tokens=prompt_tokens,
         )
+
+    def _build_prompt(self, prompt: str, system_prompt: str) -> str:
+        """优先走 tokenizer 的 chat template 注入 system 段，没有则手工前置。"""
+        if not system_prompt:
+            return prompt
+        messages = [{"role": "system", "content": system_prompt},
+                    {"role": "user", "content": prompt}]
+        try:
+            return self._tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True)
+        except (AttributeError, ValueError, TypeError):
+            return f"{system_prompt}\n\n{prompt}"
 
     def memory_usage(self, verbose: bool = False) -> MemoryUsage:
         """HF特有: 追加模型参数内存占用明细"""
@@ -293,6 +306,7 @@ class HFLoader(ModelLoader):
             self._tokenizer = None
 
         self._model_info = None
+        self._effective_load = {}
 
         # 清理显存
         gc.collect()

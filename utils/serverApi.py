@@ -1,11 +1,10 @@
 """FastAPI 服务封装。
 
-服务对象负责创建路由、鉴权、单用户排队和后台空闲模型回收；``main.py`` 只负责启动它。
+服务对象负责创建路由、鉴权和单用户排队；``main.py`` 负责启动它并驱动空闲回收。
 """
 
 from __future__ import annotations
 
-import asyncio
 import json
 import uuid
 from contextlib import asynccontextmanager
@@ -40,7 +39,7 @@ def response(model: str, special: int, status: str, value: Any, **extra: Any) ->
 
 
 class serverApi:
-    """可嵌入或独立运行的 FastAPI 服务，写法对应旧项目 ``webPort.web``。"""
+    "可嵌入或独立运行的 FastAPI 服务"
 
     def __init__(self, manager: ModelsMgr, handler: MsgHandler | None = None) -> None:
         self.manager = manager
@@ -56,17 +55,8 @@ class serverApi:
 
     @asynccontextmanager
     async def _lifespan(self, _: FastAPI) -> AsyncIterator[None]:
-        async def reaper() -> None:
-            while True:
-                await asyncio.sleep(30)
-                await asyncio.to_thread(self.manager.reap_idle)
-
-        task = asyncio.create_task(reaper())
-        try:
-            yield
-        finally:
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+        # 空闲回收由 main.py 独立启动，纯 Console 模式（AI_KAPI=false）同样需要。
+        yield
 
     def _create_app(self) -> FastAPI:
         app = FastAPI(title="AI Multi-Model Service", lifespan=self._lifespan)

@@ -68,12 +68,17 @@ class VLLMLoader(ModelLoader):
         top_k: int = 50,
         repetition_penalty: float = 1.05,
         stop_sequences: list[str] | None = None,
+        system_prompt: str = "",
         **kwargs: Any
     ) -> GenerationResult:
         from vllm import SamplingParams
 
         if not self.is_loaded:
             raise RuntimeError("Model not loaded. Call load() first.")
+
+        # vLLM 的 LLM.generate 接受纯文本，没有 chat 接口可用，直接前置 system 段。
+        if system_prompt:
+            prompt = f"{system_prompt}\n\n{prompt}"
 
         sampling_params = SamplingParams(
             max_tokens=max_new_tokens,
