@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import time
 import uuid
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator
@@ -30,6 +31,17 @@ class ChatRequest(BaseModel):
 class MessageRequest(BaseModel):
     id: int
     args: Any = None
+
+
+class OpenAIChatRequest(BaseModel):
+    """OpenAI/Open WebUI 发送的最小聊天请求结构。"""
+
+    model: str = ""
+    messages: list[dict[str, Any]] = Field(default_factory=list)
+    temperature: float | None = None
+    top_p: float | None = None
+    max_tokens: int | None = None
+    stream: bool = False
 
 
 def response(model: str, special: int, status: str, value: Any, **extra: Any) -> dict[str, Any]:
@@ -71,6 +83,55 @@ class serverApi:
         @app.get("/v1/health")
         async def health() -> dict[str, str]:
             return {"status": "ok"}
+
+        @app.get("/v1/models")
+        async def models(x_api_key: str | None = Header(default=None)) -> dict[str, Any]:
+            """Open WebUI 首次连接时调用的模型列表接口。"""
+            self._check_key(x_api_key)
+            now = int(time.time())
+            return {"object": "list", "data": [
+                {"id": model_id, "object": "model", "created": now,
+                 "owned_by": "local"}
+                for model_id in self.manager.specs
+            ]}
+
+        @app.post("/v1/chat/completions")
+        async def chat_completions(
+            request: OpenAIChatRequest,
+            x_api_key: str | None = Header(default=None),
+        ) -> dict[str, Any]:
+            """将 OpenAI 格式转换为共享 MsgHandler。"""
+            self._check_key(x_api_key)
+            if request.stream:
+                return {"error": {"message": "stream 暂未实现", "type": "不支持的请求"}}
+            if not request.model:
+                raise HTTPException(status_code=400, detail="model 不能为空")
+            messages = request.messages or []
+            prompt_parts = [
+                f"{item.get('role', 'user')}: {item.get('content', '')}"
+                for item in messages if isinstance(item, dict)
+            ]
+            prompt = "\n".join(prompt_parts)
+            deploy = {
+                key: value for key, value in {
+                    "temperature": request.temperature,
+                    "top_p": request.top_p,
+                    "max_tokens": request.max_tokens,
+                }.items() if value is not None
+            }
+            result = await self.handler.handle(
+                0, {"model": request.model, "prompt": prompt, "deploy": deploy},
+                model=request.model, prompt=prompt, deploy=deploy, source="openwebui",
+            )
+            if result.get("status") != "ok":
+                raise HTTPException(status_code=500, detail=result.get("response", "模型生成失败"))
+            return {
+                "id": f"chatcmpl-{uuid.uuid4().hex}", "object": "chat.completion",
+                "created": int(time.time()), "model": request.model,
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": result["response"]},
+                             "finish_reason": "stop"}],
+                "usage": result.get("usage", {}),
+            }
 
         @app.post("/v1/chat")
         async def chat(request: ChatRequest, x_api_key: str | None = Header(default=None)) -> dict[str, Any]:
