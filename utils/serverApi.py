@@ -84,6 +84,11 @@ class serverApi:
         async def health() -> dict[str, str]:
             return {"status": "ok"}
 
+        @app.api_route("/v1", methods=["GET", "HEAD"])
+        async def api_root() -> dict[str, str]:
+            """Open WebUI 会先用 HEAD /v1 探测 OpenAI 服务是否可达。"""
+            return {"status": "ok"}
+
         @app.get("/v1/models")
         async def models(x_api_key: str | None = Header(default=None)) -> dict[str, Any]:
             """Open WebUI 首次连接时调用的模型列表接口。"""
