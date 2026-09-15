@@ -141,11 +141,15 @@ class GGUFLoader(ModelLoader):
         messages.append({"role": "user", "content": prompt})
         start = time.perf_counter()
         try:
-            result = self._model.create_chat_completion(
-                messages=messages,
-                max_tokens=max_new_tokens, temperature=max(temperature, 0.01), top_p=top_p,
-                top_k=top_k, repeat_penalty=repetition_penalty, stop=stop_sequences,
-            )
+            sampling = {"max_tokens": max_new_tokens, "temperature": max(temperature, 0.01),
+                        "top_p": top_p, "top_k": top_k,
+                        "repeat_penalty": repetition_penalty, "stop": stop_sequences}
+            for key in ("min_p", "seed", "mirostat", "mirostat_eta", "mirostat_tau",
+                        "repeat_last_n", "tfs_z", "logit_bias", "frequency_penalty",
+                        "presence_penalty"):
+                if key in kwargs:
+                    sampling[key] = kwargs[key]
+            result = self._model.create_chat_completion(messages=messages, **sampling)
             text = str(result["choices"][0]["message"]["content"])
             usage = result.get("usage", {})
             prompt_tokens = int(usage.get("prompt_tokens", 0))
@@ -154,10 +158,7 @@ class GGUFLoader(ModelLoader):
             log_info("GGUF聊天接口不可用，回退普通生成", type(exc).__name__, exc)
             # 没有 chat template 时只能手工前置 system 段。
             prompt = f"{system_prompt}\n\n{prompt}" if system_prompt else prompt
-            result = self._model(
-                prompt, max_tokens=max_new_tokens, temperature=max(temperature, 0.01),
-                top_p=top_p, top_k=top_k, repeat_penalty=repetition_penalty, stop=stop_sequences,
-            )
+            result = self._model(prompt, **sampling)
             text = str(result["choices"][0].get("text", ""))
             tokens = len(self._model.tokenize(text.encode("utf-8")))
             prompt_tokens = len(self._model.tokenize(prompt.encode("utf-8")))

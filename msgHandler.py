@@ -14,8 +14,10 @@ from .utils.common import info, log
 
 # 每次请求可覆盖的采样参数；``max_tokens`` 在传给 Loader 前改名为 ``max_new_tokens``。
 GENERATION_KEYS = frozenset({
-    "temperature", "top_p", "top_k", "repetition_penalty",
-    "max_tokens", "stop_sequences", "system_prompt",
+    "temperature", "top_p", "top_k", "min_p", "repetition_penalty",
+    "max_tokens", "stop_sequences", "system_prompt", "seed", "logit_bias",
+    "frequency_penalty", "presence_penalty", "repeat_last_n", "tfs_z",
+    "mirostat", "mirostat_eta", "mirostat_tau",
 })
 
 

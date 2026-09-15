@@ -80,14 +80,13 @@ class VLLMLoader(ModelLoader):
         if system_prompt:
             prompt = f"{system_prompt}\n\n{prompt}"
 
-        sampling_params = SamplingParams(
-            max_tokens=max_new_tokens,
-            temperature=max(temperature, 0.01),
-            top_p=top_p,
-            top_k=top_k,
-            repetition_penalty=repetition_penalty,
-            stop=stop_sequences,
-        )
+        sampling = {"max_tokens": max_new_tokens, "temperature": max(temperature, 0.01),
+                    "top_p": top_p, "top_k": top_k,
+                    "repetition_penalty": repetition_penalty, "stop": stop_sequences}
+        for key in ("min_p", "seed", "frequency_penalty", "presence_penalty", "logit_bias"):
+            if key in kwargs:
+                sampling[key] = kwargs[key]
+        sampling_params = SamplingParams(**sampling)
 
         # 执行生成
         start_time = time.perf_counter()

@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import json
-import os
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -14,8 +13,8 @@ from typing import Any, AsyncIterator
 
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
-from starlette.responses import HTMLResponse, JSONResponse, StreamingResponse
+from pydantic import BaseModel, ConfigDict, Field
+from starlette.responses import JSONResponse, StreamingResponse
 
 from ..loader.models_mgr import ModelsMgr
 from ..msgHandler import MsgHandler
@@ -36,47 +35,112 @@ class MessageRequest(BaseModel):
 
 
 class OpenAIChatRequest(BaseModel):
-    """OpenAI/Open WebUI 发送的最小聊天请求结构。"""
+    """OpenAI/Open WebUI 文本聊天请求；后端不支持的字段保持兼容接收。"""
+
+    model_config = ConfigDict(extra="allow")
 
     model: str = ""
     messages: list[dict[str, Any]] = Field(default_factory=list)
-    temperature: float | None = None
-    top_p: float | None = None
-    max_tokens: int | None = None
     stream: bool = False
+    stream_options: dict[str, Any] | None = None
+    temperature: float | None = Field(default=None, ge=0)
+    top_p: float | None = Field(default=None, ge=0, le=1)
+    top_k: int | None = Field(default=None, ge=0)
+    min_p: float | None = Field(default=None, ge=0, le=1)
+    max_tokens: int | None = None
+    max_completion_tokens: int | None = None
+    stop: str | list[str] | None = None
+    seed: int | None = None
+    logit_bias: dict[str, float] | None = None
+    frequency_penalty: float | None = None
+    presence_penalty: float | None = None
+    repetition_penalty: float | None = None
+    repeat_penalty: float | None = None
+    repeat_last_n: int | None = None
+    tfs_z: float | None = None
+    mirostat: int | None = None
+    mirostat_eta: float | None = None
+    mirostat_tau: float | None = None
+    reasoning_effort: str | int | None = None
+    think: bool | int | None = None
+    system_prompt: str | None = None
+    stream_delta_chunk_size: int | None = Field(default=None, ge=0)
+    extra_body: dict[str, Any] = Field(default_factory=dict)
+    custom_parameters: dict[str, Any] = Field(default_factory=dict)
+    tools: list[dict[str, Any]] | None = None
+    tool_choice: Any = None
+    parallel_tool_calls: bool | None = None
+    function_call: Any = None
+    context_compression_threshold: int | float | None = None
+    format: Any = None
+    num_keep: int | None = None
+    num_ctx: int | None = None
+    num_batch: int | None = None
+    num_thread: int | None = None
+    num_gpu: int | None = None
+    keep_alive: Any = None
+    use_mmap: bool | None = None
+    use_mlock: bool | None = None
+
+
+_REQUEST_GENERATION_FIELDS = {
+    "temperature", "top_p", "top_k", "min_p", "max_tokens", "stop",
+    "seed", "logit_bias", "frequency_penalty", "presence_penalty",
+    "repetition_penalty", "repeat_penalty", "repeat_last_n", "tfs_z",
+    "mirostat", "mirostat_eta", "mirostat_tau",
+}
+
+
+def _message_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(str(item.get("text", "")) for item in content
+                       if isinstance(item, dict) and item.get("type") == "text")
+    return str(content or "")
+
+
+def _reasoning_level(value: str | int | None) -> int:
+    if isinstance(value, int):
+        return max(0, min(5, value))
+    return {"none": 0, "low": 1, "medium": 3, "high": 5}.get(str(value).lower(), 0)
+
+
+def _chat_prompt(messages: list[dict[str, Any]], system_prompt: str | None) -> str:
+    items = ([{"role": "system", "content": system_prompt}] if system_prompt else []) + messages
+    return "\n".join(f"{item.get('role', 'user')}: {_message_text(item.get('content'))}"
+                     for item in items if isinstance(item, dict))
+
+
+def _generation_params(request: OpenAIChatRequest) -> dict[str, Any]:
+    values = {key: getattr(request, key) for key in _REQUEST_GENERATION_FIELDS
+              if getattr(request, key) is not None}
+    values.update({key: value for key, value in request.extra_body.items()
+                   if key in _REQUEST_GENERATION_FIELDS and key not in values})
+    values.update({key: value for key, value in request.custom_parameters.items()
+                   if key in _REQUEST_GENERATION_FIELDS and key not in values})
+    if request.max_tokens is not None and request.max_completion_tokens is not None \
+            and request.max_tokens != request.max_completion_tokens:
+        raise HTTPException(status_code=400, detail="max_tokens 与 max_completion_tokens 冲突")
+    if request.max_tokens is None and request.max_completion_tokens is not None:
+        values["max_tokens"] = request.max_completion_tokens
+    if isinstance(values.get("stop"), str):
+        values["stop_sequences"] = [values.pop("stop")]
+    elif "stop" in values:
+        values["stop_sequences"] = values.pop("stop")
+    if values.get("repeat_penalty") is not None:
+        values["repetition_penalty"] = values.pop("repeat_penalty")
+    if request.repeat_penalty is not None:
+        values["repetition_penalty"] = request.repeat_penalty
+    if request.repetition_penalty is not None:
+        values["repetition_penalty"] = request.repetition_penalty
+    return values
 
 
 def response(model: str, special: int, status: str, value: Any, **extra: Any) -> dict[str, Any]:
     payload = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
     return {"request_id": str(uuid.uuid4()), "status": status, "model": model,
             "special": special, "response": payload, **extra}
-
-
-# ``desktop`` is an optional lightweight web UI served by this process.  It is
-# deliberately not the official Open WebUI backend; that backend can still use
-# the OpenAI-compatible routes below when this service runs in ``api`` mode.
-_DESKTOP_HTML = """<!doctype html>
-<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>AI Desktop Web UI</title><style>
-:root{font:16px system-ui,sans-serif;color:#e8e8e8;background:#171717}body{margin:0;height:100vh;display:flex;flex-direction:column}
-header{padding:14px 20px;border-bottom:1px solid #333;display:flex;gap:12px;align-items:center}header strong{margin-right:auto}
-select,button,textarea{font:inherit;border:1px solid #444;border-radius:6px;background:#242424;color:inherit;padding:8px}
-button{cursor:pointer;background:#4b55c8;border-color:#5963e0}button.secondary{background:#242424}
-#messages{flex:1;overflow:auto;padding:24px;display:flex;flex-direction:column;gap:12px}.message{max-width:850px;white-space:pre-wrap;line-height:1.5;padding:12px 15px;border-radius:8px;background:#242424}.user{align-self:flex-end;background:#303b77}
-form{display:flex;gap:10px;padding:14px 20px;border-top:1px solid #333}textarea{resize:none;flex:1;min-height:44px}small{opacity:.65}
-</style></head><body><header><strong>AI Desktop Web UI</strong><label>模型 <select id="model"></select></label><input id="api-key" type="password" placeholder="API Key（可选）" autocomplete="off"><button class="secondary" id="new">新建聊天</button></header>
-<main id="messages"><small>正在加载模型...</small></main><form id="form"><textarea id="prompt" placeholder="输入消息..." required></textarea><button>发送</button></form>
-<script>
-const model=document.querySelector('#model'),messages=document.querySelector('#messages'),prompt=document.querySelector('#prompt'),apiKey=document.querySelector('#api-key'),history=[];
-apiKey.value=sessionStorage.getItem('ai-api-key')||'';
-apiKey.onchange=()=>sessionStorage.setItem('ai-api-key',apiKey.value);
-function authHeaders(){const key=apiKey.value.trim();return key?{'X-API-Key':key}:{} }
-function add(text,kind){const el=document.createElement('div');el.className='message '+kind;el.textContent=text;messages.append(el);messages.scrollTop=messages.scrollHeight;return el}
-async function loadModels(){const r=await fetch('/v1/models',{headers:authHeaders()});if(!r.ok)throw Error('模型列表加载失败');const data=await r.json();model.replaceChildren(...(data.data||[]).map(x=>new Option(x.id,x.id)));if(!model.options.length)throw Error('models.json 中没有模型');messages.replaceChildren()}
-document.querySelector('#new').onclick=()=>{history.length=0;messages.replaceChildren()};
-document.querySelector('#form').onsubmit=async e=>{e.preventDefault();const text=prompt.value.trim();if(!text||!model.value)return;prompt.value='';history.push({role:'user',content:text});add(text,'user');const pending=add('正在生成...','assistant');try{const r=await fetch('/v1/chat/completions',{method:'POST',headers:{'Content-Type':'application/json',...authHeaders()},body:JSON.stringify({model:model.value,messages:history,stream:false})});const data=await r.json();if(!r.ok)throw Error(data.detail||data.error?.message||'请求失败');const answer=data.choices?.[0]?.message?.content||'无返回内容';pending.textContent=answer;history.push({role:'assistant',content:answer})}catch(err){history.pop();pending.textContent='错误：'+err.message}};
-loadModels().catch(err=>{messages.replaceChildren();add('错误：'+err.message,'assistant')});
-</script></body></html>"""
 
 
 class serverApi:
@@ -87,25 +151,11 @@ class serverApi:
         self.handler = handler or MsgHandler(manager)
         self.queue = self.handler
         self._server: Any = None
-        self.interface = self._get_interface()
         self.app = self._create_app()
-
-    def _get_interface(self) -> str:
-        """Return the selected listener/UI mode: ``api`` or ``desktop``."""
-        settings = self._server_settings()
-        value = os.getenv("AI_SERVER_INTERFACE", settings.get("interface", "api"))
-        value = str(value).strip().lower()
-        if value not in {"api", "desktop"}:
-            raise ValueError("server.interface 必须是 api 或 desktop")
-        return value
 
     def _port(self) -> int:
         settings = self._server_settings()
-        key, default = ("desktop_port", 3000) if self.interface == "desktop" else ("api_port", 8000)
-        if key in settings:
-            return int(settings[key])
-        # ``port`` is retained for old configs in API mode only.
-        return int(settings["port"]) if self.interface == "api" and "port" in settings else default
+        return int(settings.get("api_port", settings.get("port", 8000)))
 
     def _server_settings(self) -> dict[str, Any]:
         """读取服务配置；兼容旧配置把 ``server`` 放在根节点的写法。"""
@@ -148,9 +198,7 @@ class serverApi:
 
         @app.get("/", response_model=None)
         async def root() -> Any:
-            if self.interface == "desktop":
-                return HTMLResponse(_DESKTOP_HTML)
-            return JSONResponse({"status": "ok", "interface": "api", "openai_base_url": "/v1"})
+            return JSONResponse({"status": "ok", "openai_base_url": "/v1", "port": self._port()})
 
         @app.api_route("/v1", methods=["GET", "HEAD"])
         async def api_root() -> dict[str, str]:
@@ -182,21 +230,18 @@ class serverApi:
             if not request.model:
                 raise HTTPException(status_code=400, detail="model 不能为空")
             messages = request.messages or []
-            prompt_parts = [
-                f"{item.get('role', 'user')}: {item.get('content', '')}"
-                for item in messages if isinstance(item, dict)
-            ]
-            prompt = "\n".join(prompt_parts)
-            deploy = {
-                key: value for key, value in {
-                    "temperature": request.temperature,
-                    "top_p": request.top_p,
-                    "max_tokens": request.max_tokens,
-                }.items() if value is not None
-            }
+            if any(isinstance(item.get("content"), list) and
+                   any(part.get("type") != "text" for part in item["content"]
+                       if isinstance(part, dict)) for item in messages if isinstance(item, dict)):
+                raise HTTPException(status_code=400, detail="当前服务仅支持文本消息")
+            prompt = _chat_prompt(messages, request.system_prompt)
+            deploy = _generation_params(request)
             result = await self.handler.handle(
                 0, {"model": request.model, "prompt": prompt, "deploy": deploy},
-                model=request.model, prompt=prompt, deploy=deploy, source="openwebui",
+                model=request.model, prompt=prompt, deploy=deploy,
+                think=(int(request.think) if isinstance(request.think, bool) else request.think)
+                if request.think is not None else _reasoning_level(request.reasoning_effort),
+                source="openwebui",
             )
             if result.get("status") != "ok":
                 raise HTTPException(status_code=500, detail=result.get("response", "模型生成失败"))
@@ -205,7 +250,9 @@ class serverApi:
                 "created": int(time.time()), "model": request.model,
                 "choices": [{"index": 0, "message": {"role": "assistant", "content": result["response"]},
                              "finish_reason": "stop"}],
-                "usage": result.get("usage", {}),
+                "usage": {**result.get("usage", {}),
+                          "total_tokens": result.get("usage", {}).get("prompt_tokens", 0)
+                          + result.get("usage", {}).get("completion_tokens", 0)},
             }
             if not request.stream:
                 return payload
@@ -213,11 +260,25 @@ class serverApi:
             async def events() -> AsyncIterator[str]:
                 # Generation is currently one-shot; SSE keeps clients compatible
                 # and can become token streaming when loaders expose an iterator.
-                chunk = {"id": payload["id"], "object": "chat.completion.chunk",
-                         "created": payload["created"], "model": request.model,
-                         "choices": [{"index": 0, "delta": {"role": "assistant",
-                                      "content": result["response"]}, "finish_reason": None}]}
-                yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                content = result["response"]
+                size = request.stream_delta_chunk_size or len(content) or 1
+                for index in range(0, len(content), size):
+                    chunk = {"id": payload["id"], "object": "chat.completion.chunk",
+                             "created": payload["created"], "model": request.model,
+                             "choices": [{"index": 0, "delta": {
+                                 **({"role": "assistant"} if index == 0 else {}),
+                                 "content": content[index:index + size]},
+                                 "finish_reason": None}]}
+                    yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                end = {"id": payload["id"], "object": "chat.completion.chunk",
+                       "created": payload["created"], "model": request.model,
+                       "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
+                yield f"data: {json.dumps(end, ensure_ascii=False)}\n\n"
+                if (request.stream_options or {}).get("include_usage"):
+                    usage = {"id": payload["id"], "object": "chat.completion.chunk",
+                             "created": payload["created"], "model": request.model,
+                             "choices": [], "usage": payload["usage"]}
+                    yield f"data: {json.dumps(usage, ensure_ascii=False)}\n\n"
                 yield "data: [DONE]\n\n"
 
             return StreamingResponse(events(), media_type="text/event-stream")

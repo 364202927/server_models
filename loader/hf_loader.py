@@ -173,6 +173,9 @@ class HFLoader(ModelLoader):
         if not self.is_loaded:
             raise RuntimeError("Model not loaded. Call load() first.")
 
+        if "seed" in kwargs:
+            torch.manual_seed(int(kwargs["seed"]))
+
         # 编码输入
         inputs = self._tokenizer(self._build_prompt(prompt, system_prompt), return_tensors="pt")
         input_ids = inputs["input_ids"].to(self._model.device)
@@ -188,6 +191,8 @@ class HFLoader(ModelLoader):
             "do_sample": temperature > 0,
             "pad_token_id": self._tokenizer.eos_token_id,
         }
+        if "min_p" in kwargs:
+            gen_kwargs["min_p"] = kwargs["min_p"]
 
         # 处理停止序列
         if stop_sequences:
