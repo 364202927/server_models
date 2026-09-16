@@ -5,11 +5,16 @@ HuggingFace Transformers 模型加载器
 局限: 单batch推理，速度较vLLM慢
 """
 
+import copy
+import json
+import re
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
-from .base import ModelLoader, ModelInfo, GenerationResult, MemoryUsage
+from .base import (GenerationResult, MemoryUsage, ModelInfo, ModelLoader,
+                   ToolCapabilityError, ToolOutputError)
 
 
 class HFLoader(ModelLoader):
@@ -119,6 +124,7 @@ class HFLoader(ModelLoader):
             except StopIteration:
                 pass
         self._model_info = self._extract_model_info(model_path, quantization=quantization, dtype=dtype)
+        self._tool_parser = kwargs.get("tool_parser")
 
         # 提取模型元信息
         self._update_model_metadata()
@@ -137,6 +143,8 @@ class HFLoader(ModelLoader):
             "tensor_parallel": tensor_parallel_size,
             "gpu_split": kwargs.get("gpu_split"),
             "trust_remote_code": trust_remote_code,
+            "tool_parser": self._tool_parser,
+            "chat_format": kwargs.get("chat_format"),
         }
 
         return self
@@ -176,8 +184,11 @@ class HFLoader(ModelLoader):
         if "seed" in kwargs:
             torch.manual_seed(int(kwargs["seed"]))
 
-        # 编码输入
-        inputs = self._tokenizer(self._build_prompt(prompt, system_prompt), return_tensors="pt")
+        tool_mode = kwargs.get("messages") is not None
+        rendered = (self._build_tool_prompt(kwargs["messages"], kwargs.get("tools", []),
+                                            kwargs.get("tool_choice"))
+                    if tool_mode else self._build_prompt(prompt, system_prompt))
+        inputs = self._tokenizer(rendered, return_tensors="pt")
         input_ids = inputs["input_ids"].to(self._model.device)
         prompt_tokens = input_ids.shape[1]
 
@@ -209,13 +220,73 @@ class HFLoader(ModelLoader):
         generated_ids = outputs[0][prompt_tokens:]
         tokens_generated = len(generated_ids)
 
+        text = self._tokenizer.decode(generated_ids, skip_special_tokens=not tool_mode)
+        content, tool_calls = self._parse_tool_output(text) if tool_mode else (text, [])
         return GenerationResult(
-            text=self._tokenizer.decode(generated_ids, skip_special_tokens=True),
+            text=content,
             tokens_generated=tokens_generated,
             time_seconds=elapsed,
             tokens_per_second=tokens_generated / elapsed if elapsed > 0 else 0,
             prompt_tokens=prompt_tokens,
+            tool_calls=tool_calls,
+            finish_reason=("tool_calls" if tool_calls else
+                           "length" if tokens_generated >= max_new_tokens else "stop"),
         )
+
+    def _build_tool_prompt(
+        self, messages: list[dict[str, Any]], tools: list[dict[str, Any]], tool_choice: Any,
+    ) -> str:
+        if self._tool_parser != "hermes_json":
+            raise ToolCapabilityError("HF 工具调用需要配置 load.tool_parser=hermes_json")
+        prepared = copy.deepcopy(messages)
+        for message in prepared:
+            for call in message.get("tool_calls", []):
+                arguments = call.get("function", {}).get("arguments")
+                if isinstance(arguments, str):
+                    call["function"]["arguments"] = json.loads(arguments)
+        if tool_choice == "none":
+            tools = []
+        elif tool_choice == "required":
+            prepared.insert(0, {"role": "system", "content": "你必须调用至少一个可用工具。"})
+        elif isinstance(tool_choice, dict):
+            name = tool_choice["function"]["name"]
+            tools = [tool for tool in tools if tool["function"]["name"] == name]
+            prepared.insert(0, {"role": "system", "content": f"你必须调用工具 {name}。"})
+        try:
+            return self._tokenizer.apply_chat_template(
+                prepared, tools=tools, tokenize=False, add_generation_prompt=True,
+            )
+        except (AttributeError, ValueError, TypeError) as exc:
+            raise ToolCapabilityError("当前 HF tokenizer 缺少可用的工具聊天模板") from exc
+
+    def _parse_tool_output(self, text: str) -> tuple[str, list[dict[str, Any]]]:
+        if self._tool_parser != "hermes_json":
+            raise ToolCapabilityError("HF 工具调用需要配置 load.tool_parser=hermes_json")
+        pattern = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
+        matches = list(pattern.finditer(text))
+        if "<tool_call>" in text and not matches:
+            raise ToolOutputError("模型返回了未闭合的 <tool_call>")
+        calls = []
+        for match in matches:
+            try:
+                value = json.loads(match.group(1))
+                function = value.get("function", value)
+                name = function["name"]
+                arguments = function.get("arguments", {})
+                if isinstance(arguments, str):
+                    arguments = json.loads(arguments)
+            except (json.JSONDecodeError, KeyError, TypeError) as exc:
+                raise ToolOutputError("模型返回了无效的 Hermes 工具调用") from exc
+            calls.append({"id": str(value.get("id") or f"call_{uuid.uuid4().hex}"),
+                          "type": "function", "function": {
+                              "name": name,
+                              "arguments": json.dumps(arguments, ensure_ascii=False,
+                                                      separators=(",", ":")),
+                          }})
+        content = pattern.sub("", text)
+        for token in ("<|im_end|>", "<|endoftext|>"):
+            content = content.replace(token, "")
+        return content.strip(), calls
 
     def _build_prompt(self, prompt: str, system_prompt: str) -> str:
         """优先走 tokenizer 的 chat template 注入 system 段，没有则手工前置。"""

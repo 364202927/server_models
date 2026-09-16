@@ -19,7 +19,11 @@ CACHE_DEFAULTS: dict[str, Any] = {
 
 @dataclass
 class ModelLoadConfig:
-    """模型第一次加载时使用的参数。缺少字段时使用模型/后端默认值。"""
+    """模型第一次加载时使用的参数。
+
+    HF 工具调用显式配置 ``tool_parser: hermes_json``；GGUF 配置
+    ``chat_format: chatml-function-calling``。未配置的模型只支持文本生成。
+    """
 
     dtype: str = "float16"
     context_length: int | None = None
@@ -32,6 +36,8 @@ class ModelLoadConfig:
     tensor_parallel: int = 1
     gpu_split: list[float] | None = None
     trust_remote_code: bool = True
+    tool_parser: str | None = None
+    chat_format: str | None = None
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any] | None) -> "ModelLoadConfig":
@@ -54,6 +60,8 @@ class ModelLoadConfig:
             "draft_model": self.draft_model,
             "speculative_decoding": self.speculative_decoding,
             "gpu_split": self.gpu_split,
+            "tool_parser": self.tool_parser,
+            "chat_format": self.chat_format,
         }
 
 

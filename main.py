@@ -28,8 +28,8 @@ REAP_INTERVAL_SEC = 30
 manager = ModelsMgr(str(MODELS_FILE))
 handler = MsgHandler(manager)
 server = serverApi(manager, handler)
-console = Console(command_handler=lambda message_id, data: handler.handle(
-    message_id, data, source="console"))
+console = Console(command_handler=lambda message_id, args: handler.handle(
+    message_id, args, source="console"))
 app = server.app
 
 

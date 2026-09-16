@@ -37,6 +37,16 @@ class GenerationResult:
     time_seconds: float
     tokens_per_second: float
     prompt_tokens: int = 0
+    tool_calls: list[dict[str, Any]] = field(default_factory=list)
+    finish_reason: str = "stop"
+
+
+class ToolCapabilityError(ValueError):
+    """The configured model backend cannot honor a tool request."""
+
+
+class ToolOutputError(RuntimeError):
+    """The model produced an invalid tool call."""
 
 
 @dataclass

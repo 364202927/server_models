@@ -10,7 +10,8 @@ import re
 from pathlib import Path
 from typing import Any
 
-from .base import GenerationResult, MemoryUsage, ModelLoader
+from .base import (GenerationResult, MemoryUsage, ModelLoader,
+                   ToolCapabilityError, ToolOutputError)
 from ..utils.common import info as log_info
 
 
@@ -85,6 +86,9 @@ class GGUFLoader(ModelLoader):
         if kwargs.get("gpu_split"):
             # tensor_split 用每张卡的相对分配比例；None 表示 llama.cpp 自动分配。
             llm_kwargs["tensor_split"] = kwargs["gpu_split"]
+        self._chat_format = kwargs.get("chat_format")
+        if self._chat_format:
+            llm_kwargs["chat_format"] = self._chat_format
         log_info("GGUF加载参数", str(source), llm_kwargs)
         self._model = Llama(**llm_kwargs)
         self._model_info = self._extract_model_info(str(source), dtype=dtype)
@@ -117,6 +121,8 @@ class GGUFLoader(ModelLoader):
             "tensor_parallel": tensor_parallel_size,
             "gpu_split": kwargs.get("gpu_split"),
             "trust_remote_code": trust_remote_code,
+            "tool_parser": kwargs.get("tool_parser"),
+            "chat_format": self._chat_format,
         }
         return self
 
@@ -135,11 +141,22 @@ class GGUFLoader(ModelLoader):
     ) -> GenerationResult:
         if not self.is_loaded:
             raise RuntimeError("Model not loaded. Call load() first.")
+        if kwargs.get("messages") is not None:
+            tool_kwargs = {key: value for key, value in kwargs.items()
+                           if key not in {"messages", "tools", "tool_choice",
+                                          "parallel_tool_calls"}}
+            return self._generate_tools(
+                kwargs["messages"], kwargs.get("tools", []), kwargs.get("tool_choice"),
+                max_new_tokens=max_new_tokens, temperature=temperature, top_p=top_p,
+                top_k=top_k, repetition_penalty=repetition_penalty,
+                stop_sequences=stop_sequences, **tool_kwargs,
+            )
         messages: list[dict[str, str]] = []
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
         messages.append({"role": "user", "content": prompt})
         start = time.perf_counter()
+        finish_reason = "stop"
         try:
             sampling = {"max_tokens": max_new_tokens, "temperature": max(temperature, 0.01),
                         "top_p": top_p, "top_k": top_k,
@@ -150,7 +167,9 @@ class GGUFLoader(ModelLoader):
                 if key in kwargs:
                     sampling[key] = kwargs[key]
             result = self._model.create_chat_completion(messages=messages, **sampling)
-            text = str(result["choices"][0]["message"]["content"])
+            choice = result["choices"][0]
+            text = str(choice["message"]["content"])
+            finish_reason = str(choice.get("finish_reason") or "stop")
             usage = result.get("usage", {})
             prompt_tokens = int(usage.get("prompt_tokens", 0))
             tokens = int(usage.get("completion_tokens", 0))
@@ -161,9 +180,56 @@ class GGUFLoader(ModelLoader):
             result = self._model(prompt, **sampling)
             text = str(result["choices"][0].get("text", ""))
             tokens = len(self._model.tokenize(text.encode("utf-8")))
+            finish_reason = str(result["choices"][0].get("finish_reason") or
+                                ("length" if tokens >= max_new_tokens else "stop"))
             prompt_tokens = len(self._model.tokenize(prompt.encode("utf-8")))
         elapsed = time.perf_counter() - start
-        return GenerationResult(text, tokens, elapsed, tokens / elapsed if elapsed else 0.0, prompt_tokens)
+        return GenerationResult(text, tokens, elapsed, tokens / elapsed if elapsed else 0.0,
+                                prompt_tokens, finish_reason=finish_reason)
+
+    def _generate_tools(
+        self, messages: list[dict[str, Any]], tools: list[dict[str, Any]], tool_choice: Any,
+        *, max_new_tokens: int, temperature: float, top_p: float, top_k: int,
+        repetition_penalty: float, stop_sequences: list[str] | None, **kwargs: Any,
+    ) -> GenerationResult:
+        if self._chat_format != "chatml-function-calling":
+            raise ToolCapabilityError(
+                "GGUF 工具调用需要配置 load.chat_format=chatml-function-calling"
+            )
+        messages = [dict(item) for item in messages]
+        backend_choice = tool_choice
+        if tool_choice == "required":
+            backend_choice = "auto"
+            messages.insert(0, {"role": "system", "content": "你必须调用至少一个可用工具。"})
+        sampling = {"max_tokens": max_new_tokens, "temperature": max(temperature, 0.01),
+                    "top_p": top_p, "top_k": top_k,
+                    "repeat_penalty": repetition_penalty, "stop": stop_sequences}
+        for key in ("min_p", "seed", "mirostat", "mirostat_eta", "mirostat_tau",
+                    "repeat_last_n", "tfs_z", "logit_bias", "frequency_penalty",
+                    "presence_penalty"):
+            if key in kwargs:
+                sampling[key] = kwargs[key]
+        start = time.perf_counter()
+        try:
+            result = self._model.create_chat_completion(
+                messages=messages, tools=tools, tool_choice=backend_choice, **sampling,
+            )
+            choice = result["choices"][0]
+            message = choice["message"]
+        except (AttributeError, TypeError, KeyError, ValueError) as exc:
+            raise ToolCapabilityError(f"GGUF 工具聊天接口不可用: {exc}") from exc
+        calls = message.get("tool_calls") or []
+        if not isinstance(calls, list):
+            raise ToolOutputError("GGUF 后端返回的 tool_calls 不是数组")
+        usage = result.get("usage", {})
+        elapsed = time.perf_counter() - start
+        tokens = int(usage.get("completion_tokens", 0))
+        return GenerationResult(
+            str(message.get("content") or ""), tokens, elapsed,
+            tokens / elapsed if elapsed else 0.0,
+            int(usage.get("prompt_tokens", 0)), calls,
+            str(choice.get("finish_reason") or ("tool_calls" if calls else "stop")),
+        )
 
     @staticmethod
     def _guess_quantization(filename: str) -> str | None:
