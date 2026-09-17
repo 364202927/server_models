@@ -2,7 +2,7 @@
   "defaults": {
     "server": {
       "host": "0.0.0.0",
-      "api_port": 8000,
+      "api_port": 8666,
       "api_key": ""
     },
     "sleep": {
@@ -18,32 +18,14 @@
       "top_k": 50,
       "repetition_penalty": 1.05,
       "max_tokens": 512,
-      "stop_sequences": [],
+      "stop_sequences": [ ],
       "mirostat": 0,
       "system_prompt": ""
     }
   },
   "models": {
     "qwen3.8-27B": {
-      "path": "D:/ai/models/Qwen3.8-27B-Uncensored-GGUF/Qwen3.8-27B-Uncensored-IQ4_XS.gguf",
-      "estimated_vram_mb": null,
-      "load": {
-        "dtype": "float16",
-        "context_length": 4096,
-        "batch_size": 1,
-        "flash_attention": true,
-        "draft_model": null,
-        "speculative_decoding": false,
-        "tensor_parallel": 1,
-        "gpu_split": null,
-        "trust_remote_code": true
-      },
-      "cache": {
-        "state_snapshot_enabled": false,
-        "prompt_cache_enabled": false,
-        "kv_cache_enabled": false,
-        "cache_dir": "assets/cache"
-      }
+      "path": "D:/ai/models/Qwen3.8-27B-Uncensored-GGUF/Qwen3.8-27B-Uncensored-IQ4_XS.gguf"
     }
   }
 }
