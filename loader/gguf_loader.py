@@ -62,6 +62,11 @@ def _build_sampling(max_new_tokens: int, temperature: float, top_p: float, top_k
                "top_p": top_p, "top_k": top_k, "repeat_penalty": repetition_penalty,
                "stop": stop_sequences}
     sampling.update({key: extra[key] for key in _EXTRA_SAMPLING_KEYS if key in extra})
+    if "mirostat" in sampling:
+        # OpenAI/Ollama 协议里这个参数叫 mirostat；llama-cpp-python 的
+        # Llama.__call__/create_chat_completion 实际接收的形参名是
+        # mirostat_mode，直传 "mirostat" 会被当成未知关键字参数拒绝。
+        sampling["mirostat_mode"] = sampling.pop("mirostat")
     return sampling
 
 
@@ -189,14 +194,14 @@ class GGUFLoader(ModelLoader):
         # 分支键是 tools，不是 messages：没有工具时走普通聊天，
         # 和改造前的普通对话行为一致，只是现在用的是完整多轮 messages。
         tools = kwargs.get("tools") or []
-        tool_choice = kwargs.get("tool_choice")
-        if not tools or tool_choice == "none":
+        if not tools:
             return self._chat(messages, sampling, max_new_tokens)
         if self._chat_format == "chatml-function-calling":
-            return self._chat_with_backend_tools(messages, tools, tool_choice, sampling)
+            return self._chat_with_backend_tools(messages, tools, kwargs.get("tool_choice"), sampling)
         # 未配置 chatml-function-calling 不再直接报错：先尝试模型自带模板
         # 支持的 Hermes 风格 <tool_call> 兜底（如 Qwen3 原生就是这个格式）。
-        return self._chat_with_hermes_tools(messages, tools, tool_choice, sampling, max_new_tokens)
+        return self._chat_with_hermes_tools(messages, tools, kwargs.get("tool_choice"),
+                                            sampling, max_new_tokens)
 
     def _chat(self, messages: list[dict[str, Any]], sampling: dict[str, Any],
              max_new_tokens: int) -> GenerationResult:
