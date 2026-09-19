@@ -1,11 +1,20 @@
-"""Console 与 FastAPI 共用的统一消息处理器。"""
+"""Console 与 FastAPI 共用的统一消息处理器。
+
+单流程说明：无论请求是 Console 的裸 prompt 还是 HTTP 的结构化 messages，
+最终都会在 _generate_chat -> _build_messages 这一步统一成同一份 messages
+交给 Loader；Loader 内部只按"有没有 tools"决定走普通聊天模板还是工具模板，
+不再区分"有没有 messages"。
+"""
+
 from __future__ import annotations
+
 import asyncio
 import json
 import re
 import uuid
 from dataclasses import dataclass, field
 from typing import Any
+
 from .hardware import detect_hardware
 from .loader.base import ToolCapabilityError, ToolOutputError
 from .loader.model_spec import LOAD_KEYS
@@ -22,9 +31,11 @@ GENERATION_KEYS = frozenset({
 SUPPORTED_MESSAGE_IDS = frozenset({0, 1001, 1002, 1003, 1004, 1005, 1006, 1007})
 _TOOL_NAME = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
+
 # --------------------------------------------------------------------------
 # 工具调用请求/响应的校验；均为纯函数，可脱离 MsgHandler 独立测试。
 # --------------------------------------------------------------------------
+
 def _validate_tools(tools: list[dict[str, Any]]) -> set[str]:
     """校验 tools 列表中每个函数工具定义是否合法，返回已出现过的工具名集合。"""
     names: set[str] = set()
@@ -44,6 +55,7 @@ def _validate_tools(tools: list[dict[str, Any]]) -> set[str]:
         names.add(name)
     return names
 
+
 def _resolve_tool_choice(tool_choice: Any, tools: list[dict[str, Any]], names: set[str]) -> str | dict[str, Any]:
     """解析并校验 tool_choice，返回规范化后的取值。"""
     choice = tool_choice if tool_choice is not None else ("auto" if tools else "none")
@@ -61,13 +73,14 @@ def _resolve_tool_choice(tool_choice: Any, tools: list[dict[str, Any]], names: s
         return choice
     raise ValueError("tool_choice 必须是 none/auto/required 或函数选择对象")
 
+
 def _validate_message_history(messages: list[dict[str, Any]]) -> None:
     """校验对话历史里 tool_calls 与 role=tool 结果的配对是否完整、合法。"""
     known: set[str] = set()
     pending: set[str] = set()
     completed: set[str] = set()
 
-    def _register_calls(calls: Any, role: str) -> None:
+    def register_calls(calls: Any, role: str) -> None:
         if role != "assistant" or not isinstance(calls, list) or not calls:
             raise ValueError("tool_calls 只能出现在 assistant 消息且不能为空")
         for call in calls:
@@ -86,7 +99,7 @@ def _validate_message_history(messages: list[dict[str, Any]]) -> None:
             known.add(call_id)
             pending.add(call_id)
 
-    def _consume_tool_result(message: dict[str, Any]) -> None:
+    def consume_tool_result(message: dict[str, Any]) -> None:
         call_id = message.get("tool_call_id")
         if not isinstance(call_id, str) or call_id not in pending:
             suffix = "已重复回传" if call_id in completed else "不存在"
@@ -102,41 +115,31 @@ def _validate_message_history(messages: list[dict[str, Any]]) -> None:
             raise ValueError("工具调用结果未补齐，不能开始下一轮消息")
         calls = message.get("tool_calls")
         if calls is not None:
-            _register_calls(calls, role)
+            register_calls(calls, role)
         if role == "tool":
-            _consume_tool_result(message)
+            consume_tool_result(message)
     if pending:
         raise ValueError("工具调用结果未补齐: " + ", ".join(sorted(pending)))
-    
-def validate_tool_request(messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None,tool_choice: Any) -> tuple[list[dict[str, Any]], str | dict[str, Any]]:
-    """校验现代 function 工具定义与历史消息中的工具调用配对，返回规范化后的 (tools, tool_choice)。"""
+
+
+def validate_tool_request(messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None,
+                           tool_choice: Any) -> tuple[list[dict[str, Any]], str | dict[str, Any]]:
+    """校验现代 function 工具定义与历史消息中的工具调用配对，返回规范化后的 (tools, tool_choice)。
+
+    这里始终对 messages 做结构校验（不管本次是否带 tools），因为服务端始终
+    把结构化 messages 交给 Loader；tools 为空时 tool_choice 会被归一为
+    "none"，下游据此判断"这是一次普通对话"。
+    """
     tools = tools or []
     names = _validate_tools(tools)
     choice = _resolve_tool_choice(tool_choice, tools, names)
     _validate_message_history(messages)
     return tools, choice
 
-def validate_tool_output(calls: list[dict[str, Any]], tools: list[dict[str, Any]],choice: str | dict[str, Any], parallel: bool) -> list[dict[str, Any]]:
+
+def validate_tool_output(calls: list[dict[str, Any]], tools: list[dict[str, Any]],
+                          choice: str | dict[str, Any], parallel: bool) -> list[dict[str, Any]]:
     """校验并规范化模型返回的工具调用，确保符合本次请求的 tool_choice/parallel_tool_calls 约束。"""
-    def _normalize(call: dict[str, Any]) -> dict[str, Any]:
-            function = call.get("function") if isinstance(call, dict) else None
-            name = function.get("name") if isinstance(function, dict) else None
-            if name not in names or (forced and name != forced):
-                raise ToolOutputError(f"模型调用了未允许的工具: {name}")
-            arguments = function.get("arguments", "{}")
-            if not isinstance(arguments, str):
-                arguments = json.dumps(arguments, ensure_ascii=False, separators=(",", ":"))
-            try:
-                if not isinstance(json.loads(arguments), dict):
-                    raise ValueError
-            except (json.JSONDecodeError, ValueError) as exc:
-                raise ToolOutputError(f"工具 {name} 的 arguments 不是 JSON 对象") from exc
-            call_id = str(call.get("id") or f"call_{uuid.uuid4().hex}")
-            if call_id in call_ids:
-                raise ToolOutputError(f"模型返回了重复的工具调用 ID: {call_id}")
-            call_ids.add(call_id)
-            return {"id": call_id, "type": "function", "function": {"name": name, "arguments": arguments}}
-    
     if choice == "none" and calls:
         raise ToolOutputError("模型在 tool_choice=none 时返回了工具调用")
     if choice == "required" and not calls:
@@ -147,7 +150,27 @@ def validate_tool_output(calls: list[dict[str, Any]], tools: list[dict[str, Any]
     names = {tool["function"]["name"] for tool in tools}
     forced = choice.get("function", {}).get("name") if isinstance(choice, dict) else None
     call_ids: set[str] = set()
-    return [_normalize(call) for call in calls]
+
+    def normalize(call: dict[str, Any]) -> dict[str, Any]:
+        function = call.get("function") if isinstance(call, dict) else None
+        name = function.get("name") if isinstance(function, dict) else None
+        if name not in names or (forced and name != forced):
+            raise ToolOutputError(f"模型调用了未允许的工具: {name}")
+        arguments = function.get("arguments", "{}")
+        if not isinstance(arguments, str):
+            arguments = json.dumps(arguments, ensure_ascii=False, separators=(",", ":"))
+        try:
+            if not isinstance(json.loads(arguments), dict):
+                raise ValueError
+        except (json.JSONDecodeError, ValueError) as exc:
+            raise ToolOutputError(f"工具 {name} 的 arguments 不是 JSON 对象") from exc
+        call_id = str(call.get("id") or f"call_{uuid.uuid4().hex}")
+        if call_id in call_ids:
+            raise ToolOutputError(f"模型返回了重复的工具调用 ID: {call_id}")
+        call_ids.add(call_id)
+        return {"id": call_id, "type": "function", "function": {"name": name, "arguments": arguments}}
+
+    return [normalize(call) for call in calls]
 
 
 @dataclass
@@ -176,7 +199,7 @@ class MsgHandler:
     @property
     def pending(self) -> int:
         return self._pending
-    
+
     length = pending  # 兼容外部代码按 length 属性访问排队数（如确认无外部引用可删除）
 
     @staticmethod
@@ -193,7 +216,11 @@ class MsgHandler:
             return str(args[0])
         return str(args or "")
 
-    async def handle(self, message_id: int, args: Any = None, *, model: str = "", prompt: str = "",think: int = 0, deploy: dict[str, Any] | None = None, source: str = "unknown",messages: list[dict[str, Any]] | None = None,tools: list[dict[str, Any]] | None = None, tool_choice: Any = None,parallel_tool_calls: bool = True, system_prompt: str = "") -> dict[str, Any]:
+    async def handle(self, message_id: int, args: Any = None, *, model: str = "", prompt: str = "",
+                      think: int = 0, deploy: dict[str, Any] | None = None, source: str = "unknown",
+                      messages: list[dict[str, Any]] | None = None,
+                      tools: list[dict[str, Any]] | None = None, tool_choice: Any = None,
+                      parallel_tool_calls: bool = True, system_prompt: str = "") -> dict[str, Any]:
         """统一入口：校验请求合法性后串行分发给 ModelsMgr。message_id=0 为聊天，1001~1007 为管理指令。"""
         if message_id not in SUPPORTED_MESSAGE_IDS:
             raise ValueError(f"不支持的 message_id: {message_id}")
@@ -252,11 +279,12 @@ class MsgHandler:
             return self._response(model, message_id, "error", str(exc))
         except Exception as exc:
             # 推理后端可能抛出自定义异常；统一转成可见的错误响应，避免
-            # Console/FastAPI 只看到“消息处理开始”却没有结束结果。
+            # Console/FastAPI 只看到"消息处理开始"却没有结束结果。
             log("消息处理异常:", type(exc).__name__, exc)
             return self._response(model, message_id, "error", f"推理失败: {exc}")
 
     # ---- 管理指令：每个 message_id 对应一个独立方法，便于单独测试/复用 ----
+
     def _status(self, model: str) -> dict[str, Any]:
         value = self.manager.status()
         value["queue_length"] = self.pending
@@ -286,12 +314,34 @@ class MsgHandler:
         merged = await asyncio.to_thread(self.manager.update_generation, target, changes)
         return self._response(target, 1007, "ok", merged)
 
-    # ---- message_id == 0：聊天/工具调用 ----
-    async def _generate_chat(self, model: str, prompt: str, payload: dict[str, Any],ctx: _ChatContext) -> dict[str, Any]:
-        """构建生成参数并调用 Loader；处理 message_id == 0 的核心逻辑。"""
-        def _think_instruction() -> str:
+    # ---- message_id == 0：聊天/工具调用（单流程：统一走结构化 messages）----
+
+    def _build_messages(self, prompt: str, ctx: _ChatContext, default_system: str) -> list[dict[str, Any]]:
+        """把 Console 的裸 prompt 与 HTTP 的结构化 messages 统一成同一份 messages。
+
+        system 段来源（从低到高优先级，同时给出时依次拼接）：
+        模型配置的默认 system_prompt → 请求级 system_prompt → think 等级指令。
+        与 messages 里已有的首条 system 消息合并，避免出现两条 system。
+        """
+        messages = ([dict(item) for item in ctx.messages] if ctx.messages is not None
+                    else [{"role": "user", "content": prompt}])
+
+        def think_instruction() -> str:
             return f"请以推理等级 {ctx.think}/5 分析后给出最终答案。" if ctx.think else ""
 
+        segments = [text for text in (default_system, ctx.system_prompt, think_instruction()) if text]
+        if not segments:
+            return messages
+        if messages and messages[0].get("role") == "system":
+            existing = str(messages[0].get("content") or "")
+            messages[0]["content"] = "\n\n".join([*segments, existing] if existing else segments)
+        else:
+            messages.insert(0, {"role": "system", "content": "\n\n".join(segments)})
+        return messages
+
+    async def _generate_chat(self, model: str, prompt: str, payload: dict[str, Any],
+                              ctx: _ChatContext) -> dict[str, Any]:
+        """构建生成参数并调用 Loader；处理 message_id == 0 的核心逻辑。"""
         deploy = {**dict(payload.get("deploy", {})), **ctx.deploy}
         changes = {key: value for key, value in deploy.items() if key in LOAD_KEYS}
         if changes:
@@ -305,20 +355,19 @@ class MsgHandler:
         if "max_tokens" in params:
             params["max_new_tokens"] = params.pop("max_tokens")
 
-        messages = ctx.messages
-        if messages is not None:
-            messages = [dict(item) for item in messages]
-            instructions = [item for item in (ctx.system_prompt, _think_instruction()) if item]
-            if instructions:
-                messages.insert(0, {"role": "system", "content": "\n\n".join(instructions)})
-            params.update({"messages": messages, "tools": ctx.tools, "tool_choice": ctx.tool_choice,
-                           "parallel_tool_calls": ctx.parallel_tool_calls})
-        elif ctx.think:
-            prompt = f"{_think_instruction()}\n\n{prompt}"
+        # 单流程核心：所有聊天请求统一走结构化 messages。system_prompt 从这里
+        # 摘出来折进 messages，避免 Loader 端对同一份系统提示做两次处理
+        # （原来结构化分支会静默丢弃模型级默认 system_prompt，这里一并修掉）。
+        default_system = str(params.pop("system_prompt", "") or "")
+        messages = self._build_messages(prompt, ctx, default_system)
+        params.update({"messages": messages, "tools": ctx.tools, "tool_choice": ctx.tool_choice,
+                       "parallel_tool_calls": ctx.parallel_tool_calls})
 
         result = await asyncio.to_thread(self.manager.generate, model, prompt, **params)
+        # 没有声明 tools 时不校验工具输出：普通对话里模型偶发吐出类似
+        # <tool_call> 的文本不该被当成协议违规而返回 502，原样按文本处理。
         calls = (validate_tool_output(result.tool_calls, ctx.tools, ctx.tool_choice, ctx.parallel_tool_calls)
-                 if messages is not None else result.tool_calls)
+                 if ctx.tools else [])
         return self._response(model, 0, "ok", result.text) | {
             "tool_calls": calls,
             "finish_reason": "tool_calls" if calls else result.finish_reason,
@@ -330,4 +379,5 @@ class MsgHandler:
 
 
 msgHandler = MsgHandler
-__all__ = ["GENERATION_KEYS", "SUPPORTED_MESSAGE_IDS", "MsgHandler", "msgHandler","validate_tool_request", "validate_tool_output"]
+__all__ = ["GENERATION_KEYS", "SUPPORTED_MESSAGE_IDS", "MsgHandler", "msgHandler",
+           "validate_tool_request", "validate_tool_output"]

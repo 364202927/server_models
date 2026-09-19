@@ -2,6 +2,11 @@
 
 把 OpenAI Chat Completions 协议的请求翻译为内部 MsgHandler 调用，
 并把内部生成结果重新包装为 OpenAI 兼容的响应（含 SSE 流式重放）。
+
+单流程说明：所有聊天请求（message_id == 0）统一把结构化 messages 交给
+MsgHandler，不再区分"要不要走工具"；是否拼普通 prompt、是否渲染工具
+模板，全部下沉到 MsgHandler / Loader 决定（依据是否有 tools，而不是
+是否有 messages）。API 层不再做这个分流。
 """
 from __future__ import annotations
 
@@ -32,11 +37,8 @@ _GENERATION_FIELDS = {
 class OpenAIChatRequest(BaseModel):
     """OpenAI / Open WebUI 兼容的聊天请求体。
 
-    只显式声明会影响生成行为、或被服务实际用到的字段；未识别的字段仍会被接受
-    （见 model_config），因此原本"仅接收并忽略"的纯 Ollama 占位参数
-    （format/num_keep/num_ctx/num_batch/num_thread/num_gpu/keep_alive/use_mmap/use_mlock）
-    以及未被任何逻辑使用的 context_compression_threshold 不再显式声明，
-    去掉它们不影响兼容性，只是不再对其做类型校验。
+    只显式声明会影响生成行为、或被服务实际使用的字段；未识别的字段仍会被接受（见 model_config），
+    但不再显式声明纯粹"接收后忽略"的参数（如部分 Ollama 专属选项），以保持结构简洁。
     """
     model_config = ConfigDict(extra="allow")
 
@@ -46,7 +48,7 @@ class OpenAIChatRequest(BaseModel):
 
     # ---- 会话内容 ----
     model: str = ""                                                # 目标模型 ID，决定由哪个 Loader/权重生成回复
-    messages: list[dict[str, Any]] = Field(default_factory=list)   # 对话历史；按顺序拼接为文本提示，或在工具调用场景下整体透传给 Loader
+    messages: list[dict[str, Any]] = Field(default_factory=list)   # 对话历史；始终整体透传给 MsgHandler，由其决定拼接方式
     system_prompt: str | None = None                               # 追加系统提示词，插入到 messages 之前，用于设定角色、语气与行为约束
 
     # ---- 输出方式：只影响返回节奏/格式，不改变生成内容本身 ----
@@ -82,8 +84,8 @@ class OpenAIChatRequest(BaseModel):
     extra_body: dict[str, Any] = Field(default_factory=dict)         # OpenAI SDK 常用的扩展参数透传字段，优先级高于 custom_parameters
     custom_parameters: dict[str, Any] = Field(default_factory=dict)  # 自定义参数透传字段，优先级低于 extra_body
 
-    # ---- 工具调用 ----
-    tools: list[dict[str, Any]] | None = None                      # 可用函数工具定义，模型据此决定是否发起调用
+    # ---- 工具调用：唯一的工具能力来源；服务端不猜测、不用 @ 关键字判断 ----
+    tools: list[dict[str, Any]] | None = None                      # 可用函数工具定义；为空/未提供时模型只会普通回答
     tool_choice: Any = None                                        # none/auto/required 或指定函数，控制是否强制/禁止调用工具
     parallel_tool_calls: bool | None = None                        # 为 false 时模型一轮最多只返回一个工具调用
 
@@ -92,19 +94,14 @@ class OpenAIChatRequest(BaseModel):
     functions: list[dict[str, Any]] | None = None                  # 旧版函数定义；传入即拒绝，提示改用 tools
 
 
-# --------------------------------------------------------------------------
-# 纯函数：请求 -> Loader 所需的中间数据结构。均可脱离 FastAPI 独立测试。
-# --------------------------------------------------------------------------
-
 def _chat_prompt(messages: list[dict[str, Any]], system_prompt: str | None) -> str:
-    """把系统提示词与多轮消息合并为单个 `role: content` 文本提示。"""
-
+    """为旧版 handler 保留扁平 prompt，同时完整 messages 仍单独透传。"""
     def text_of(content: Any) -> str:
         if isinstance(content, str):
             return content
         if isinstance(content, list):
             return "".join(part.get("text", "") for part in content
-                            if isinstance(part, dict) and part.get("type") == "text")
+                           if isinstance(part, dict) and part.get("type") == "text")
         return str(content or "")
 
     turns = ([{"role": "system", "content": system_prompt}] if system_prompt else []) + messages
@@ -121,18 +118,11 @@ def _has_non_text_content(messages: list[dict[str, Any]]) -> bool:
     return False
 
 
-def _needs_structured_messages(request: OpenAIChatRequest) -> bool:
-    """判断是否需要把结构化 messages 原样传给 Loader（工具调用场景），而非拼接为纯文本提示。"""
-    if request.tools or request.tool_choice not in (None, "none"):
-        return True
-    return any(isinstance(item, dict) and (item.get("role") == "tool" or item.get("tool_calls") is not None)
-               for item in request.messages)
-
-
 def _resolve_think_level(request: OpenAIChatRequest) -> int:
     """解析推理强度：think 优先于 reasoning_effort，统一转换为内部等级。"""
     if request.think is not None:
-        return int(request.think) if isinstance(request.think, bool) else request.think
+        value = int(request.think)
+        return max(0, min(5, value))
     if isinstance(request.reasoning_effort, int):
         return max(0, min(5, request.reasoning_effort))
     return {"none": 0, "low": 1, "medium": 3, "high": 5}.get(str(request.reasoning_effort).lower(), 0)
@@ -162,10 +152,6 @@ def _generation_params(request: OpenAIChatRequest) -> dict[str, Any]:
 
     return values
 
-
-# --------------------------------------------------------------------------
-# 纯函数：内部生成结果 -> OpenAI 响应结构。
-# --------------------------------------------------------------------------
 
 def _build_payload(result: dict[str, Any], model_id: str) -> dict[str, Any]:
     """把内部生成结果转换为 OpenAI `chat.completion` 响应体。"""
@@ -272,22 +258,19 @@ class serverApi:
                 raise HTTPException(status_code=400, detail="model 不能为空")
             if is_chat and not messages:
                 raise HTTPException(status_code=400, detail="messages 不能为空")
+            if is_chat and _has_non_text_content(messages):
+                raise HTTPException(status_code=400, detail="当前服务仅支持文本消息")
 
-            structured = _needs_structured_messages(request)
-            prompt, deploy, think = "", {}, 0
-            if is_chat:
-                if _has_non_text_content(messages):
-                    raise HTTPException(status_code=400, detail="当前服务仅支持文本消息")
-                if not structured:
-                    prompt = _chat_prompt(messages, request.system_prompt)
-                deploy = _generation_params(request)
-                think = _resolve_think_level(request)
-
+            # 单流程：不再判断"要不要走结构化"，聊天请求一律把 messages
+            # 原样交给 MsgHandler；是否调用工具完全由 tools/tool_choice 决定。
             try:
                 result = await self.handler.handle(
-                    request.message_id, request.args, model=request.model, prompt=prompt,
-                    deploy=deploy, think=think, source="openwebui",
-                    messages=messages if is_chat and structured else None,
+                    request.message_id, request.args, model=request.model,
+                    prompt=_chat_prompt(messages, request.system_prompt) if is_chat else "",
+                    deploy=_generation_params(request) if is_chat else {},
+                    think=_resolve_think_level(request) if is_chat else 0,
+                    source="openwebui",
+                    messages=messages if is_chat else None,
                     tools=request.tools, tool_choice=request.tool_choice,
                     parallel_tool_calls=request.parallel_tool_calls is not False,
                     system_prompt=request.system_prompt or "")
@@ -343,5 +326,6 @@ class serverApi:
                                  port=self._port(), log_level="info")
         self._server = uvicorn.Server(config)
         await self._server.serve()
+
 
 web = serverApi

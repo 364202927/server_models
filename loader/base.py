@@ -1,4 +1,5 @@
 """
+base.py
 模型加载器抽象基类
 
 定义统一的模型加载和推理接口，支持:
@@ -14,6 +15,18 @@ from pathlib import Path
 from typing import Any
 
 from ..config import GenerationParams, detect_model_type
+
+# torch/psutil 都是可选依赖：在模块级尝试一次，失败则置为 None，
+# 后续方法用 `is not None` 判断即可，不需要在每个方法里各自 try/except。
+try:
+    import torch
+except ImportError:
+    torch = None
+
+try:
+    import psutil
+except ImportError:
+    psutil = None
 
 
 @dataclass
@@ -91,58 +104,28 @@ class ModelLoader(ABC):
         return dict(self._effective_load)
 
     @abstractmethod
-    def load(
-        self,
-        model_path: str,
-        *,
-        quantization: str | None = None,
-        dtype: str = "float16",
-        max_model_len: int | None = None,
-        tensor_parallel_size: int = 1,
-        trust_remote_code: bool = True,
-        **kwargs: Any
-    ) -> "ModelLoader":
+    def load(self, model_path: str, *, quantization: str | None = None, dtype: str = "float16",
+             max_model_len: int | None = None, tensor_parallel_size: int = 1,
+             trust_remote_code: bool = True, **kwargs: Any) -> "ModelLoader":
         """加载模型，返回self支持链式调用"""
-        pass
 
     @abstractmethod
-    def generate(
-        self,
-        prompt: str,
-        *,
-        max_new_tokens: int = 512,
-        temperature: float = 0.3,
-        top_p: float = 0.95,
-        top_k: int = 50,
-        repetition_penalty: float = 1.05,
-        stop_sequences: list[str] | None = None,
-        system_prompt: str = "",
-        **kwargs: Any
-    ) -> GenerationResult:
+    def generate(self, prompt: str, *, max_new_tokens: int = 512, temperature: float = 0.3,
+                top_p: float = 0.95, top_k: int = 50, repetition_penalty: float = 1.05,
+                stop_sequences: list[str] | None = None, system_prompt: str = "",
+                **kwargs: Any) -> GenerationResult:
         """生成文本，返回GenerationResult；system_prompt 非空时作为系统角色注入"""
-        pass
 
-    def generate_with_params(
-        self,
-        prompt: str,
-        params: GenerationParams,
-        **kwargs
-    ) -> GenerationResult:
+    def generate_with_params(self, prompt: str, params: GenerationParams, **kwargs) -> GenerationResult:
         """使用GenerationParams配置生成"""
         return self.generate(
-            prompt,
-            max_new_tokens=params.max_new_tokens,
-            temperature=params.temperature,
-            top_p=params.top_p,
-            top_k=params.top_k,
-            repetition_penalty=params.repetition_penalty,
-            **kwargs
-        )
+            prompt, max_new_tokens=params.max_new_tokens, temperature=params.temperature,
+            top_p=params.top_p, top_k=params.top_k, repetition_penalty=params.repetition_penalty,
+            **kwargs)
 
     @abstractmethod
     def unload(self) -> None:
         """卸载模型，释放显存"""
-        pass
 
     def sleep_to_ram(self) -> bool:
         """将模型权重移出 GPU 保留在 RAM；引擎不支持时返回 False。"""
@@ -177,35 +160,9 @@ class ModelLoader(ABC):
             verbose: True时返回详细信息(各GPU设备、模型参数量等)
         """
         usage = MemoryUsage()
+        if torch is not None and torch.cuda.is_available():
+            self._fill_gpu_usage(usage, verbose)
 
-        # GPU显存 - 通过torch.cuda获取
-        try:
-            import torch
-            if torch.cuda.is_available():
-                device_index = self._get_gpu_device_index()
-                usage.gpu_allocated_mb = round(torch.cuda.memory_allocated(device_index) / (1024 ** 2), 1)
-                usage.gpu_reserved_mb = round(torch.cuda.memory_reserved(device_index) / (1024 ** 2), 1)
-                total = torch.cuda.get_device_properties(device_index).total_memory
-                usage.gpu_total_mb = round(total / (1024 ** 2), 1)
-                usage.gpu_free_mb = round(usage.gpu_total_mb - usage.gpu_reserved_mb, 1)
-
-                if verbose:
-                    usage.details = usage.details or {}
-                    # 多GPU时列出各设备占用
-                    if torch.cuda.device_count() > 1:
-                        gpu_details = []
-                        for i in range(torch.cuda.device_count()):
-                            gpu_details.append({
-                                "device": i,
-                                "name": torch.cuda.get_device_properties(i).name,
-                                "allocated_mb": round(torch.cuda.memory_allocated(i) / (1024 ** 2), 1),
-                                "reserved_mb": round(torch.cuda.memory_reserved(i) / (1024 ** 2), 1),
-                            })
-                        usage.details["gpu_devices"] = gpu_details
-        except ImportError:
-            pass
-
-        # 进程内存 - 通过psutil或/proc获取
         usage.process_rss_mb = round(self._get_process_rss_mb(), 1)
         usage.system_available_mb = round(self._get_system_available_mb(), 1)
 
@@ -218,6 +175,23 @@ class ModelLoader(ABC):
 
         return usage
 
+    def _fill_gpu_usage(self, usage: MemoryUsage, verbose: bool) -> None:
+        """填充当前设备的 GPU 显存占用；verbose 且多卡时附加各设备明细。"""
+        device_index = self._get_gpu_device_index()
+        usage.gpu_allocated_mb = round(torch.cuda.memory_allocated(device_index) / (1024 ** 2), 1)
+        usage.gpu_reserved_mb = round(torch.cuda.memory_reserved(device_index) / (1024 ** 2), 1)
+        usage.gpu_total_mb = round(torch.cuda.get_device_properties(device_index).total_memory / (1024 ** 2), 1)
+        usage.gpu_free_mb = round(usage.gpu_total_mb - usage.gpu_reserved_mb, 1)
+        if verbose and torch.cuda.device_count() > 1:
+            usage.details = usage.details or {}
+            usage.details["gpu_devices"] = [self._gpu_device_detail(i) for i in range(torch.cuda.device_count())]
+
+    @staticmethod
+    def _gpu_device_detail(index: int) -> dict[str, Any]:
+        return {"device": index, "name": torch.cuda.get_device_properties(index).name,
+                "allocated_mb": round(torch.cuda.memory_allocated(index) / (1024 ** 2), 1),
+                "reserved_mb": round(torch.cuda.memory_reserved(index) / (1024 ** 2), 1)}
+
     def release_cache(self) -> MemoryUsage:
         """
         释放推理过程中产生的临时显存/内存占用 (KV cache, 临时张量等)
@@ -226,13 +200,8 @@ class ModelLoader(ABC):
         Returns:
             清理后的MemoryUsage
         """
-        try:
-            import torch
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-        except ImportError:
-            pass
-
+        if torch is not None and torch.cuda.is_available():
+            torch.cuda.empty_cache()
         gc.collect()
         return self.memory_usage()
 
@@ -243,35 +212,27 @@ class ModelLoader(ABC):
     @staticmethod
     def _get_process_rss_mb() -> float:
         """获取当前进程物理内存占用(MB)"""
-        try:
-            import psutil
+        if psutil is not None:
             return psutil.Process(os.getpid()).memory_info().rss / (1024 ** 2)
-        except ImportError:
-            pass
-        # psutil不可用，Linux下读/proc/self/status
-        try:
-            with open("/proc/self/status", "r") as f:
-                for line in f:
-                    if line.startswith("VmRSS:"):
-                        return int(line.split()[1]) / 1024  # kB -> MB
-        except Exception:
-            pass
-        return 0
+        return ModelLoader._read_proc_field("/proc/self/status", "VmRSS:")
 
     @staticmethod
     def _get_system_available_mb() -> float:
         """获取系统可用内存(MB)"""
-        try:
-            import psutil
+        if psutil is not None:
             return psutil.virtual_memory().available / (1024 ** 2)
-        except ImportError:
-            pass
+        return ModelLoader._read_proc_field("/proc/meminfo", "MemAvailable:")
+
+    @staticmethod
+    def _read_proc_field(path: str, prefix: str) -> float:
+        """从 /proc 下的键值文件读取一个以 kB 为单位的字段并换算为 MB；
+        文件不存在、无权限或格式异常时返回 0（psutil 不可用时的兜底路径，仅 Linux 有效）。"""
         try:
-            with open("/proc/meminfo", "r") as f:
-                for line in f:
-                    if line.startswith("MemAvailable:"):
+            with open(path) as handle:
+                for line in handle:
+                    if line.startswith(prefix):
                         return int(line.split()[1]) / 1024  # kB -> MB
-        except Exception:
+        except (OSError, ValueError, IndexError):
             pass
         return 0
 
@@ -280,11 +241,8 @@ class ModelLoader(ABC):
         path = Path(model_path)
         name = path.name if path.exists() else model_path.split("/")[-1]
         return ModelInfo(
-            name=name,
-            path=model_path,
-            model_type=detect_model_type(name),
-            quantization=kwargs.get("quantization"),
-            dtype=kwargs.get("dtype", "float16"),
+            name=name, path=model_path, model_type=detect_model_type(name),
+            quantization=kwargs.get("quantization"), dtype=kwargs.get("dtype", "float16"),
         )
 
     def __enter__(self) -> "ModelLoader":
