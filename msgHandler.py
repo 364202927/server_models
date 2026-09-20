@@ -4,6 +4,12 @@
 最终都会在 _generate_chat -> _build_messages 这一步统一成同一份 messages
 交给 Loader；Loader 内部只按"有没有 tools"决定走普通聊天模板还是工具模板，
 不再区分"有没有 messages"。
+
+工具数量较多时（超过 _TOOL_SEARCH_THRESHOLD），_generate_with_tool_search
+会切换成按需检索模式：只把 __search_tools__ 元工具的完整定义交给模型，
+其余工具收进一份精简目录，模型需要时自己调用 __search_tools__ 换取完整
+定义。这个过程完全在 MsgHandler 内部完成，对客户端和各个 Loader 透明——
+见 tool_search.py。
 """
 
 from __future__ import annotations
@@ -19,6 +25,7 @@ from .hardware import detect_hardware
 from .loader.base import ToolCapabilityError, ToolOutputError
 from .loader.model_spec import LOAD_KEYS
 from .loader.models_mgr import ModelsMgr
+from .tool_search import SEARCH_TOOL_NAME, merge_tools, prepare_tool_view, search_tools
 from .utils.common import info, log
 
 # 每次请求可覆盖的采样参数；``max_tokens`` 在传给 Loader 前改名为 ``max_new_tokens``。
@@ -30,6 +37,13 @@ GENERATION_KEYS = frozenset({
 })
 SUPPORTED_MESSAGE_IDS = frozenset({0, 1001, 1002, 1003, 1004, 1005, 1006, 1007})
 _TOOL_NAME = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+# 工具数超过这个值才启用 __search_tools__ 按需检索；数量不多时直接原样透传更简单。
+_TOOL_SEARCH_THRESHOLD = 8
+# 每次 __search_tools__ 命中后最多带回几个工具的完整定义。
+_TOOL_SEARCH_TOP_K = 3
+# 最多允许几轮"调用 __search_tools__ -> 重新生成"；超过后直接把全量工具兜底发一次。
+_MAX_TOOL_SEARCH_HOPS = 2
 
 
 # --------------------------------------------------------------------------
@@ -316,11 +330,13 @@ class MsgHandler:
 
     # ---- message_id == 0：聊天/工具调用（单流程：统一走结构化 messages）----
 
-    def _build_messages(self, prompt: str, ctx: _ChatContext, default_system: str) -> list[dict[str, Any]]:
+    def _build_messages(self, prompt: str, ctx: _ChatContext, default_system: str,
+                        extra_system: str = "") -> list[dict[str, Any]]:
         """把 Console 的裸 prompt 与 HTTP 的结构化 messages 统一成同一份 messages。
 
         system 段来源（从低到高优先级，同时给出时依次拼接）：
-        模型配置的默认 system_prompt → 请求级 system_prompt → think 等级指令。
+        模型配置的默认 system_prompt → 请求级 system_prompt → think 等级指令 →
+        工具检索目录说明（仅工具数超过阈值时存在，见 tool_search.prepare_tool_view）。
         与 messages 里已有的首条 system 消息合并，避免出现两条 system。
         """
         messages = ([dict(item) for item in ctx.messages] if ctx.messages is not None
@@ -329,7 +345,8 @@ class MsgHandler:
         def think_instruction() -> str:
             return f"请以推理等级 {ctx.think}/5 分析后给出最终答案。" if ctx.think else ""
 
-        segments = [text for text in (default_system, ctx.system_prompt, think_instruction()) if text]
+        segments = [text for text in (default_system, ctx.system_prompt, think_instruction(), extra_system)
+                   if text]
         if not segments:
             return messages
         if messages and messages[0].get("role") == "system":
@@ -356,14 +373,13 @@ class MsgHandler:
             params["max_new_tokens"] = params.pop("max_tokens")
 
         # 单流程核心：所有聊天请求统一走结构化 messages。system_prompt 从这里
-        # 摘出来折进 messages，避免 Loader 端对同一份系统提示做两次处理
-        # （原来结构化分支会静默丢弃模型级默认 system_prompt，这里一并修掉）。
+        # 摘出来折进 messages，避免 Loader 端对同一份系统提示做两次处理。
         default_system = str(params.pop("system_prompt", "") or "")
-        messages = self._build_messages(prompt, ctx, default_system)
-        params.update({"messages": messages, "tools": ctx.tools, "tool_choice": ctx.tool_choice,
-                       "parallel_tool_calls": ctx.parallel_tool_calls})
+        tools_for_model, catalog_notice = prepare_tool_view(ctx.tools, ctx.tool_choice, _TOOL_SEARCH_THRESHOLD)
+        messages = self._build_messages(prompt, ctx, default_system, catalog_notice or "")
 
-        result = await asyncio.to_thread(self.manager.generate, model, prompt, **params)
+        result = await self._generate_with_tool_search(model, prompt, messages, tools_for_model, ctx, params)
+
         # 没有声明 tools 时不校验工具输出：普通对话里模型偶发吐出类似
         # <tool_call> 的文本不该被当成协议违规而返回 502，原样按文本处理。
         calls = (validate_tool_output(result.tool_calls, ctx.tools, ctx.tool_choice, ctx.parallel_tool_calls)
@@ -376,6 +392,48 @@ class MsgHandler:
                 "time_seconds": result.time_seconds, "tokens_per_second": result.tokens_per_second,
             },
         }
+
+    async def _generate_with_tool_search(self, model: str, prompt: str, messages: list[dict[str, Any]],
+                                         tools_for_model: list[dict[str, Any]], ctx: _ChatContext,
+                                         params: dict[str, Any]) -> Any:
+        """调用 Loader 生成一个回复。
+
+        工具数没超过阈值时 tools_for_model 就是 ctx.tools，第一轮必然不会
+        命中 SEARCH_TOOL_NAME，行为和不做检索完全一样。工具数超过阈值时，
+        模型调用 __search_tools__ 就在这里按需展开完整定义并重新生成，
+        对客户端和 Loader 都透明——两者都只会看到真正的工具调用。
+        """
+        tools = tools_for_model
+        for _ in range(_MAX_TOOL_SEARCH_HOPS):
+            params.update({"messages": messages, "tools": tools, "tool_choice": ctx.tool_choice,
+                          "parallel_tool_calls": ctx.parallel_tool_calls})
+            result = await asyncio.to_thread(self.manager.generate, model, prompt, **params)
+            search_calls = [call for call in result.tool_calls if call["function"]["name"] == SEARCH_TOOL_NAME]
+            if not search_calls:
+                return result
+
+            messages = messages + [{"role": "assistant", "tool_calls": search_calls}]
+            for call in search_calls:
+                found = search_tools(self._search_query(call), ctx.tools, _TOOL_SEARCH_TOP_K)
+                tools = merge_tools(tools, found)
+                content = ("找到: " + ", ".join(tool["function"]["name"] for tool in found) if found else
+                          "没有找到匹配的工具，换个关键词再试，或者直接回答用户。")
+                messages.append({"role": "tool", "tool_call_id": call["id"], "content": content})
+
+        # 超过检索跳数上限：把完整工具集合一次性交给模型兜底，避免用户被卡在搜索循环里。
+        params.update({"messages": messages, "tools": ctx.tools, "tool_choice": ctx.tool_choice,
+                      "parallel_tool_calls": ctx.parallel_tool_calls})
+        return await asyncio.to_thread(self.manager.generate, model, prompt, **params)
+
+    @staticmethod
+    def _search_query(call: dict[str, Any]) -> str:
+        """安全解析 __search_tools__ 调用的 query 参数；解析失败就当作空查询（返回空结果）。"""
+        try:
+            arguments = call["function"]["arguments"]
+            parsed = json.loads(arguments) if isinstance(arguments, str) else arguments
+            return str(parsed.get("query", "")) if isinstance(parsed, dict) else ""
+        except (json.JSONDecodeError, KeyError, TypeError, AttributeError):
+            return ""
 
 
 msgHandler = MsgHandler
