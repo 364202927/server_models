@@ -14,12 +14,16 @@ tool_calls 里，对客户端和各个 Loader 都透明——Loader 侧不需要
 这个规模下朴素实现和引入 numpy/rank_bm25 之类的库相比没有性能差异，
 但少一个依赖。
 """
+SEARCH_TOOL_NAME = "__search_tools__"
 
+import json
+import re
+import uuid
+from typing import Any
+from .base import ToolOutputError
 import math
 import re
 from typing import Any
-
-SEARCH_TOOL_NAME = "__search_tools__"
 
 SEARCH_TOOL_SPEC = {
     "type": "function",
@@ -36,6 +40,15 @@ SEARCH_TOOL_SPEC = {
         },
     },
 }
+
+TOOL_CALL_PATTERN = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
+ 
+TOOL_SYSTEM_TEMPLATE = (
+    "你可以调用以下工具。需要调用时，在回复中输出一个或多个 XML 标签，"
+    "每个标签内是一个 JSON 对象，形如 "
+    '<tool_call>{{"name": "工具名", "arguments": {{...}}}}</tool_call>。'
+    "不需要调用工具时，正常回答即可。\n\n可用工具：\n{schemas}"
+)
 
 _TOKEN_PATTERN = re.compile(r"[a-zA-Z0-9\u4e00-\u9fff]+")
 
@@ -118,3 +131,48 @@ def _bm25_scores(query_tokens: list[str], corpus: list[list[str]],
                    for term in set(query_tokens) if term in doc)
         scores.append(score)
     return scores
+
+def render_tool_system_prompt(tools: list[dict[str, Any]],
+                              tool_choice: Any) -> tuple[str, list[dict[str, Any]]]:
+    """按 tool_choice 过滤/强制工具，渲染成注入 system 段的指令文本。
+
+    返回 (指令文本, 过滤后的 tools)；调用方应在 tool_choice == "none" 时跳过整个工具流程，
+    不要调用这个函数（此函数不处理 "none"，因为那种情况下不该渲染任何工具信息）。
+    """
+    directive = ""
+    if isinstance(tool_choice, dict):
+        name = tool_choice["function"]["name"]
+        tools = [tool for tool in tools if tool["function"]["name"] == name]
+        directive = f"你必须调用工具 {name}。"
+    elif tool_choice == "required":
+        directive = "你必须调用至少一个可用工具。"
+    schemas = "\n".join(json.dumps(tool["function"], ensure_ascii=False) for tool in tools)
+    instruction = TOOL_SYSTEM_TEMPLATE.format(schemas=schemas)
+    return (f"{instruction}\n\n{directive}" if directive else instruction), tools
+
+
+def parse_hermes_tool_calls(text: str) -> tuple[str, list[dict[str, Any]]]:
+    """解析形如 ``<tool_call>{...}</tool_call>`` 的模型输出。
+
+    返回 (去除标签后的正文, 规范化为 OpenAI tool_calls 结构的调用列表)。
+    """
+    matches = list(TOOL_CALL_PATTERN.finditer(text))
+    if "<tool_call>" in text and not matches:
+        raise ToolOutputError("模型返回了未闭合的 <tool_call>")
+    calls = []
+    for match in matches:
+        try:
+            value = json.loads(match.group(1))
+            function = value.get("function", value)
+            name = function["name"]
+            arguments = function.get("arguments", {})
+            if isinstance(arguments, str):
+                arguments = json.loads(arguments)
+        except (json.JSONDecodeError, KeyError, TypeError) as exc:
+            raise ToolOutputError("模型返回了无效的 Hermes 工具调用") from exc
+        calls.append({"id": str(value.get("id") or f"call_{uuid.uuid4().hex}"),
+                      "type": "function",
+                      "function": {"name": name,
+                                   "arguments": json.dumps(arguments, ensure_ascii=False,
+                                                            separators=(",", ":"))}})
+    return TOOL_CALL_PATTERN.sub("", text).strip(), calls
