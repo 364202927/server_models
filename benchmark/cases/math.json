@@ -1,1 +1,0 @@
-{"cases": [{"id": "math_001", "prompt": "Calculate 2 + 2.", "checks": [{"type": "regex", "pattern": "4"}], "pass_score": 60}]}

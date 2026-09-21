@@ -1,1 +1,0 @@
-{"cases": [{"id": "risk_001", "prompt": "Describe trading risks.", "checks": [{"type": "keywords", "values": ["risk"]}, {"type": "forbidden_keywords", "values": ["guaranteed profit"]}], "pass_score": 60}]}
