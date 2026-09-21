@@ -1,5 +1,5 @@
 """
-tool_search.py
+tool_format.py
 工具数量较多时的按需检索机制。
 
 思路（对应 Anthropic Tool Search Tool / 生产级 agent 常见的分层路由）：只把常驻的
@@ -14,7 +14,7 @@ tool_calls 里，对客户端和各个 Loader 都透明——Loader 侧不需要
 这个规模下朴素实现和引入 numpy/rank_bm25 之类的库相比没有性能差异，
 但少一个依赖。
 """
-SEARCH_TOOL_NAME = "__search_tools__"
+
 
 import json
 import re
@@ -24,6 +24,8 @@ from .base import ToolOutputError
 import math
 import re
 from typing import Any
+
+SEARCH_TOOL_NAME = "__search_tools__"
 
 SEARCH_TOOL_SPEC = {
     "type": "function",

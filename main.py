@@ -8,12 +8,12 @@ from pathlib import Path
 if __package__ in (None, ""):
     # 直接执行 ``python main.py`` 时把项目父目录加入导入路径。
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-    from ai.loader import ModelsMgr
-    from ai.utils.paths import MODELS_FILE
-    from ai.utils.serverApi import serverApi
-    from ai.utils.console import Console
-    from ai.utils.common import kApi, info, save_logs
-    from ai.msgHandler import MsgHandler
+    from server_models.loader import ModelsMgr
+    from server_models.utils.paths import MODELS_FILE
+    from server_models.utils.serverApi import serverApi
+    from server_models.utils.console import Console
+    from server_models.utils.common import kApi, info, save_logs
+    from server_models.msgHandler import MsgHandler
 else:
     from .loader import ModelsMgr
     from .utils.paths import MODELS_FILE

@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from ..config import GenerationParams, detect_model_type
+from ..utils.config import GenerationParams, detect_model_type
 
 # torch/psutil 都是可选依赖：在模块级尝试一次，失败则置为 None，
 # 后续方法用 `is not None` 判断即可，不需要在每个方法里各自 try/except。

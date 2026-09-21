@@ -9,7 +9,7 @@
 会切换成按需检索模式：只把 __search_tools__ 元工具的完整定义交给模型，
 其余工具收进一份精简目录，模型需要时自己调用 __search_tools__ 换取完整
 定义。这个过程完全在 MsgHandler 内部完成，对客户端和各个 Loader 透明——
-见 tool_search.py。
+见 loader/tool_format.py。
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ from .hardware import detect_hardware
 from .loader.base import ToolCapabilityError, ToolOutputError
 from .loader.model_spec import LOAD_KEYS
 from .loader.models_mgr import ModelsMgr
-from .tool_search import SEARCH_TOOL_NAME, merge_tools, prepare_tool_view, search_tools
+from .loader.tool_format import SEARCH_TOOL_NAME, merge_tools, prepare_tool_view, search_tools
 from .utils.common import info, log
 
 # 每次请求可覆盖的采样参数；``max_tokens`` 在传给 Loader 前改名为 ``max_new_tokens``。
@@ -336,7 +336,7 @@ class MsgHandler:
 
         system 段来源（从低到高优先级，同时给出时依次拼接）：
         模型配置的默认 system_prompt → 请求级 system_prompt → think 等级指令 →
-        工具检索目录说明（仅工具数超过阈值时存在，见 tool_search.prepare_tool_view）。
+        工具检索目录说明（仅工具数超过阈值时存在，见 tool_format.prepare_tool_view）。
         与 messages 里已有的首条 system 消息合并，避免出现两条 system。
         """
         messages = ([dict(item) for item in ctx.messages] if ctx.messages is not None
