@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .hardware import detect_hardware
-from .loader.base import ToolCapabilityError, ToolOutputError
+from .loader.llmFramework.baseInference import ToolCapabilityError, ToolOutputError
 from .loader.model_spec import LOAD_KEYS
 from .loader.models_mgr import ModelsMgr
 from .loader.tool_format import SEARCH_TOOL_NAME, merge_tools, prepare_tool_view, search_tools

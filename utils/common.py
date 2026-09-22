@@ -49,11 +49,11 @@ def readFile(pathFile, model='r'):
     def _read_gzip() -> Any:
         with gzip.open(pathFile, "rb") as file:
             return pickle.load(file)
-    return switchFn({"json": lambda: _read_json(pathFile, model),
-                        "jsonl": lambda: _read_jsonl(pathFile, model),
+    return switchFn({"json": lambda: _read_json(),
+                        "jsonl": lambda: _read_jsonl(),
                         "pkl": lambda: _read_pickle(pathFile),
-                        "txt": lambda: _read_text(pathFile, model),
-                        "gz": lambda: _read_gzip(pathFile),
+                        "txt": lambda: _read_text(),
+                        "gz": lambda: _read_gzip(),
                     }, key=fileType)
 def writeFile(data, pathFile, model='w'):
     if data is None or (isinstance(data, (list, dict)) and len(data) == 0):
@@ -72,10 +72,10 @@ def writeFile(data, pathFile, model='w'):
     def _txt():
         with open(pathFile, model, encoding='utf-8') as f:
             f.write(str(data))
-    result = switchFn({'json': lambda: _json,
-                        'jsonl': lambda: _jsonl,
-                        'pkl': lambda: _pkl,
-                        'txt': lambda: _txt,
+    result = switchFn({'json': lambda: _json(),
+                        'jsonl': lambda: _jsonl(),
+                        'pkl': lambda: _pkl(),
+                        'txt': lambda: _txt(),
                     }, key=fileType)
     # switchFn 找不到对应文件类型时返回 False,否则(即便回调无显式返回值/None)视为成功
     return result is not False
@@ -122,15 +122,6 @@ def getFileExtension(fileName: str) -> tuple[str, str]:
     return extension[1:].lower(), name
 def joinPath(*parts: str | os.PathLike[str]) -> str:
     return os.path.join(*(os.fspath(part) for part in parts))
-
-#
-def str2time(mode: str = "strNow", value: datetime | None = None) -> str:
-    current = value or datetime.now().astimezone()
-    if mode == "strNow":
-        return current.strftime("%Y-%m-%d %H:%M:%S")
-    if mode == "date":
-        return current.strftime("%Y-%m-%d")
-    return current.isoformat(timespec="seconds")
 
 
 def ensure_asset_dirs() -> None:

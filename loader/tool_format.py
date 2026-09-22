@@ -17,13 +17,12 @@ tool_calls 里，对客户端和各个 Loader 都透明——Loader 侧不需要
 
 
 import json
+import math
 import re
 import uuid
 from typing import Any
-from .base import ToolOutputError
-import math
-import re
-from typing import Any
+
+from .llmFramework.baseInference import ToolOutputError
 
 SEARCH_TOOL_NAME = "__search_tools__"
 

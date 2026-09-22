@@ -80,6 +80,9 @@ class ModelSpec:
     path: str
     source_path: str | None = field(default=None, repr=False, compare=False)
     estimated_vram_mb: int | None = None
+    # 显式指定推理框架(vllm/sglang/llama);只在加载时读取一次,运行期改它不生效。
+    # 未配置时按路径后缀推断默认值,见 loader/engine_select.py。
+    engine: str | None = None
     lora: list[dict[str, Any]] = field(default_factory=list)
     load: ModelLoadConfig = field(default_factory=ModelLoadConfig)
     generation: dict[str, Any] = field(default_factory=dict)
@@ -128,7 +131,7 @@ def load_model_specs(config: dict[str, Any]) -> dict[str, ModelSpec]:
     models = config.get("models", {})
     if not isinstance(models, dict):
         raise ValueError("models.json 的 models 必须是对象")
-    known = {"path", "estimated_vram_mb", "lora", "load", "generation"}
+    known = {"path", "estimated_vram_mb", "engine", "lora", "load", "generation"}
     for model_id, raw in models.items():
         if not isinstance(raw, dict):
             raise ValueError(f"模型 {model_id} 配置必须是对象")
@@ -136,11 +139,13 @@ def load_model_specs(config: dict[str, Any]) -> dict[str, ModelSpec]:
             raise ValueError(f"模型 {model_id} 缺少 path 配置")
         raw_load = raw.get("load")
         raw_generation = raw.get("generation")
+        raw_engine = raw.get("engine")
         result[str(model_id)] = ModelSpec(
             model_id=str(model_id),
             path=normalize_model_path(str(raw["path"])),
             source_path=str(raw["path"]),
             estimated_vram_mb=raw.get("estimated_vram_mb"),
+            engine=str(raw_engine).strip().lower() if raw_engine else None,
             lora=list(raw.get("lora", [])),
             load=ModelLoadConfig.from_dict(raw_load),
             generation=dict(raw_generation) if isinstance(raw_generation, dict) else {},

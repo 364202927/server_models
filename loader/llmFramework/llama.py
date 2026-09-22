@@ -1,7 +1,7 @@
 """
-gguf_loader.py
+llama.py
 llama.cpp GGUF 模型加载器。
-该模块延迟导入 ``llama_cpp``，因此未安装可选依赖时不会影响 HF/vLLM 的导入。
+该模块延迟导入 ``llama_cpp``，因此未安装可选依赖时不会影响 vllm/sglang 的导入。
 """
 
 from __future__ import annotations
@@ -12,10 +12,10 @@ import time
 from pathlib import Path
 from typing import Any
 
-from .base import GenerationResult, MemoryUsage, ModelLoader, ToolCapabilityError, ToolOutputError
-from .tool_format import parse_hermes_tool_calls, render_tool_system_prompt
-from ..hardware import detect_gpu
-from ..utils.common import info as log_info
+from ..tool_format import parse_hermes_tool_calls, render_tool_system_prompt
+from ...hardware import detect_gpu
+from ...utils.common import info as log_info
+from .baseInference import GenerationResult, MemoryUsage, ToolCapabilityError, ToolOutputError, baseInference
 
 try:
     from llama_cpp import Llama
@@ -49,34 +49,18 @@ def _gpu_offload_supported() -> bool | None:
         return None
 
 
-_EXTRA_SAMPLING_KEYS = ("min_p", "seed", "mirostat", "mirostat_eta", "mirostat_tau",
-                        "repeat_last_n", "tfs_z", "logit_bias", "frequency_penalty",
-                        "presence_penalty")
-
-
-def _build_sampling(max_new_tokens: int, temperature: float, top_p: float, top_k: int,
-                    repetition_penalty: float, stop_sequences: list[str] | None,
-                    extra: dict[str, Any]) -> dict[str, Any]:
-    """组装 llama.cpp 采样参数，附加已知的可选采样字段。"""
-    sampling = {"max_tokens": max_new_tokens, "temperature": max(temperature, 0.01),
-               "top_p": top_p, "top_k": top_k, "repeat_penalty": repetition_penalty,
-               "stop": stop_sequences}
-    sampling.update({key: extra[key] for key in _EXTRA_SAMPLING_KEYS if key in extra})
-    if "mirostat" in sampling:
-        # OpenAI/Ollama 协议里这个参数叫 mirostat；llama-cpp-python 的
-        # Llama.__call__/create_chat_completion 实际接收的形参名是
-        # mirostat_mode，直传 "mirostat" 会被当成未知关键字参数拒绝。
-        sampling["mirostat_mode"] = sampling.pop("mirostat")
-    return sampling
-
-
 def _flatten_messages(messages: list[dict[str, Any]]) -> str:
     """把多轮 messages 拍平成纯文本，仅用于 create_chat_completion 不可用时的兜底补全接口。"""
     return "\n".join(f"{item.get('role', 'user')}: {item.get('content', '')}" for item in messages)
 
 
-class GGUFLoader(ModelLoader):
+class llama(baseInference):
     """使用 llama-cpp-python 加载单文件或目录中的 GGUF 模型。"""
+
+    _SAMPLING_KEY_MAP = {"repetition_penalty": "repeat_penalty", "mirostat": "mirostat_mode"}
+    _EXTRA_SAMPLING_KEYS = ("min_p", "seed", "mirostat", "mirostat_eta", "mirostat_tau",
+                            "repeat_last_n", "tfs_z", "logit_bias", "frequency_penalty",
+                            "presence_penalty")
 
     @staticmethod
     def _resolve_gguf_file(model_path: str) -> Path:
@@ -131,9 +115,9 @@ class GGUFLoader(ModelLoader):
             self._model_info.quantization = str(quantization)
         return metadata
 
-    def load(self, model_path: str, *, dtype: str = "float16", max_model_len: int | None = None,
-             tensor_parallel_size: int = 1, trust_remote_code: bool = True,
-             **kwargs: Any) -> "GGUFLoader":
+    def load(self, model_path: str, *, quantization: str | None = None, dtype: str = "float16",
+             max_model_len: int | None = None, tensor_parallel_size: int = 1,
+             trust_remote_code: bool = True, **kwargs: Any) -> "llama":
         if Llama is None:
             raise RuntimeError("GGUF 模型需要安装 llama-cpp-python（建议按 CUDA 架构安装）")
 
@@ -149,6 +133,7 @@ class GGUFLoader(ModelLoader):
             )
 
         self._chat_format = kwargs.get("chat_format")
+        self._tool_parser = kwargs.get("tool_parser")
         llm_kwargs = self._build_llm_kwargs(source, gpu_layers, max_model_len, **kwargs)
         log_info("GGUF加载参数", str(source), llm_kwargs)
         self._model = Llama(**llm_kwargs)
@@ -160,7 +145,7 @@ class GGUFLoader(ModelLoader):
                 "context=", self._model_info.context_length,
                 "quantization=", self._model_info.quantization or "未检测到")
         self._effective_load = {
-            "dtype": dtype,
+            "engine": "llama", "dtype": dtype,
             "context_length": self._model_info.context_length,
             "gpu_offload_layers": llm_kwargs["n_gpu_layers"],
             "batch_size": llm_kwargs["n_batch"],
@@ -170,7 +155,7 @@ class GGUFLoader(ModelLoader):
             "tensor_parallel": tensor_parallel_size,
             "gpu_split": kwargs.get("gpu_split"),
             "trust_remote_code": trust_remote_code,
-            "tool_parser": kwargs.get("tool_parser"),
+            "tool_parser": self._tool_parser,
             "chat_format": self._chat_format,
         }
         return self
@@ -179,20 +164,16 @@ class GGUFLoader(ModelLoader):
                 top_p: float = 0.95, top_k: int = 50, repetition_penalty: float = 1.05,
                 stop_sequences: list[str] | None = None, system_prompt: str = "",
                 **kwargs: Any) -> GenerationResult:
+        """llama.cpp 的后端是消息级 chat-completions 接口，形状与 vllm/sglang 的
+        整段 prompt 进/整段文本出不同，完整覆盖 generate() 而不用模板方法。"""
         if not self.is_loaded:
             raise RuntimeError("Model not loaded. Call load() first.")
-        sampling = _build_sampling(max_new_tokens, temperature, top_p, top_k, repetition_penalty,
-                                   stop_sequences, kwargs)
-
-        messages = kwargs.get("messages")
-        if messages is None:
-            # 兼容绕过 MsgHandler 直接调用 Loader 的场景（脚本/测试）；
-            # 正常链路里 MsgHandler 已经把 prompt 统一成 messages。
-            messages = ([{"role": "system", "content": system_prompt}] if system_prompt else [])
-            messages = messages + [{"role": "user", "content": prompt}]
+        sampling = self._build_sampling(max_new_tokens, temperature, top_p, top_k, repetition_penalty,
+                                        stop_sequences, kwargs)
+        messages = self._normalize_messages(prompt, system_prompt, kwargs)
 
         # 分支键是 tools，不是 messages：没有工具时走普通聊天，
-        # 和改造前的普通对话行为一致，只是现在用的是完整多轮 messages。
+        # 和不带工具时的普通对话行为一致，只是现在用的是完整多轮 messages。
         tools = kwargs.get("tools") or []
         if not tools:
             return self._chat(messages, sampling, max_new_tokens)
@@ -241,7 +222,7 @@ class GGUFLoader(ModelLoader):
         start = time.perf_counter()
         try:
             result = self._model.create_chat_completion(messages=messages, tools=tools,
-                                                        tool_choice=backend_choice, **sampling)
+                                                         tool_choice=backend_choice, **sampling)
             choice = result["choices"][0]
             message = choice["message"]
         except (AttributeError, TypeError, KeyError, ValueError) as exc:

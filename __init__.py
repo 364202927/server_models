@@ -1,32 +1,26 @@
-# AI Model Benchmark for Quantitative Trading
-# 量化交易AI模型评估框架
+# AI 模型服务与量化交易能力评估框架
+# server_models package
 
 __version__ = "0.1.0"
 
-from .utils.config import BenchmarkConfig, TestDimension
 from .hardware import detect_hardware, print_hardware_info, HardwareInfo
-from .loader import ModelLoader, MemoryUsage, HFLoader, GGUFLoader, VLLMLoader
-from .msgHandler import MsgHandler
-from .benchmark import BenchmarkRunner, BenchmarkResult, Scorer, ReportGenerator
+from .loader import (
+    MemoryUsage, ModelSpec, ModelsMgr, RuntimeModel, baseInference,
+    create_loader, load_model_specs, normalize_model_path,
+)
 
 __all__ = [
-    # Config
-    "BenchmarkConfig",
-    "TestDimension",
     # Hardware
     "detect_hardware",
     "print_hardware_info",
     "HardwareInfo",
     # Loader
-    "ModelLoader",
+    "baseInference",
     "MemoryUsage",
-    "HFLoader",
-    "GGUFLoader",
-    "VLLMLoader",
-    "MsgHandler",
-    # Benchmark
-    "BenchmarkRunner",
-    "BenchmarkResult",
-    "Scorer",
-    "ReportGenerator",
+    "ModelSpec",
+    "load_model_specs",
+    "normalize_model_path",
+    "create_loader",
+    "ModelsMgr",
+    "RuntimeModel",
 ]

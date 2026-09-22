@@ -25,7 +25,8 @@
   },
   "models": {
     "qwen3.8-27B": {
-      "path": "D:/ai/models/Qwen3.8-27B-Uncensored-GGUF/Qwen3.8-27B-Uncensored-IQ4_XS.gguf"
+      "path": "D:/ai/models/Qwen3.8-27B-Uncensored-GGUF/Qwen3.8-27B-Uncensored-IQ4_XS.gguf",
+      "engine": "llama"
     }
   }
 }

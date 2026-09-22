@@ -24,6 +24,14 @@ def _format_location(file_stem: str, func_name: str, line_no: int) -> str:
 def _env_positive_int(name: str, default: int) -> int:
     return max(1, int(os.getenv(name, str(default))))
 
+def str2time(mode: str = "strNow", value: datetime | None = None) -> str:
+    current = value or datetime.now().astimezone()
+    if mode == "strNow":
+        return current.strftime("%Y-%m-%d %H:%M:%S")
+    if mode == "date":
+        return current.strftime("%Y-%m-%d")
+    return current.isoformat(timespec="seconds")
+
 class _LogState:
     """集中管理日志缓冲区与运行时开关，取代原先分散、靠 global 读写的模块级变量。"""
 
@@ -82,6 +90,7 @@ def warn(*msgs: Any) -> str:
     return _logBase(kWarn, *msgs)
 def err(*msgs: Any) -> str:
     return _logBase(kError, *msgs)
+error = err
 
 def logFormat(value: Any) -> str:
     return _logBase(kLog, "\n", pprint.pformat(value))

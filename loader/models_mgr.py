@@ -12,17 +12,17 @@ from typing import Any
 
 from ..hardware import check_gpu_memory, check_ram, detect_gpu, query_gpu_used_mb
 from ..utils.common import info as log_info, readFile, writeFile
-from .base import GenerationResult, ModelLoader
-from .factory import create_loader
+from .llmFramework.baseInference import GenerationResult, baseInference
+from .engine_select import create_loader
+from .expand.lora import load_lora
 from .cache import load_snapshot, save_snapshot
-from .lora import load_lora
 from .model_spec import CACHE_DEFAULTS, LOAD_KEYS, ModelSpec, load_model_specs
 
 
 @dataclass
 class RuntimeModel:
     spec: ModelSpec
-    loader: ModelLoader | None = None
+    loader: baseInference | None = None
     state: str = "UNLOADED"
     last_used_at: float = field(default_factory=time.time)
     active: bool = False
@@ -213,6 +213,12 @@ class ModelsMgr:
             # 加载前后的整卡差值才是本模型的占用；torch 的计数器是进程级累计。
             used_before = query_gpu_used_mb()
             runtime.loader = create_loader(spec)
+            if runtime.loader is None:
+                # create_loader 已经打印了具体原因(未配置 engine 且无法按后缀推断)；
+                # 这里不再包成异常抛出，直接把模型标记为未加载并返回。保留 runtime
+                # 记录(不 pop)以便 status()/list_models() 能看到 error 原因。
+                runtime.state, runtime.error = "UNLOADED", "无法确定推理框架"
+                return runtime
             log_info("选择模型Loader", model_id, type(runtime.loader).__name__)
             runtime.loader.load(spec.path, **spec.load.loader_kwargs())
             load_lora(runtime.loader, spec.lora)
