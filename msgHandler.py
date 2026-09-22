@@ -330,6 +330,20 @@ class MsgHandler:
 
     # ---- message_id == 0：聊天/工具调用（单流程：统一走结构化 messages）----
 
+    @staticmethod
+    def _clean_history(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """客户端（如 OpenWebUI）会把模型输出的推理段原样存回历史再传回来；
+        清掉历史 assistant 消息里残留的 ``...</think>`` 前缀，避免脏文本被当
+        成正文再次拼进下一轮 prompt、越攒越长最终把上下文撑爆。"""
+        cleaned = []
+        for item in messages:
+            item = dict(item)
+            content = item.get("content")
+            if item.get("role") == "assistant" and isinstance(content, str) and "</think>" in content:
+                item["content"] = content.split("</think>", 1)[1].strip()
+            cleaned.append(item)
+        return cleaned
+
     def _build_messages(self, prompt: str, ctx: _ChatContext, default_system: str,
                         extra_system: str = "") -> list[dict[str, Any]]:
         """把 Console 的裸 prompt 与 HTTP 的结构化 messages 统一成同一份 messages。
@@ -339,7 +353,7 @@ class MsgHandler:
         工具检索目录说明（仅工具数超过阈值时存在，见 tool_format.prepare_tool_view）。
         与 messages 里已有的首条 system 消息合并，避免出现两条 system。
         """
-        messages = ([dict(item) for item in ctx.messages] if ctx.messages is not None
+        messages = (self._clean_history([dict(item) for item in ctx.messages]) if ctx.messages is not None
                     else [{"role": "user", "content": prompt}])
 
         def think_instruction() -> str:

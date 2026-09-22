@@ -160,7 +160,9 @@ def parse_hermes_tool_calls(text: str) -> tuple[str, list[dict[str, Any]]]:
     """
     matches = list(TOOL_CALL_PATTERN.finditer(text))
     if "<tool_call>" in text and not matches:
-        raise ToolOutputError("模型返回了未闭合的 <tool_call>")
+        # 带上原文片段：这类错误常见于上游 create_chat_completion 失败后
+        # 回退到裸补全接口，模型没有按格式指令输出，只看异常类型定位不到原因。
+        raise ToolOutputError(f"模型返回了未闭合的 <tool_call>，原文片段: {text[:200]!r}")
     calls = []
     for match in matches:
         try:
@@ -171,7 +173,9 @@ def parse_hermes_tool_calls(text: str) -> tuple[str, list[dict[str, Any]]]:
             if isinstance(arguments, str):
                 arguments = json.loads(arguments)
         except (json.JSONDecodeError, KeyError, TypeError) as exc:
-            raise ToolOutputError("模型返回了无效的 Hermes 工具调用") from exc
+            raise ToolOutputError(
+                f"模型返回了无效的 Hermes 工具调用: {exc}，原文片段: {match.group(1)[:200]!r}"
+            ) from exc
         calls.append({"id": str(value.get("id") or f"call_{uuid.uuid4().hex}"),
                       "type": "function",
                       "function": {"name": name,

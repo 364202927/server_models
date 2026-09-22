@@ -7,7 +7,7 @@ from .utils.config import BenchmarkConfig, TestDimension
 from .hardware import detect_hardware, print_hardware_info, HardwareInfo
 from .loader import ModelLoader, MemoryUsage, HFLoader, GGUFLoader, VLLMLoader
 from .msgHandler import MsgHandler
-from .benchmark import BenchmarkRunner, BenchmarkResult, Scorer, ReportGenerator
+# from .benchmark import BenchmarkRunner, BenchmarkResult, Scorer, ReportGenerator
 
 __all__ = [
     # Config
@@ -25,8 +25,8 @@ __all__ = [
     "VLLMLoader",
     "MsgHandler",
     # Benchmark
-    "BenchmarkRunner",
-    "BenchmarkResult",
-    "Scorer",
-    "ReportGenerator",
+    # "BenchmarkRunner",
+    # "BenchmarkResult",
+    # "Scorer",
+    # "ReportGenerator",
 ]

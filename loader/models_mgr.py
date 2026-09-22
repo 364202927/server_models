@@ -205,15 +205,11 @@ class ModelsMgr:
         model_id = spec.model_id
         runtime.state = "LOADING"
         try:
-            log_info("模型加载配置", model_id,
-                     "path=", spec.path, "path_exists=", spec.path_obj.exists(),
-                     "estimated_vram_mb=", spec.estimated_vram_mb,
-                     "load=", spec.load.to_dict())
+            log_info("开始加载模型", model_id, "context_length=", spec.load.context_length)
             self._admit(spec)
             # 加载前后的整卡差值才是本模型的占用；torch 的计数器是进程级累计。
             used_before = query_gpu_used_mb()
             runtime.loader = create_loader(spec)
-            log_info("选择模型Loader", model_id, type(runtime.loader).__name__)
             runtime.loader.load(spec.path, **spec.load.loader_kwargs())
             load_lora(runtime.loader, spec.lora)
             self._measure_vram(runtime, used_before)
@@ -222,9 +218,9 @@ class ModelsMgr:
             runtime.state, runtime.error = "RUNNING", None
             runtime.last_used_at = time.time()
             self._save_snapshot(runtime)
-            log_info("模型加载完成", model_id,
-                     "estimated_vram_mb=", spec.estimated_vram_mb,
-                     "model_info=", runtime.loader.model_info)
+            info = runtime.loader.model_info
+            log_info("模型加载完成", model_id, "vram_mb=", spec.estimated_vram_mb,
+                     "context_length=", info.context_length if info else None)
             return runtime
         except Exception as exc:
             if runtime.loader:
@@ -344,15 +340,21 @@ class ModelsMgr:
             if runtime.loader is None:
                 raise RuntimeError(f"模型 {model_id} 未加载")
             runtime.active = True
-            log_info("开始生成", model_id, "prompt_chars=", len(prompt), "params=", kwargs)
+            # 不打印完整 kwargs：里面的 messages 带着全部历史原文，每次请求都
+            # 整段重复打印会把日志刷屏；只留下用于排查问题的关键旋钮。
+            log_info("开始生成:", model_id, " prompt_chars:", len(prompt),
+                     " messages:", len(kwargs.get("messages") or []),
+                     " tools:", len(kwargs.get("tools") or []),
+                     " max_new_tokens:", kwargs.get("max_new_tokens"))
             try:
                 result = runtime.loader.generate(prompt, **kwargs)
                 runtime.last_used_at = time.time()
-                log_info("生成完成", model_id, "tokens=", result.tokens_generated,
-                         "seconds=", round(result.time_seconds, 2))
+                log_info("生成完成:", model_id, " tokens:", result.tokens_generated,
+                         " seconds:", round(result.time_seconds, 2),
+                         " finish_reason:", result.finish_reason)
                 return result
             except Exception as exc:
-                log_info("生成失败", model_id, type(exc).__name__, exc)
+                log_info("生成失败:", model_id, type(exc).__name__, exc)
                 raise
             finally:
                 runtime.active = False
@@ -368,7 +370,7 @@ class ModelsMgr:
                 return runtime
             if runtime.active:
                 raise RuntimeError("模型当前正在生成，不能修改加载参数")
-            log_info("重新配置模型", model_id, wanted)
+            log_info("重新配置模型:", model_id, wanted)
             self._unload_runtime(model_id)
             changed_spec = replace(spec, load=replace(spec.load, **wanted))
             changed_spec.load_fields = set(spec.load_fields) | set(wanted)
@@ -405,7 +407,7 @@ class ModelsMgr:
             tmp_path = self.config_path.with_name(f".{self.config_path.stem}.tmp.json")
             writeFile(self._config, str(tmp_path))
             tmp_path.replace(self.config_path)
-            log_info("生成参数已更新", model_id, changes)
+            log_info("生成参数已更新:", model_id, changes)
             return merged
 
     # ---------------------------------------------------------------- 释放
