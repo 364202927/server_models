@@ -1,5 +1,14 @@
 """可复用项目基础设施。"""
 
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+ASSETS_DIR = PROJECT_ROOT / "assets"
+MODELS_FILE = ASSETS_DIR / "models.json"
+RUNTIME_DIR = ASSETS_DIR / "runtime"
+CACHE_DIR = ASSETS_DIR / "cache"
+CHAT_HISTORY_DIR = ASSETS_DIR / "chat_history"
+
 from .common import (
     RecordBuffer,
     aContainB,
@@ -7,6 +16,7 @@ from .common import (
     dictFind,
     err,
     error,
+    ensure_asset_dirs,
     get_log_buffer,
     get_logger,
     info,
@@ -30,7 +40,6 @@ from .common import (
     writeFile,
 )
 from .console import Console, console
-from .paths import ASSETS_DIR, CACHE_DIR, CHAT_HISTORY_DIR, MODELS_FILE, RUNTIME_DIR, ensure_asset_dirs
 from .recordBuffer import recordBuffer
 
 __all__ = [
