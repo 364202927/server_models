@@ -81,7 +81,7 @@ class ModelSpec:
     source_path: str | None = field(default=None, repr=False, compare=False)
     estimated_vram_mb: int | None = None
     # 显式指定推理框架(vllm/sglang/llama);只在加载时读取一次,运行期改它不生效。
-    # 未配置时按路径后缀推断默认值,见 loader/engine_select.py。
+    # 未配置时按路径后缀推断默认值,见 loader/tool_format.py。
     engine: str | None = None
     lora: list[dict[str, Any]] = field(default_factory=list)
     load: ModelLoadConfig = field(default_factory=ModelLoadConfig)

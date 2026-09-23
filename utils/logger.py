@@ -88,14 +88,17 @@ def info(*msgs: Any) -> str:
     return _logBase(kInfo, *msgs)
 def warn(*msgs: Any) -> str:
     return _logBase(kWarn, *msgs)
-def err(*msgs: Any) -> str:
+def error(*msgs: Any) -> str:
     return _logBase(kError, *msgs)
-error = err
 
 def logFormat(value: Any) -> str:
-    return _logBase(kLog, "\n", pprint.pformat(value))
-def logJson(value: Any) -> str:
-    return _logBase(kLog, "\n", json.dumps(value, indent=4, ensure_ascii=False, default=str))
+    """格式化并记录任意值：dict/list 视为 JSON 数据用 json.dumps 输出，其余类型用 pprint.pformat。"""
+    formatted = (
+        json.dumps(value, indent=4, ensure_ascii=False, default=str)
+        if isinstance(value, (dict, list))
+        else pprint.pformat(value)
+    )
+    return _logBase(kLog, "\n", formatted)
 def save_logs() -> bool:
     return _state.buffer.save2File()
 
@@ -126,8 +129,4 @@ def get_logger(name: str = "ai", level: int | str | None = None) -> logging.Logg
     return logger
 
 
-__all__ = [
-    "RecordBuffer", "str2time", "get_log_buffer", "set_console_active", "configure_logging",
-    "get_logger", "log", "info", "warn", "err", "error", "logFormat", "logJson", "save_logs",
-    "kLog", "kInfo", "kWarn", "kError",
-]
+__all__ = ["log", "info", "warn", "error", "logFormat", "save_logs"]

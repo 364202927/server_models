@@ -5,9 +5,8 @@ from typing import Any
 from datetime import datetime
 from .recordBuffer import RecordBuffer
 from pathlib import Path
-from .logger import (
-    configure_logging, err, error, get_log_buffer, get_logger, info, kError, kInfo, kLog, kWarn,
-    log, logFormat, logJson, save_logs, set_console_active, str2time, warn,
+from .logger import (configure_logging, error, get_log_buffer, get_logger, info, kError, kInfo,
+    kLog, kWarn, log, logFormat, save_logs, set_console_active, str2time, warn,
 )
 
 # True 时在 main.py 额外启动 FastAPI；Console 始终启动。可用 AI_KAPI=false 覆盖。
