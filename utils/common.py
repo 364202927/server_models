@@ -10,7 +10,7 @@ from .logger import (configure_logging, error, get_log_buffer, get_logger, info,
 )
 
 # True 时在 main.py 额外启动 FastAPI；Console 始终启动。可用 AI_KAPI=false 覆盖。
-kApi = os.getenv("AI_KAPI", "true").strip().lower() not in {"0", "false", "no", "off"}
+kApi = os.getenv("AI_KAPI", "True").strip().lower() not in {"0", "false", "no", "off"}
 
 
 def listFind(lists: Iterable[Any], fnJudge: Callable[[Any], bool]) -> Any | None:

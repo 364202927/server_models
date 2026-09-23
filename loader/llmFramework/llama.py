@@ -14,7 +14,7 @@ from typing import Any
 
 from ..tool_format import parse_hermes_tool_calls, render_tool_system_prompt
 from ...hardware import detect_gpu
-from ...utils.common import info as log_info
+from ...utils.common import info as log_info, warn, error
 from .baseInference import GenerationResult, MemoryUsage, ToolCapabilityError, ToolOutputError, baseInference
 
 try:
@@ -54,6 +54,19 @@ def _flatten_messages(messages: list[dict[str, Any]]) -> str:
     return "\n".join(f"{item.get('role', 'user')}: {item.get('content', '')}" for item in messages)
 
 
+def _repair_think_open(text: str) -> str:
+    """补全被截断的 ``<think>`` 开标签。
+
+    Qwen3 等模型的 chat template 会把 ``<think>\\n`` 作为 assistant 段的生成起点
+    拼进 prompt 里，模型只需要续写、最后吐出 ``</think>`` 收尾——所以
+    completion 文本天然是"有尾没头"。不补回开标签的话，客户端（如 OpenWebUI）
+    按 ``<think>...</think>`` 完整标签对识别推理块，会认不出来直接整段当正文
+    显示，看不到折叠/变暗效果。这里只是补标签，不改变、不删除任何内容。"""
+    if "</think>" in text and not text.lstrip().startswith("<think>"):
+        return "<think>\n" + text
+    return text
+
+
 class llama(baseInference):
     """使用 llama-cpp-python 加载单文件或目录中的 GGUF 模型。"""
 
@@ -61,6 +74,14 @@ class llama(baseInference):
     _EXTRA_SAMPLING_KEYS = ("min_p", "seed", "mirostat", "mirostat_eta", "mirostat_tau",
                             "repeat_last_n", "tfs_z", "logit_bias", "frequency_penalty",
                             "presence_penalty")
+    # 模型没配置 context_length 时的兜底窗口；不能省略 n_ctx，llama.cpp 的
+    # 构造器默认值是 512，历史消息一多就会静默截断或直接报错。
+    _FALLBACK_N_CTX = 8192
+    # 生成前给 prompt 之外预留的安全余量，以及至少要留出的生成空间；
+    # 余量不够时直接报错，而不是让 create_chat_completion 抛异常后被
+    # 误判成"没有 chat template"走进拍平兜底。
+    _CONTEXT_SAFETY_MARGIN = 32
+    _MIN_GENERATION_TOKENS = 16
 
     @staticmethod
     def _resolve_gguf_file(model_path: str) -> Path:
@@ -83,11 +104,11 @@ class llama(baseInference):
             "model_path": str(source),
             # n_gpu_layers 决定有多少层放入 GPU；-1 表示尽可能全部 offload。
             "n_gpu_layers": gpu_layers,
-            "n_batch": int(kwargs.get("batch_size", 1)),
+            # 未配置时不能省略 n_ctx——llama.cpp 构造器默认只有 512。
+            "n_ctx": int(max_model_len) if max_model_len else llama._FALLBACK_N_CTX,
+            "n_batch": int(kwargs.get("batch_size", 512)),
             "verbose": bool(kwargs.get("verbose", False)),
         }
-        if max_model_len is not None:
-            llm_kwargs["n_ctx"] = int(max_model_len)
         if kwargs.get("flash_attention") is not None:
             llm_kwargs["flash_attn"] = bool(kwargs["flash_attention"])
         if kwargs.get("gpu_split"):
@@ -99,11 +120,21 @@ class llama(baseInference):
 
     def _apply_metadata(self, source: Path, max_model_len: int | None) -> dict[str, Any]:
         """从已加载的 Llama 对象读取 metadata，回填 context_length/quantization 到
-        model_info，返回原始 metadata 供调用方记日志用。"""
+        model_info，返回原始 metadata 供调用方记日志用。
+
+        context_length 以 ``Llama.n_ctx()``（构造器实际生效值）为准，不能再信
+        metadata 里的训练上下文——不同架构键名不一致（如 Qwen3 是
+        ``qwen35.context_length`` 而不是通用的 ``llama.context_length``），
+        取不到时会静默退回 dataclass 默认值 4096，把真实只有 512 的窗口掩盖掉。
+        """
         metadata = getattr(self._model, "metadata", {}) or {}
-        context = max_model_len or metadata.get("llama.context_length") or metadata.get("n_ctx_train")
-        if context:
-            self._model_info.context_length = int(context)
+        self._model_info.context_length = int(self._model.n_ctx())
+
+        arch = metadata.get("general.architecture")
+        trained = metadata.get(f"{arch}.context_length") if arch else None
+        if trained and int(trained) > self._model_info.context_length:
+            log_info("上下文窗口小于模型训练长度", source.name,
+                     f"当前={self._model_info.context_length}", f"训练={trained}")
 
         # 转换器通常把 ``general.file_type`` 写成数字枚举（例如 30），
         # 它不是用户可读的量化名称；优先使用 metadata 字符串或文件名标记。
@@ -135,14 +166,13 @@ class llama(baseInference):
         self._chat_format = kwargs.get("chat_format")
         self._tool_parser = kwargs.get("tool_parser")
         llm_kwargs = self._build_llm_kwargs(source, gpu_layers, max_model_len, **kwargs)
-        log_info("GGUF加载参数", str(source), llm_kwargs)
         self._model = Llama(**llm_kwargs)
         self._model_info = self._extract_model_info(str(source), dtype=dtype)
 
-        metadata = self._apply_metadata(source, max_model_len)
-        log_info("GGUF加载结果", str(source),
-                "metadata_keys=", list(metadata)[:20],
-                "context=", self._model_info.context_length,
+        self._apply_metadata(source, max_model_len)
+        log_info("GGUF加载完成", source.name,
+                "n_ctx=", self._model_info.context_length,
+                "n_gpu_layers=", llm_kwargs["n_gpu_layers"],
                 "quantization=", self._model_info.quantization or "未检测到")
         self._effective_load = {
             "engine": "llama", "dtype": dtype,
@@ -168,9 +198,14 @@ class llama(baseInference):
         整段 prompt 进/整段文本出不同，完整覆盖 generate() 而不用模板方法。"""
         if not self.is_loaded:
             raise RuntimeError("Model not loaded. Call load() first.")
+        messages = self._normalize_messages(prompt, system_prompt, kwargs)
+
+        # 请求的 max_new_tokens 可能超过上下文剩余空间（历史消息越攒越长）；
+        # 在这里提前按 n_ctx 裁掉，而不是让 create_chat_completion 抛异常后
+        # 被误判成"没有 chat template"走进拍平兜底、吐出垃圾续写。
+        max_new_tokens = self._clamp_to_context(messages, max_new_tokens)
         sampling = self._build_sampling(max_new_tokens, temperature, top_p, top_k, repetition_penalty,
                                         stop_sequences, kwargs)
-        messages = self._normalize_messages(prompt, system_prompt, kwargs)
 
         # 分支键是 tools，不是 messages：没有工具时走普通聊天，
         # 和不带工具时的普通对话行为一致，只是现在用的是完整多轮 messages。
@@ -184,9 +219,24 @@ class llama(baseInference):
         return self._chat_with_hermes_tools(messages, tools, kwargs.get("tool_choice"),
                                             sampling, max_new_tokens)
 
+    def _clamp_to_context(self, messages: list[dict[str, Any]], max_new_tokens: int) -> int:
+        """按 ``n_ctx`` 与已用 prompt token 数裁剪本次可生成的 token 数；
+        剩余空间连最小生成长度都不够时直接报错，不再尝试硬生成。"""
+        n_ctx = self._model.n_ctx()
+        prompt_tokens = len(self._model.tokenize(_flatten_messages(messages).encode("utf-8")))
+        available = n_ctx - prompt_tokens - self._CONTEXT_SAFETY_MARGIN
+        if available < self._MIN_GENERATION_TOKENS:
+            raise ValueError(
+                f"上下文不足: prompt 约 {prompt_tokens} token，窗口 {n_ctx} token，"
+                "请精简历史消息或调大 context_length"
+            )
+        return min(max_new_tokens, available)
+
     def _chat(self, messages: list[dict[str, Any]], sampling: dict[str, Any],
              max_new_tokens: int) -> GenerationResult:
-        """无工具场景：用后端聊天接口生成完整多轮对话；接口不可用时退化为普通补全接口。"""
+        """无工具场景：用后端聊天接口生成完整多轮对话；模型没有 chat template 时
+        退化为普通补全接口。上下文溢出等请求级错误已经在 generate() 里提前拦截，
+        这里只处理"接口本身不可用"，不再吞掉别的异常。"""
         start = time.perf_counter()
         try:
             result = self._model.create_chat_completion(messages=messages, **sampling)
@@ -196,8 +246,13 @@ class llama(baseInference):
             usage = result.get("usage", {})
             prompt_tokens = int(usage.get("prompt_tokens", 0))
             tokens = int(usage.get("completion_tokens", 0))
-        except (AttributeError, TypeError, KeyError, ValueError) as exc:
-            log_info("GGUF聊天接口不可用，回退普通生成", type(exc).__name__, exc)
+        except (AttributeError, TypeError) as exc:
+            # 打印异常原文 + 触发这次调用的消息结构（角色序列/是否缺 content），
+            # 这是目前唯一能定位"是哪条消息、哪个字段让模型自带的 chat template
+            # 渲染失败"的线索，不能只留异常类名。
+            error("GGUF聊天模板渲染失败，回退补全接口", type(exc).__name__, exc,
+                "messages=", [(m.get("role"), "content" in m, bool(m.get("tool_calls")))
+                              for m in messages])
             # 没有 chat template 时只能手工拍平多轮消息。
             flat = _flatten_messages(messages)
             result = self._model(flat, **sampling)
@@ -207,7 +262,10 @@ class llama(baseInference):
                                 ("length" if tokens >= max_new_tokens else "stop"))
             prompt_tokens = len(self._model.tokenize(flat.encode("utf-8")))
         elapsed = time.perf_counter() - start
-        return GenerationResult(text, tokens, elapsed, tokens / elapsed if elapsed else 0.0,
+        if finish_reason == "length":
+            warn("生成被截断", "tokens=", tokens, "max_new_tokens=", max_new_tokens)
+        return GenerationResult(_repair_think_open(text), tokens, elapsed,
+                                tokens / elapsed if elapsed else 0.0,
                                 prompt_tokens, finish_reason=finish_reason)
 
     def _chat_with_backend_tools(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]],
@@ -235,7 +293,7 @@ class llama(baseInference):
         elapsed = time.perf_counter() - start
         tokens = int(usage.get("completion_tokens", 0))
         return GenerationResult(
-            str(message.get("content") or ""), tokens, elapsed,
+            _repair_think_open(str(message.get("content") or "")), tokens, elapsed,
             tokens / elapsed if elapsed else 0.0,
             int(usage.get("prompt_tokens", 0)), calls,
             str(choice.get("finish_reason") or ("tool_calls" if calls else "stop")),
