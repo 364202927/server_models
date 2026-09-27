@@ -5,19 +5,28 @@
 交给 Loader；Loader 内部只按"有没有 tools"决定走普通聊天模板还是工具模板，
 不再区分"有没有 messages"。
 
+协议适配层说明：聊天请求与管理指令分别有各自的规范化入口，不必每接入
+一个新协议就重写一遍字段翻译逻辑。
+`ChatRequest` + `MsgHandler.chat()` 是所有协议适配器（serverApi 的
+OpenAI 网关、未来的其它协议网关）发起聊天的统一入口，适配器只需要把
+自己协议里的字段翻译成 `ChatRequest`，消息校验、生成参数别名归一化、
+推理等级解析、消息拉平等协议无关的逻辑全部在这里完成一次。
+`AdminRequest` + `MsgHandler.admin()` 是管理指令（message_id
+1001~1007）的对应入口，适配器直接给出 model（以及 1007 需要的
+generation），不再需要像 `_dispatch` 里 `_model_from` 那样对 args
+的形状（dict/list/字符串）做猜测。
+Console 的裸 prompt 调用仍然走原有的 `handle()`，以保持兼容。
+
 工具数量较多时（超过 _TOOL_SEARCH_THRESHOLD），_generate_with_tool_search
 会切换成按需检索模式：只把 __search_tools__ 元工具的完整定义交给模型，
 其余工具收进一份精简目录，模型需要时自己调用 __search_tools__ 换取完整
-定义。这个过程完全在 MsgHandler 内部完成，对客户端和各个 Loader 透明——
-见 loader/tool_format.py。
+定义。这个过程完全在 MsgHandler 内部完成，对客户端和各个 Loader 透明
+
+msgHandler.py
 """
 
 from __future__ import annotations
-
-import asyncio
-import json
-import re
-import uuid
+import uuid,asyncio,json,re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -36,6 +45,9 @@ GENERATION_KEYS = frozenset({
     "mirostat", "mirostat_eta", "mirostat_tau",
 })
 SUPPORTED_MESSAGE_IDS = frozenset({0, 1001, 1002, 1003, 1004, 1005, 1006, 1007})
+# 管理指令的 message_id 子集；AdminRequest/admin() 用它做入参校验，语义上与
+# SUPPORTED_MESSAGE_IDS 去掉聊天用的 0 完全一致，单独列出是为了不必在校验时反复排除 0。
+ADMIN_MESSAGE_IDS = frozenset({1001, 1002, 1003, 1004, 1005, 1006, 1007})
 _TOOL_NAME = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 # 工具数超过这个值才启用 __search_tools__ 按需检索；数量不多时直接原样透传更简单。
@@ -44,6 +56,11 @@ _TOOL_SEARCH_THRESHOLD = 8
 _TOOL_SEARCH_TOP_K = 3
 # 最多允许几轮"调用 __search_tools__ -> 重新生成"；超过后直接把全量工具兜底发一次。
 _MAX_TOOL_SEARCH_HOPS = 2
+
+# reasoning_effort 风格的字符串等级 -> 内部 0~5 等级的映射（协议无关，供 resolve_think_level 使用）。
+REASONING_EFFORT_LEVELS = {"none": 0, "low": 1, "medium": 3, "high": 5}
+# 各协议里常见的生成参数别名 -> 内部规范名；协议专属别名可在调用 normalize_generation_params 时追加。
+GENERATION_ALIASES = {"stop": "stop_sequences", "repeat_penalty": "repetition_penalty"}
 
 
 # --------------------------------------------------------------------------
@@ -136,8 +153,7 @@ def _validate_message_history(messages: list[dict[str, Any]]) -> None:
         raise ValueError("工具调用结果未补齐: " + ", ".join(sorted(pending)))
 
 
-def validate_tool_request(messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None,
-                           tool_choice: Any) -> tuple[list[dict[str, Any]], str | dict[str, Any]]:
+def validate_tool_request(messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None,tool_choice: Any) -> tuple[list[dict[str, Any]], str | dict[str, Any]]:
     """校验现代 function 工具定义与历史消息中的工具调用配对，返回规范化后的 (tools, tool_choice)。
 
     这里始终对 messages 做结构校验（不管本次是否带 tools），因为服务端始终
@@ -187,10 +203,102 @@ def validate_tool_output(calls: list[dict[str, Any]], tools: list[dict[str, Any]
     return [normalize(call) for call in calls]
 
 
+# --------------------------------------------------------------------------
+# 协议无关的请求规范化：供各协议适配器（serverApi 等）复用，避免每接一个
+# 协议就把 think 等级解析、生成参数别名归一化、消息拉平、纯文本校验重写一遍。
+# --------------------------------------------------------------------------
+
+def resolve_think_level(*, think: Any = None, reasoning_effort: Any = None) -> int:
+    """把协议层解析出的原始推理强度字段，统一映射为内部 0~5 等级。
+
+    ``think`` 优先于 ``reasoning_effort``；``reasoning_effort`` 可以是
+    0~5 的整数，也可以是 none/low/medium/high 这类字符串等级。
+    """
+    if think is not None:
+        return max(0, min(5, int(think)))
+    if isinstance(reasoning_effort, int):
+        return max(0, min(5, reasoning_effort))
+    return REASONING_EFFORT_LEVELS.get(str(reasoning_effort).lower(), 0)
+
+
+def normalize_generation_params(*sources: dict[str, Any], aliases: dict[str, str] | None = None) -> dict[str, Any]:
+    """合并多个来源的生成参数，归一化别名字段名，并过滤到 GENERATION_KEYS。
+
+    ``sources`` 按优先级从高到低传入（如协议自身字段优先于 extra_body，
+    extra_body 优先于 custom_parameters）；同一来源内规范名优先于别名
+    （例如显式给出的 repetition_penalty 优先于 repeat_penalty）。
+    ``aliases`` 用于追加某个协议专属的别名（如 Ollama 的 num_predict），
+    不会污染其它协议共用的 GENERATION_ALIASES。
+    """
+    alias_map = {**GENERATION_ALIASES, **(aliases or {})}
+    values: dict[str, Any] = {}
+    for source in sources:
+        for key, value in sorted(source.items(), key=lambda kv: kv[0] in alias_map):
+            if value is not None:
+                values.setdefault(alias_map.get(key, key), value)
+    return {key: value for key, value in values.items() if key in GENERATION_KEYS}
+
+
+def flatten_messages(messages: list[dict[str, Any]], system_prompt: str | None = None) -> str:
+    """把结构化 messages 拉平为纯文本 prompt，供仍需要扁平 prompt 的 Loader 使用。"""
+    def text_of(content: Any) -> str:
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            return "".join(part.get("text", "") for part in content
+                           if isinstance(part, dict) and part.get("type") == "text")
+        return str(content or "")
+
+    turns = ([{"role": "system", "content": system_prompt}] if system_prompt else []) + list(messages)
+    return "\n".join(f"{turn.get('role', 'user')}: {text_of(turn.get('content'))}" for turn in turns)
+
+
+def has_non_text_content(messages: list[dict[str, Any]]) -> bool:
+    """检测消息中是否包含非文本内容分段（当前服务仅支持纯文本消息，与具体协议无关）。"""
+    for item in messages:
+        if not isinstance(item, dict) or not isinstance(item.get("content"), list):
+            continue
+        if any(isinstance(part, dict) and part.get("type") != "text" for part in item["content"]):
+            return True
+    return False
+
+
+@dataclass
+class ChatRequest:
+    """跨协议的规范化聊天请求：所有协议适配器调用 MsgHandler.chat() 时的统一参数。
+
+    协议适配器（如 serverApi 的 OpenAI 网关）只需要把自己协议里的字段翻译
+    成这个对象，不需要关心消息校验、生成参数别名、消息拉平这些协议无关的
+    细节——它们都在 MsgHandler.chat() 内部统一处理。
+    """
+    model: str
+    messages: list[dict[str, Any]]
+    think: int = 0
+    deploy: dict[str, Any] = field(default_factory=dict)
+    tools: list[dict[str, Any]] = field(default_factory=list)
+    tool_choice: Any = None
+    parallel_tool_calls: bool = True
+    system_prompt: str = ""
+
+
+@dataclass
+class AdminRequest:
+    """跨协议的规范化管理指令请求：message_id 1001~1007 的统一入参。
+
+    协议适配器只需要把自己协议里承载管理指令的字段翻译成这个对象，
+    不再需要靠 `_model_from` 那样对 args 的形状（dict/list/字符串）做猜测——
+    model 由适配器直接给出；generation 仅 message_id == 1007（更新常驻生成
+    参数）时使用，其余指令用不到，留空即可。
+    """
+    message_id: int
+    model: str = ""
+    generation: dict[str, Any] = field(default_factory=dict)
+
+
 @dataclass
 class _ChatContext:
     """message_id == 0（聊天）分支所需的参数集合；把 handle() 的一长串关键字参数收敛成一个对象，
-    避免 _dispatch/_generate_chat 各自携带十几个参数。"""
+    避免 _dispatch/_generate_chat 各自携带十几个参数。ChatRequest 会被转换成这个内部对象。"""
     model: str = ""
     prompt: str = ""
     think: int = 0
@@ -219,8 +327,7 @@ class MsgHandler:
     @staticmethod
     def _response(model: str, message_id: int, status: str, value: Any) -> dict[str, Any]:
         payload = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
-        return {"request_id": str(uuid.uuid4()), "status": status, "model": model,
-                "message_id": message_id, "response": payload}
+        return {"request_id": str(uuid.uuid4()), "status": status, "model": model,"message_id": message_id, "response": payload}
 
     @staticmethod
     def _model_from(args: Any) -> str:
@@ -235,7 +342,11 @@ class MsgHandler:
                       messages: list[dict[str, Any]] | None = None,
                       tools: list[dict[str, Any]] | None = None, tool_choice: Any = None,
                       parallel_tool_calls: bool = True, system_prompt: str = "") -> dict[str, Any]:
-        """统一入口：校验请求合法性后串行分发给 ModelsMgr。message_id=0 为聊天，1001~1007 为管理指令。"""
+        """统一入口：校验请求合法性后串行分发给 ModelsMgr。message_id=0 为聊天，1001~1007 为管理指令。
+
+        供 Console 的裸 prompt 调用与管理指令使用。协议适配器（HTTP 网关）的聊天请求
+        请改用 chat()，那里已经把结构化 ChatRequest 的校验/翻译收敛掉了。
+        """
         if message_id not in SUPPORTED_MESSAGE_IDS:
             raise ValueError(f"不支持的 message_id: {message_id}")
         if message_id != 0 and (tools or messages is not None or tool_choice is not None):
@@ -251,9 +362,67 @@ class MsgHandler:
             async with self._lock:
                 info("消息处理", source, message_id, model)
                 result = await self._dispatch(message_id, args, ctx)
-                info("消息处理完成", source, message_id,
+                info("消息处理完成", source, message_id, "status=", result.get("status", "unknown"),
+                     "response_chars=", len(str(result.get("response", ""))))
+                return result
+        finally:
+            self._pending -= 1
+
+    async def chat(self, request: ChatRequest, *, source: str = "unknown") -> dict[str, Any]:
+        """所有协议适配器的统一聊天入口。
+
+        适配器只需要把自己协议里的字段翻译成 ChatRequest；消息的纯文本校验、
+        工具定义/历史校验、生成参数合并、实际生成、结果组装都在这里完成，
+        并复用 _dispatch 里既有的错误分类（ToolCapabilityError/ToolOutputError/
+        其它异常 -> error_type），行为与 handle() 的聊天分支完全一致。
+
+        与 handle() 相同的错误处理约定：请求级校验（如非文本消息、非法工具
+        定义）在进入 _dispatch 之前直接抛 ValueError，由调用方（协议适配器）
+        转换成协议自己的 400 响应；生成期错误则走 _dispatch 的 error_type 分支。
+        """
+        if has_non_text_content(request.messages):
+            raise ValueError("当前服务仅支持文本消息")
+        tools, tool_choice = validate_tool_request(request.messages, request.tools, request.tool_choice)
+
+        ctx = _ChatContext(model=request.model,
+                            prompt=flatten_messages(request.messages, request.system_prompt),
+                            think=request.think, deploy=request.deploy, messages=request.messages,
+                            tools=tools, tool_choice=tool_choice,
+                            parallel_tool_calls=request.parallel_tool_calls,
+                            system_prompt=request.system_prompt)
+        self._pending += 1
+        try:
+            async with self._lock:
+                info("消息处理", source, 0, request.model)
+                result = await self._dispatch(0, None, ctx)
+                info("消息处理完成", source, 0,
                      "status=", result.get("status", "unknown"),
                      "response_chars=", len(str(result.get("response", ""))))
+                return result
+        finally:
+            self._pending -= 1
+
+    async def admin(self, request: AdminRequest, *, source: str = "unknown") -> dict[str, Any]:
+        """所有协议适配器的统一管理指令入口（message_id 1001~1007）。
+
+        与 handle() 的管理分支行为完全一致（复用同一个 _dispatch），区别只在于
+        入参是规范化的 AdminRequest：model 已经由适配器给出，_dispatch 里
+        `model or self._model_from(args)` 这类兜底猜测因此永远不会被触发；
+        只有 1007（更新生成参数）需要额外的 generation 字段，通过 args 传给
+        `_update_generation`，其余指令的 args 留空即可。
+        """
+        if request.message_id not in ADMIN_MESSAGE_IDS:
+            raise ValueError(f"不支持的管理指令 message_id: {request.message_id}")
+        args = {"model": request.model, "generation": request.generation} if request.message_id == 1007 else None
+
+        ctx = _ChatContext(model=request.model)
+        self._pending += 1
+        try:
+            async with self._lock:
+                info("消息处理", source, request.message_id, request.model)
+                result = await self._dispatch(request.message_id, args, ctx)
+                info("消息处理完成", source, request.message_id,
+                     "status=", result.get("status", "unknown"))
                 return result
         finally:
             self._pending -= 1
@@ -451,5 +620,8 @@ class MsgHandler:
 
 
 msgHandler = MsgHandler
-__all__ = ["GENERATION_KEYS", "SUPPORTED_MESSAGE_IDS", "MsgHandler", "msgHandler",
+__all__ = ["GENERATION_KEYS", "SUPPORTED_MESSAGE_IDS", "ADMIN_MESSAGE_IDS",
+           "GENERATION_ALIASES", "REASONING_EFFORT_LEVELS",
+           "ChatRequest", "AdminRequest", "MsgHandler", "msgHandler",
+           "resolve_think_level", "normalize_generation_params", "flatten_messages", "has_non_text_content",
            "validate_tool_request", "validate_tool_output"]

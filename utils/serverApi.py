@@ -1,12 +1,17 @@
 """OpenAI / Open WebUI 兼容的 FastAPI 网关。
 
-把 OpenAI Chat Completions 协议的请求翻译为内部 MsgHandler 调用，
-并把内部生成结果重新包装为 OpenAI 兼容的响应（含 SSE 流式重放）。
+只做两件事：把 OpenAI 协议字段翻译成 MsgHandler 能理解的规范化请求
+（聊天请求 -> ChatRequest，管理指令 -> AdminRequest），再把 MsgHandler
+返回的内部结果重新包装成 OpenAI 兼容的响应（含 SSE 流式重放）。消息校验、
+生成参数别名归一化、推理等级解析这些协议无关的逻辑都在 MsgHandler 里，
+这里不重复实现，未来接入其它协议时也不需要在这一层重写。
 
 单流程说明：所有聊天请求（message_id == 0）统一把结构化 messages 交给
 MsgHandler，不再区分"要不要走工具"；是否拼普通 prompt、是否渲染工具
 模板，全部下沉到 MsgHandler / Loader 决定（依据是否有 tools，而不是
 是否有 messages）。API 层不再做这个分流。
+
+serverApi.py
 """
 from __future__ import annotations
 
@@ -14,7 +19,6 @@ import json
 import time
 import uuid
 from contextlib import asynccontextmanager
-from itertools import chain
 from typing import Any, AsyncIterator, Iterator
 
 from fastapi import Depends, FastAPI, Header, HTTPException
@@ -23,9 +27,12 @@ from pydantic import BaseModel, ConfigDict, Field
 from starlette.responses import JSONResponse, StreamingResponse
 
 from ..loader.models_mgr import ModelsMgr
-from ..msgHandler import MsgHandler
+from ..msgHandler import AdminRequest, ChatRequest, MsgHandler, normalize_generation_params, resolve_think_level
 
 # 会实际影响生成结果的采样/惩罚参数；用于从 extra_body/custom_parameters 中过滤出有效字段。
+# 注意这里同时包含规范名和 OpenAI/Ollama 风格的别名（stop、repeat_penalty）——
+# 别名归一化本身交给 MsgHandler.normalize_generation_params，这里只负责圈定
+# "OpenAIChatRequest 上哪些字段算生成参数"。
 _GENERATION_FIELDS = {
     "temperature", "top_p", "top_k", "min_p", "max_tokens", "stop",
     "seed", "logit_bias", "frequency_penalty", "presence_penalty",
@@ -94,63 +101,33 @@ class OpenAIChatRequest(BaseModel):
     functions: list[dict[str, Any]] | None = None                  # 旧版函数定义；传入即拒绝，提示改用 tools
 
 
-def _chat_prompt(messages: list[dict[str, Any]], system_prompt: str | None) -> str:
-    """为旧版 handler 保留扁平 prompt，同时完整 messages 仍单独透传。"""
-    def text_of(content: Any) -> str:
-        if isinstance(content, str):
-            return content
-        if isinstance(content, list):
-            return "".join(part.get("text", "") for part in content
-                           if isinstance(part, dict) and part.get("type") == "text")
-        return str(content or "")
-
-    turns = ([{"role": "system", "content": system_prompt}] if system_prompt else []) + messages
-    return "\n".join(f"{turn.get('role', 'user')}: {text_of(turn.get('content'))}" for turn in turns)
-
-
-def _has_non_text_content(messages: list[dict[str, Any]]) -> bool:
-    """检测消息中是否包含非文本内容分段（当前服务仅支持纯文本消息）。"""
-    for item in messages:
-        if not isinstance(item, dict) or not isinstance(item.get("content"), list):
-            continue
-        if any(isinstance(part, dict) and part.get("type") != "text" for part in item["content"]):
-            return True
-    return False
-
-
-def _resolve_think_level(request: OpenAIChatRequest) -> int:
-    """解析推理强度：think 优先于 reasoning_effort，统一转换为内部等级。"""
-    if request.think is not None:
-        value = int(request.think)
-        return max(0, min(5, value))
-    if isinstance(request.reasoning_effort, int):
-        return max(0, min(5, request.reasoning_effort))
-    return {"none": 0, "low": 1, "medium": 3, "high": 5}.get(str(request.reasoning_effort).lower(), 0)
-
-
-def _generation_params(request: OpenAIChatRequest) -> dict[str, Any]:
-    """合并顶层字段与 extra_body/custom_parameters 中的生成参数，并统一停止序列、长度、重复惩罚等别名。"""
-    values = {field: getattr(request, field) for field in _GENERATION_FIELDS
-              if getattr(request, field) is not None}
-    for key, value in chain(request.extra_body.items(), request.custom_parameters.items()):
-        if key in _GENERATION_FIELDS:
-            values.setdefault(key, value)
-
+def _to_chat_request(request: OpenAIChatRequest) -> ChatRequest:
+    """把 OpenAI 协议字段翻译为规范化的 ChatRequest；只做字段名翻译，不做校验/生成——
+    那些工作交给 MsgHandler.chat()。"""
     if request.max_tokens is not None and request.max_completion_tokens not in (None, request.max_tokens):
         raise HTTPException(status_code=400, detail="max_tokens 与 max_completion_tokens 冲突")
-    if request.max_tokens is None and request.max_completion_tokens is not None:
-        values["max_tokens"] = request.max_completion_tokens
 
-    if "stop" in values:
-        stop = values.pop("stop")
-        values["stop_sequences"] = [stop] if isinstance(stop, str) else stop
+    direct_fields = {f: getattr(request, f) for f in _GENERATION_FIELDS if getattr(request, f) is not None}
+    deploy = normalize_generation_params(direct_fields, request.extra_body, request.custom_parameters)
+    if "max_tokens" not in deploy and request.max_completion_tokens is not None:
+        deploy["max_tokens"] = request.max_completion_tokens
 
-    if values.get("repeat_penalty") is not None:
-        values["repetition_penalty"] = values.pop("repeat_penalty")
-    if request.repetition_penalty is not None:
-        values["repetition_penalty"] = request.repetition_penalty
+    return ChatRequest(
+        model=request.model, messages=request.messages,
+        think=resolve_think_level(think=request.think, reasoning_effort=request.reasoning_effort),
+        deploy=deploy, tools=request.tools or [], tool_choice=request.tool_choice,
+        parallel_tool_calls=request.parallel_tool_calls is not False,
+        system_prompt=request.system_prompt or "")
 
-    return values
+
+def _to_admin_request(request: OpenAIChatRequest) -> AdminRequest:
+    """把管理指令请求（message_id 1001~1007）里的 model/args 翻译为规范化的 AdminRequest；
+    不再需要 MsgHandler 那边对 args 形状（dict/list/字符串）做猜测。"""
+    payload = request.args if isinstance(request.args, dict) else {}
+    generation = dict(payload.get("generation", payload.get("deploy", {})))
+    return AdminRequest(message_id=request.message_id,
+                         model=request.model or str(payload.get("model", "")),
+                         generation=generation)
 
 
 def _build_payload(result: dict[str, Any], model_id: str) -> dict[str, Any]:
@@ -211,9 +188,8 @@ class serverApi:
         if token != expected:
             raise HTTPException(status_code=401, detail="API key 无效")
 
-    @asynccontextmanager
+    @asynccontextmanager # 空闲回收由 main.py 独立启动，纯 Console 模式（AI_KAPI=false）同样需要。
     async def _lifespan(self, _: FastAPI) -> AsyncIterator[None]:
-        # 空闲回收由 main.py 独立启动，纯 Console 模式（AI_KAPI=false）同样需要。
         yield
 
     def _create_app(self) -> FastAPI:
@@ -225,55 +201,42 @@ class serverApi:
             allow_methods=["*"],
             allow_headers=["*"],
         )
-
+        #基础协议
         @app.get("/v1/health")  # 连接检测
         async def health() -> dict[str, str]:
             return {"status": "ok"}
-
         @app.get("/", response_model=None)  # 服务状态、OpenAI Base URL 和监听端口
         async def root() -> Any:
             return JSONResponse({"status": "ok", "openai_base_url": "/v1", "port": self._port()})
-
         @app.api_route("/v1", methods=["GET", "HEAD"])
         async def api_root() -> dict[str, str]:
             return {"status": "ok"}
-
         @app.get("/v1/models")
         async def models(_: None = Depends(self._require_api_key)) -> dict[str, Any]:
             now = int(time.time())
             return {"object": "list", "data": [
                 {"id": model_id, "object": "model", "created": now, "owned_by": "local"}
                 for model_id in self.manager.specs]}
-
+        # openai支持
         @app.post("/v1/chat/completions", response_model=None)
         async def chat_completions(request: OpenAIChatRequest,
                                     _: None = Depends(self._require_api_key)) -> Any:
             if request.function_call is not None or request.functions:
-                raise HTTPException(status_code=400,
-                                     detail="旧版 functions/function_call 不受支持，请使用 tools/tool_choice")
+                raise HTTPException(status_code=400,detail="旧版 functions/function_call 不受支持，请使用 tools/tool_choice")
 
-            messages = request.messages or []
             is_chat = request.message_id == 0
             if is_chat and not request.model:
                 raise HTTPException(status_code=400, detail="model 不能为空")
-            if is_chat and not messages:
+            if is_chat and not request.messages:
                 raise HTTPException(status_code=400, detail="messages 不能为空")
-            if is_chat and _has_non_text_content(messages):
-                raise HTTPException(status_code=400, detail="当前服务仅支持文本消息")
 
-            # 单流程：不再判断"要不要走结构化"，聊天请求一律把 messages
-            # 原样交给 MsgHandler；是否调用工具完全由 tools/tool_choice 决定。
+            # 单流程：聊天请求翻译成 ChatRequest 交给 handler.chat()，管理指令翻译成
+            # AdminRequest 交给 handler.admin()；两者的校验/生成/错误分类都在 MsgHandler 内部完成。
             try:
-                result = await self.handler.handle(
-                    request.message_id, request.args, model=request.model,
-                    prompt=_chat_prompt(messages, request.system_prompt) if is_chat else "",
-                    deploy=_generation_params(request) if is_chat else {},
-                    think=_resolve_think_level(request) if is_chat else 0,
-                    source="openwebui",
-                    messages=messages if is_chat else None,
-                    tools=request.tools, tool_choice=request.tool_choice,
-                    parallel_tool_calls=request.parallel_tool_calls is not False,
-                    system_prompt=request.system_prompt or "")
+                if is_chat:
+                    result = await self.handler.chat(_to_chat_request(request), source="openwebui")
+                else:
+                    result = await self.handler.admin(_to_admin_request(request), source="openwebui")
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -326,6 +289,5 @@ class serverApi:
                                  port=self._port(), log_level="info")
         self._server = uvicorn.Server(config)
         await self._server.serve()
-
 
 web = serverApi
