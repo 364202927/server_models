@@ -42,7 +42,7 @@ GENERATION_KEYS = frozenset({
     "temperature", "top_p", "top_k", "min_p", "repetition_penalty",
     "max_tokens", "stop_sequences", "system_prompt", "seed", "logit_bias",
     "frequency_penalty", "presence_penalty", "repeat_last_n", "tfs_z",
-    "mirostat", "mirostat_eta", "mirostat_tau",
+    "mirostat", "mirostat_eta", "mirostat_tau", "regex", "json_schema",
 })
 SUPPORTED_MESSAGE_IDS = frozenset({0, 1001, 1002, 1003, 1004, 1005, 1006, 1007})
 # 管理指令的 message_id 子集；AdminRequest/admin() 用它做入参校验，语义上与

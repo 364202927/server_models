@@ -21,6 +21,9 @@
     "qwen3.8-27B": {
       "path": "D:/ai/models/Qwen3.8-27B-Uncensored-GGUF/Qwen3.8-27B-Uncensored-IQ4_XS.gguf",
       "engine": "llama",
+      "draft": null,
+      "mtp": false,
+      "lora": null,
       "estimated_vram_mb": 15170,
       "load": {
         "dtype": "float16",

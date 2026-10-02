@@ -13,9 +13,29 @@ from typing import Any
 from ..hardware import check_gpu_memory, check_ram, detect_gpu, query_gpu_used_mb
 from ..utils.common import info as log_info, readFile, writeFile
 from .llmFramework.baseInference import GenerationResult, baseInference
-from .expand.lora import load_lora
 from .model_spec import CACHE_DEFAULTS, LOAD_KEYS, ModelSpec, load_model_specs
 from .tool_format import create_loader, load_snapshot, save_snapshot
+
+LOAD_DEFAULTS: dict[str, Any] = {
+    "dtype": "float16",
+    "gpu_offload_layers": -1,
+    "batch_size": 1,
+    "flash_attention": True,
+    "speculative_decoding": False,
+    "tensor_parallel_size": 1,
+    "gpu_split": None,
+    "trust_remote_code": True,
+}
+ENGINE_LOAD_DEFAULTS: dict[str, dict[str, Any]] = {
+    "vllm": {"gpu_memory_utilization": 0.9, "enable_sleep_mode": True},
+    "sglang": {"gpu_memory_utilization": 0.9, "enable_memory_saver": True},
+}
+LOAD_ARG_FIELDS = {"max_model_len": "context_length", "tensor_parallel_size": "tensor_parallel"}
+GENERATION_DEFAULTS: dict[str, Any] = {
+    "system_prompt": "",
+    "presence_penalty": 0,
+    "frequency_penalty": 0,
+}
 
 
 @dataclass
@@ -81,6 +101,8 @@ class ModelsMgr:
         调用方（MsgHandler）再叠加请求里的 ``deploy``，构成三层覆盖。
         """
         params = dict(self.settings.get("generation", {}))
+        for name, value in GENERATION_DEFAULTS.items():
+            params.setdefault(name, value)
         spec = self.specs.get(model_id)
         if spec:
             params.update(spec.generation)
@@ -231,10 +253,19 @@ class ModelsMgr:
                 # 记录(不 pop)以便 status()/list_models() 能看到 error 原因。
                 runtime.state, runtime.error = "UNLOADED", "无法确定推理框架"
                 return runtime
-            runtime.loader.load(spec.path, **spec.load.loader_kwargs())
-            load_lora(runtime.loader, spec.lora)
+            load_kwargs = spec.load.loader_kwargs()
+            engine_name = type(runtime.loader).__name__.lower()
+            defaults = {**LOAD_DEFAULTS, **ENGINE_LOAD_DEFAULTS.get(engine_name, {})}
+            for name, value in defaults.items():
+                if name not in load_kwargs or load_kwargs[name] is None:
+                    load_kwargs[name] = value
+                field_name = LOAD_ARG_FIELDS.get(name, name)
+                if field_name in LOAD_KEYS and getattr(spec.load, field_name) is None:
+                    setattr(spec.load, field_name, load_kwargs[name])
+            runtime.loader.load(spec.path, **load_kwargs)
+            runtime.loader._expand(spec.draft, spec.mtp, spec.lora)
             self._measure_vram(runtime, used_before)
-            self._fill_missing_load(runtime)
+            self._apply_effective_load(runtime)
             self._persist_spec(spec)
             runtime.state, runtime.error = "RUNNING", None
             runtime.last_used_at = time.time()
@@ -268,29 +299,33 @@ class ModelsMgr:
         runtime.needs_remeasure = False
         log_info("模型显存占用实测", spec.model_id, f"{spec.estimated_vram_mb} MB")
 
-    def _fill_missing_load(self, runtime: RuntimeModel) -> None:
-        """模型没有 load 节点时，用本次实际生效的参数补全；已配置的不覆盖。"""
-        if runtime.spec.load_present or runtime.loader is None:
+    def _apply_effective_load(self, runtime: RuntimeModel) -> None:
+        """记录本次实际生效的参数，供首次加载后的完整配置持久化。"""
+        if runtime.loader is None:
             return
+        spec = runtime.spec
         effective = runtime.loader.effective_load
         info = runtime.loader.model_info
         if info:
             effective.setdefault("context_length", info.context_length)
             effective.setdefault("dtype", info.dtype)
-            # 量化方式不写入配置，只输出诊断信息。
             log_info("模型量化信息", runtime.spec.model_id,
                      info.quantization or info.extra.get("quantization", "未检测到"))
         for name, value in effective.items():
             if name in LOAD_KEYS:
-                setattr(runtime.spec.load, name, value)
+                setattr(spec.load, name, value)
+        accepted_extra = set(effective) - LOAD_KEYS - {"engine"}
+        spec.load.extra = {key: value for key, value in spec.load.extra.items()
+                           if key in accepted_extra}
+        spec.load_fields.update(name for name in effective if name in LOAD_KEYS or name in spec.load.extra)
+        spec.load_present = True
 
     # ---------------------------------------------------------------- 持久化
 
     def _persist_spec(self, spec: ModelSpec) -> None:
-        """只补写缺失字段，其余键原样保留。
+        """写回首次加载后生效的完整参数，并保留模型节点中的其他键。
 
-        绝不能重建整个模型节点：那会把用户手写的 ``engine``/``quantization`` 等
-        未被本模块识别的键一并删掉。写入走临时文件 + rename，避免半写入。
+        写入走临时文件 + rename，避免半写入。
         """
         models = self._config.setdefault("models", {})
         node = models.get(spec.model_id)
@@ -302,15 +337,20 @@ class ModelsMgr:
         if spec.estimated_vram_mb is not None and node.get("estimated_vram_mb") != spec.estimated_vram_mb:
             node["estimated_vram_mb"] = spec.estimated_vram_mb
             changed = True
-        if not spec.load_present:
-            node["load"] = spec.load.to_dict()
-            spec.load_present = True
+        load_values = spec.load.to_dict()
+        if node.get("load") != load_values:
+            node["load"] = load_values
             changed = True
-        if not spec.generation_present:
-            spec.generation = copy.deepcopy(self.settings.get("generation", {}))
-            node["generation"] = dict(spec.generation)
-            spec.generation_present = True
+        generation_values = self.generation_params(spec.model_id)
+        if node.get("generation") != generation_values:
+            node["generation"] = generation_values
             changed = True
+        spec.generation = generation_values
+        spec.generation_present = True
+        for name, value in (("draft", spec.draft), ("mtp", spec.mtp), ("lora", spec.lora)):
+            if name not in node or node[name] != value:
+                node[name] = value
+                changed = True
         if not changed:
             return
 

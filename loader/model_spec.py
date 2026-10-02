@@ -25,48 +25,63 @@ class ModelLoadConfig:
     ``chat_format: chatml-function-calling``。未配置的模型只支持文本生成。
     """
 
-    dtype: str = "float16"
+    dtype: str | None = None
     context_length: int | None = None
+    gpu_memory_utilization: float | None = None
+    quantization: str | None = None
     # None 表示使用引擎默认；GGUF 默认会尽可能把层放到 GPU。
     gpu_offload_layers: int | None = None
-    batch_size: int = 1
-    flash_attention: bool = True
+    batch_size: int | None = None
+    flash_attention: bool | None = None
+    enable_memory_saver: bool | None = None
+    enable_sleep_mode: bool | None = None
     draft_model: str | None = None
-    speculative_decoding: bool = False
-    tensor_parallel: int = 1
+    speculative_decoding: bool | None = None
+    tensor_parallel: int | None = None
     gpu_split: list[float] | None = None
-    trust_remote_code: bool = True
+    trust_remote_code: bool | None = None
     tool_parser: str | None = None
     chat_format: str | None = None
+    extra: dict[str, Any] = field(default_factory=dict, repr=False)
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any] | None) -> "ModelLoadConfig":
         values = raw if isinstance(raw, dict) else {}
-        allowed = set(cls.__dataclass_fields__)
-        return cls(**{key: value for key, value in values.items() if key in allowed})
+        known = set(cls.__dataclass_fields__) - {"extra"}
+        return cls(**{key: value for key, value in values.items() if key in known},
+                   extra={key: value for key, value in values.items() if key not in known})
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        values = asdict(self)
+        extra = values.pop("extra")
+        values.update(extra)
+        return values
 
     def loader_kwargs(self) -> dict[str, Any]:
-        return {
+        values = {
             "dtype": self.dtype,
             "max_model_len": self.context_length,
             "tensor_parallel_size": self.tensor_parallel,
             "trust_remote_code": self.trust_remote_code,
+            "gpu_memory_utilization": self.gpu_memory_utilization,
+            "quantization": self.quantization,
             "gpu_offload_layers": self.gpu_offload_layers,
             "batch_size": self.batch_size,
             "flash_attention": self.flash_attention,
+            "enable_memory_saver": self.enable_memory_saver,
+            "enable_sleep_mode": self.enable_sleep_mode,
             "draft_model": self.draft_model,
             "speculative_decoding": self.speculative_decoding,
             "gpu_split": self.gpu_split,
             "tool_parser": self.tool_parser,
             "chat_format": self.chat_format,
         }
+        values.update(self.extra)
+        return values
 
 
 # 会影响模型创建、改动后必须重新加载的参数。
-LOAD_KEYS = frozenset(ModelLoadConfig.__dataclass_fields__)
+LOAD_KEYS = frozenset(ModelLoadConfig.__dataclass_fields__) - {"extra"}
 
 # 权重文件后缀；估算值缺失时按文件大小推算显存下界。
 WEIGHT_SUFFIXES = ("*.gguf", "*.safetensors", "*.bin")
@@ -83,7 +98,9 @@ class ModelSpec:
     # 显式指定推理框架(vllm/sglang/llama);只在加载时读取一次,运行期改它不生效。
     # 未配置时按路径后缀推断默认值,见 loader/tool_format.py。
     engine: str | None = None
-    lora: list[dict[str, Any]] = field(default_factory=list)
+    draft: str | None = None
+    mtp: bool = False
+    lora: str | None = None
     load: ModelLoadConfig = field(default_factory=ModelLoadConfig)
     generation: dict[str, Any] = field(default_factory=dict)
     extra: dict[str, Any] = field(default_factory=dict)
@@ -131,7 +148,7 @@ def load_model_specs(config: dict[str, Any]) -> dict[str, ModelSpec]:
     models = config.get("models", {})
     if not isinstance(models, dict):
         raise ValueError("models.json 的 models 必须是对象")
-    known = {"path", "estimated_vram_mb", "engine", "lora", "load", "generation"}
+    known = {"path", "estimated_vram_mb", "engine", "draft", "mtp", "lora", "load", "generation"}
     for model_id, raw in models.items():
         if not isinstance(raw, dict):
             raise ValueError(f"模型 {model_id} 配置必须是对象")
@@ -140,20 +157,31 @@ def load_model_specs(config: dict[str, Any]) -> dict[str, ModelSpec]:
         raw_load = raw.get("load")
         raw_generation = raw.get("generation")
         raw_engine = raw.get("engine")
+        raw_draft = raw.get("draft")
+        raw_mtp = raw.get("mtp", False)
+        raw_lora = raw.get("lora")
+        if raw_draft is not None and not isinstance(raw_draft, str):
+            raise ValueError(f"模型 {model_id} 的 draft 必须是地址字符串或 null")
+        if not isinstance(raw_mtp, bool):
+            raise ValueError(f"模型 {model_id} 的 mtp 必须是布尔值")
+        if raw_lora is not None and not isinstance(raw_lora, str):
+            raise ValueError(f"模型 {model_id} 的 lora 必须是文件路径字符串或 null")
         result[str(model_id)] = ModelSpec(
             model_id=str(model_id),
             path=normalize_model_path(str(raw["path"])),
             source_path=str(raw["path"]),
             estimated_vram_mb=raw.get("estimated_vram_mb"),
             engine=str(raw_engine).strip().lower() if raw_engine else None,
-            lora=list(raw.get("lora", [])),
+            draft=normalize_model_path(raw_draft) if raw_draft else None,
+            mtp=raw_mtp,
+            lora=normalize_model_path(raw_lora) if raw_lora else None,
             load=ModelLoadConfig.from_dict(raw_load),
             generation=dict(raw_generation) if isinstance(raw_generation, dict) else {},
             load_present=isinstance(raw_load, dict),
             generation_present=isinstance(raw_generation, dict),
             load_fields={
                 key for key, value in (raw_load.items() if isinstance(raw_load, dict) else [])
-                if key in LOAD_KEYS and value is not None
+                if value is not None
             },
             # 未识别的键原样保留，持久化时不会被丢弃。
             extra={key: value for key, value in raw.items() if key not in known},

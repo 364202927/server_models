@@ -171,6 +171,13 @@ class llama(baseInference):
         self._chat_format = kwargs.get("chat_format")
         self._tool_parser = kwargs.get("tool_parser")
         llm_kwargs = self._build_llm_kwargs(source, gpu_layers, max_model_len, **kwargs)
+        optional_kwargs = self._accepted_engine_kwargs(
+            Llama, kwargs, {"model_path", "n_gpu_layers", "n_ctx", "n_batch", "verbose",
+                            "gpu_memory_utilization", "gpu_offload_layers", "batch_size",
+                            "flash_attention", "gpu_split", "chat_format", "tool_parser",
+                            "draft_model", "speculative_decoding", "enable_memory_saver",
+                            "enable_sleep_mode"})
+        llm_kwargs.update(optional_kwargs)
         self._saved_llm_kwargs = llm_kwargs
         self._model = Llama(**llm_kwargs)
         self._sleep_capable = True
@@ -194,6 +201,7 @@ class llama(baseInference):
             "trust_remote_code": trust_remote_code,
             "tool_parser": self._tool_parser,
             "chat_format": self._chat_format,
+            **optional_kwargs,
         }
         return self
 
@@ -368,7 +376,7 @@ class llama(baseInference):
         # 卸载它腾不出 MemAvailable，所以不参与 RAM 回收。
         return False
 
-    def unload(self) -> None:
+    def _unload_engine(self) -> None:
         model, self._model = self._model, None
         if model is not None and hasattr(model, "close"):
             model.close()

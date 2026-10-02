@@ -38,22 +38,32 @@ class vllm(baseInference):
             "trust_remote_code": trust_remote_code,
             "tensor_parallel_size": tensor_parallel_size,
             "dtype": dtype,
-            "gpu_memory_utilization": kwargs.get("gpu_memory_utilization", 0.9),
-            "enable_sleep_mode": True,
+            "gpu_memory_utilization": (kwargs.get("gpu_memory_utilization")
+                                       if kwargs.get("gpu_memory_utilization") is not None else 0.9),
         }
         if quantization:
             llm_kwargs["quantization"] = quantization
         if max_model_len:
             llm_kwargs["max_model_len"] = max_model_len
 
-        try:
-            self._model = LLM(**llm_kwargs)
-            self._sleep_capable = True
-        except (TypeError, ValueError) as exc:
-            # 平台不支持 sleep mode(非 CUDA/ROCm 会抛 ValueError)或旧版本不认这个参数
-            # (TypeError)：去掉开关重建，本实例退化为不可休眠。
-            log_info("vLLM休眠模式不可用，按普通模式加载", type(exc).__name__, exc)
-            llm_kwargs.pop("enable_sleep_mode", None)
+        enable_sleep_mode = kwargs.get("enable_sleep_mode", True)
+        optional_kwargs = self._accepted_engine_kwargs(
+            LLM, kwargs, {"model", "trust_remote_code", "tensor_parallel_size", "dtype",
+                          "max_model_len", "quantization", "gpu_memory_utilization",
+                          "enable_sleep_mode", "enable_memory_saver", "tool_parser"})
+        llm_kwargs.update(optional_kwargs)
+        if enable_sleep_mode:
+            llm_kwargs["enable_sleep_mode"] = True
+            try:
+                self._model = LLM(**llm_kwargs)
+                self._sleep_capable = True
+            except (TypeError, ValueError) as exc:
+                # 平台不支持 sleep mode 或旧版本不认该参数时退回普通加载。
+                log_info("vLLM休眠模式不可用，按普通模式加载", type(exc).__name__, exc)
+                llm_kwargs.pop("enable_sleep_mode", None)
+                self._model = LLM(**llm_kwargs)
+                self._sleep_capable = False
+        else:
             self._model = LLM(**llm_kwargs)
             self._sleep_capable = False
         self._model_info = self._extract_model_info(model_path, quantization=quantization, dtype=dtype)
@@ -70,8 +80,11 @@ class vllm(baseInference):
             "context_length": self._model_info.context_length if self._model_info else max_model_len,
             "tensor_parallel": tensor_parallel_size,
             "gpu_memory_utilization": llm_kwargs["gpu_memory_utilization"],
+            "quantization": quantization,
+            "enable_sleep_mode": self._sleep_capable,
             "trust_remote_code": trust_remote_code,
             "tool_parser": self._tool_parser,
+            **optional_kwargs,
         }
         return self
 
@@ -156,7 +169,7 @@ class vllm(baseInference):
         gc.collect()
         return self.memory_usage()
 
-    def unload(self) -> None:
+    def _unload_engine(self) -> None:
         """卸载模型,释放显存"""
         self._mark_unloaded()
         gc.collect()

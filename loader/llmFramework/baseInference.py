@@ -16,6 +16,7 @@ baseInference.py
 from __future__ import annotations
 
 import gc
+import inspect
 import os
 import time
 from abc import ABC, abstractmethod
@@ -121,6 +122,7 @@ class baseInference(ABC):
         self._tool_parser: str | None = None
         self._sleeping = False
         self._sleep_capable = False
+        self._expand_config: dict[str, Any] = {"draft": None, "mtp": False, "lora": None}
 
     @property
     def model_info(self) -> ModelInfo | None:
@@ -141,9 +143,31 @@ class baseInference(ABC):
              trust_remote_code: bool = True, **kwargs: Any) -> "baseInference":
         """加载模型,返回self支持链式调用"""
 
-    @abstractmethod
     def unload(self) -> None:
-        """卸载模型,释放显存"""
+        """统一清理扩展占位状态并卸载具体推理引擎。"""
+        config = self._expand_config
+
+        def release_draft() -> None:
+            pass
+
+        def release_mtp() -> None:
+            pass
+
+        def release_lora() -> None:
+            pass
+
+        if config["draft"]:
+            release_draft()
+        if config["mtp"]:
+            release_mtp()
+        if config["lora"]:
+            release_lora()
+        self._expand_config = {"draft": None, "mtp": False, "lora": None}
+        self._unload_engine()
+
+    @abstractmethod
+    def _unload_engine(self) -> None:
+        """由子类释放引擎资源并调用 ``_mark_unloaded``。"""
 
     # ---------------------------------------------------------------- 休眠:模板方法
     #
@@ -207,8 +231,20 @@ class baseInference(ABC):
         """把权重搬回显存；支持休眠的子类必须实现。"""
         raise NotImplementedError(f"{type(self).__name__} 未实现 _engine_wake")
 
+    @staticmethod
+    def _accepted_engine_kwargs(engine: Any, values: dict[str, Any],
+                               excluded: set[str] | None = None) -> dict[str, Any]:
+        """只取引擎构造器明确声明的可选参数，丢弃未知键。"""
+        try:
+            parameters = inspect.signature(engine).parameters
+        except (TypeError, ValueError):
+            return {}
+        ignored = excluded or set()
+        return {key: value for key, value in values.items()
+                if key in parameters and key not in ignored}
+
     def _mark_unloaded(self) -> None:
-        """清空跨引擎共有的加载态；子类 unload() 做完引擎侧清理后调用。"""
+        """清空跨引擎共有的加载态；子类引擎卸载完成后调用。"""
         self._model = None
         self._tokenizer = None
         self._model_info = None
@@ -225,13 +261,26 @@ class baseInference(ABC):
     def supports_kv_cache_persistence(self) -> bool:
         return False
 
-    def load_lora(self, paths: list[str]) -> None:
-        """加载适配器;具体引擎不支持时显式报告,避免静默误用。"""
-        raise NotImplementedError("当前推理框架不支持 LoRA")
+    def _expand(self, draft: str | None = None, mtp: bool = False,
+                lora: str | None = None) -> None:
+        """登记扩展配置；具体扩展暂不实现。"""
+        self._expand_config = {"draft": draft, "mtp": mtp, "lora": lora}
 
-    def unload_lora(self) -> None:
-        """卸载已加载的适配器。"""
-        return None
+        def expand_draft() -> None:
+            pass
+
+        def expand_mtp() -> None:
+            pass
+
+        def expand_lora() -> None:
+            pass
+
+        if draft:
+            expand_draft()
+        if mtp:
+            expand_mtp()
+        if lora:
+            expand_lora()
 
     def memory_usage(self, verbose: bool = False) -> MemoryUsage:
         """

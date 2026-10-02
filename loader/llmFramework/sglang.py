@@ -25,7 +25,7 @@ class sglang(baseInference):
 
     # sglang 的采样参数用 max_new_tokens,不是 vllm 的 max_tokens。
     _SAMPLING_KEY_MAP = {"max_tokens": "max_new_tokens", "repetition_penalty": "repetition_penalty"}
-    _EXTRA_SAMPLING_KEYS = ("min_p", "frequency_penalty", "presence_penalty")
+    _EXTRA_SAMPLING_KEYS = ("min_p", "frequency_penalty", "presence_penalty", "regex", "json_schema")
 
     def load(self, model_path: str, *, quantization: str | None = None, dtype: str = "float16",
              max_model_len: int | None = None, tensor_parallel_size: int = 1,
@@ -38,22 +38,30 @@ class sglang(baseInference):
             "trust_remote_code": trust_remote_code,
             "tp_size": tensor_parallel_size,
             "dtype": dtype,
-            "mem_fraction_static": kwargs.get("gpu_memory_utilization", 0.9),
-            "enable_memory_saver": True,
+            "mem_fraction_static": (kwargs.get("gpu_memory_utilization")
+                                    if kwargs.get("gpu_memory_utilization") is not None else 0.9),
         }
         if quantization:
             engine_kwargs["quantization"] = quantization
         if max_model_len:
             engine_kwargs["context_length"] = max_model_len
 
+        enable_memory_saver = kwargs.get("enable_memory_saver", True)
+        optional_kwargs = self._accepted_engine_kwargs(
+            sgl.Engine, kwargs, {"model_path", "model", "trust_remote_code", "tp_size", "dtype",
+                                 "context_length", "quantization", "mem_fraction_static",
+                                 "gpu_memory_utilization", "enable_memory_saver", "enable_sleep_mode",
+                                 "tool_parser"})
+        engine_kwargs.update(optional_kwargs)
+        if enable_memory_saver:
+            engine_kwargs["enable_memory_saver"] = True
         try:
             self._model = sgl.Engine(**engine_kwargs)
-            self._sleep_capable = True
+            self._sleep_capable = bool(enable_memory_saver)
         except TypeError as exc:
-            # 旧版本 sglang 不认 enable_memory_saver 关键字：去掉开关重建。
-            # 注意这里只处理构造失败；真正的危险在"不传但仍成功构造"——那样
-            # release_memory_occupation() 会静默零释放，所以构造成功时必须
-            # 把 _sleep_capable 设为 True，不能再用 hasattr 探测糊弄过去。
+            if not enable_memory_saver:
+                raise
+            # 旧版本 SGLang 不认显存让渡参数时退回普通加载。
             log_info("SGLang显存让渡不可用，按普通模式加载", type(exc).__name__, exc)
             engine_kwargs.pop("enable_memory_saver", None)
             self._model = sgl.Engine(**engine_kwargs)
@@ -69,8 +77,11 @@ class sglang(baseInference):
             "context_length": self._model_info.context_length,
             "tensor_parallel": tensor_parallel_size,
             "gpu_memory_utilization": engine_kwargs["mem_fraction_static"],
+            "quantization": quantization,
+            "enable_memory_saver": self._sleep_capable,
             "trust_remote_code": trust_remote_code,
             "tool_parser": self._tool_parser,
+            **optional_kwargs,
         }
         return self
 
@@ -97,7 +108,7 @@ class sglang(baseInference):
         gc.collect()
         return self.memory_usage()
 
-    def unload(self) -> None:
+    def _unload_engine(self) -> None:
         """卸载模型,释放显存"""
         if self._model is not None:
             try:
