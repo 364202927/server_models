@@ -70,6 +70,11 @@ def _repair_think_open(text: str) -> str:
 class llama(baseInference):
     """使用 llama-cpp-python 加载单文件或目录中的 GGUF 模型。"""
 
+    def __init__(self) -> None:
+        super().__init__()
+        # 唤醒时重建 Llama 对象要用的原始构造参数；unload()/_mark_unloaded() 之外单独清空。
+        self._saved_llm_kwargs: dict[str, Any] | None = None
+
     _SAMPLING_KEY_MAP = {"repetition_penalty": "repeat_penalty", "mirostat": "mirostat_mode"}
     _EXTRA_SAMPLING_KEYS = ("min_p", "seed", "mirostat", "mirostat_eta", "mirostat_tau",
                             "repeat_last_n", "tfs_z", "logit_bias", "frequency_penalty",
@@ -166,7 +171,9 @@ class llama(baseInference):
         self._chat_format = kwargs.get("chat_format")
         self._tool_parser = kwargs.get("tool_parser")
         llm_kwargs = self._build_llm_kwargs(source, gpu_layers, max_model_len, **kwargs)
+        self._saved_llm_kwargs = llm_kwargs
         self._model = Llama(**llm_kwargs)
+        self._sleep_capable = True
         self._model_info = self._extract_model_info(str(source), dtype=dtype)
 
         self._apply_metadata(source, max_model_len)
@@ -343,13 +350,28 @@ class llama(baseInference):
             usage.details["gpu_memory_source"] = "models_mgr(delta)"
         return usage
 
-    def sleep_to_ram(self) -> bool:
-        # llama.cpp 的上下文和 mmap 状态不能可靠地迁移到 CPU 后再恢复，交由管理器卸载。
+    def _engine_sleep(self) -> None:
+        """销毁 Llama 实例放掉显存；GGUF 文件仍在 OS 页缓存里，唤醒时重建会命中缓存。
+
+        llama.cpp 没有"显存->内存"的权重迁移 API，这是能做到的最接近的形状。
+        close() 走 llama-cpp-python 的 ExitStack 清理，比只丢引用更可靠地释放显存。
+        """
+        model, self._model = self._model, None
+        if hasattr(model, "close"):
+            model.close()
+
+    def _engine_wake(self) -> None:
+        self._model = Llama(**self._saved_llm_kwargs)
+
+    def sleep_holds_ram(self) -> bool:
+        # 权重待在 OS 页缓存里(算可回收内存)，不占本进程 RSS；
+        # 卸载它腾不出 MemAvailable，所以不参与 RAM 回收。
         return False
 
     def unload(self) -> None:
-        self._model = None
-        self._tokenizer = None
-        self._model_info = None
-        self._effective_load = {}
+        model, self._model = self._model, None
+        if model is not None and hasattr(model, "close"):
+            model.close()
+        self._mark_unloaded()
+        self._saved_llm_kwargs = None
         self.release_cache()

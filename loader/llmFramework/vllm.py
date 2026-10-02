@@ -10,6 +10,7 @@ import gc
 import time
 from typing import Any
 
+from ...utils.common import info as log_info
 from .baseInference import GenerationResult, MemoryUsage, baseInference
 
 # vllm 自带 torch 依赖;在模块级尝试一次导入,缺失时统一置 None,
@@ -38,13 +39,23 @@ class vllm(baseInference):
             "tensor_parallel_size": tensor_parallel_size,
             "dtype": dtype,
             "gpu_memory_utilization": kwargs.get("gpu_memory_utilization", 0.9),
+            "enable_sleep_mode": True,
         }
         if quantization:
             llm_kwargs["quantization"] = quantization
         if max_model_len:
             llm_kwargs["max_model_len"] = max_model_len
 
-        self._model = LLM(**llm_kwargs)
+        try:
+            self._model = LLM(**llm_kwargs)
+            self._sleep_capable = True
+        except (TypeError, ValueError) as exc:
+            # 平台不支持 sleep mode(非 CUDA/ROCm 会抛 ValueError)或旧版本不认这个参数
+            # (TypeError)：去掉开关重建，本实例退化为不可休眠。
+            log_info("vLLM休眠模式不可用，按普通模式加载", type(exc).__name__, exc)
+            llm_kwargs.pop("enable_sleep_mode", None)
+            self._model = LLM(**llm_kwargs)
+            self._sleep_capable = False
         self._model_info = self._extract_model_info(model_path, quantization=quantization, dtype=dtype)
         self._tool_parser = kwargs.get("tool_parser")
 
@@ -72,6 +83,14 @@ class vllm(baseInference):
 
     def _get_tokenizer(self) -> Any:
         return self._model.get_tokenizer()
+
+    def _engine_sleep(self) -> None:
+        # level=1：权重 offload 到 CPU 内存、丢弃 KV cache。
+        # level=2 会连权重一起丢，唤醒后还得重新载权重，不符合"休眠到 RAM"的语义。
+        self._model.sleep(level=1)
+
+    def _engine_wake(self) -> None:
+        self._model.wake_up()
 
     def _run_engine(self, rendered_prompt: str, sampling: dict[str, Any]) -> tuple[str, int, int]:
         sampling_params = SamplingParams(**sampling)
@@ -139,9 +158,7 @@ class vllm(baseInference):
 
     def unload(self) -> None:
         """卸载模型,释放显存"""
-        self._model = None
-        self._model_info = None
-        self._effective_load = {}
+        self._mark_unloaded()
         gc.collect()
         if torch is not None and torch.cuda.is_available():
             torch.cuda.empty_cache()

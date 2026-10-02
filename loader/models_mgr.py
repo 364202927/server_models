@@ -61,13 +61,14 @@ class ModelsMgr:
         self.runtime: dict[str, RuntimeModel] = {}
         self.asset_root = str(self.config_path.parent)
         self._lock = threading.RLock()
+        # 休眠/准入阈值不放配置文件：误调会直接导致 OOM 或永不回收。
+        self.ram_reserve_mb = 8192
+        self.gpu_reserve_mb = 512
+        # 空闲休眠秒数；<= 0 表示常驻不自动休眠，配置缺省时用 600。
+        server = self.settings.get("server", {})
+        self.sleep_time = int(server.get("sleepTime", 600)) if isinstance(server, dict) else 600
 
     # ---------------------------------------------------------------- 配置读取
-
-    @property
-    def sleep_settings(self) -> dict[str, Any]:
-        value = self.settings.get("sleep", {})
-        return value if isinstance(value, dict) else {}
 
     @property
     def cache_settings(self) -> dict[str, Any]:
@@ -115,8 +116,7 @@ class ModelsMgr:
         # 无 CUDA/NVIDIA 环境时允许后端自行决定 CPU 加载，不能因显存估算阻断调试运行。
         if not detect_gpu():
             return True
-        reserve = int(self.sleep_settings.get("gpu_reserve_mb", 512))
-        return check_gpu_memory(required, reserve).allowed
+        return check_gpu_memory(required, self.gpu_reserve_mb).allowed
 
     def _admit(self, spec: ModelSpec) -> None:
         """显存准入：不够先按 LRU 释放空闲模型，仍不够则明确报错而不是等 OOM。"""
@@ -147,18 +147,34 @@ class ModelsMgr:
             if self._free_for(self.specs[exclude]):
                 return
 
-    def _release(self, runtime: RuntimeModel) -> None:
-        """单个模型的释放：优先休眠到 RAM，RAM 不足或引擎不支持时卸载。
+    def _reclaim_ram(self, exclude: str, required_mb: int) -> bool:
+        """RAM 不足时按最久未用顺序卸载已休眠的模型，腾内存给新的休眠请求。
 
-        GGUF 的 ``sleep_to_ram`` 恒为 False（llama.cpp 的 CUDA 上下文无法迁移后恢复），
-        因此走卸载分支；其权重文件仍在 OS 文件缓存中，重载接近 RAM 休眠的效果。
+        只挑 ``sleep_holds_ram()`` 为真的引擎：GGUF 的"休眠"靠 OS 页缓存，那部分算可回收内存，
+        卸载它并不会让 MemAvailable 变多，只会白丢热状态。
         """
-        sleep_cfg = self.sleep_settings
+        candidates = [item for model_id, item in self.runtime.items()
+                      if model_id != exclude and item.loader and not item.active
+                      and item.state == "SLEEPING_RAM" and item.loader.sleep_holds_ram()]
+        candidates.sort(key=lambda item: item.last_used_at)
+        log_info("RAM不足，开始回收休眠模型", "exclude=", exclude,
+                 "candidates=", [item.spec.model_id for item in candidates])
+        for item in candidates:
+            self._unload_runtime(item.spec.model_id)
+            if check_ram(required_mb, self.ram_reserve_mb).allowed:
+                return True
+        return check_ram(required_mb, self.ram_reserve_mb).allowed
+
+    def _release(self, runtime: RuntimeModel) -> None:
+        """单个模型的释放：优先休眠到 RAM。
+
+        RAM 不足时先按 LRU 卸载已休眠的旧模型腾地方，仍不够或引擎不支持休眠才真正卸载当前模型。
+        """
         model_id = runtime.spec.model_id
-        ram_ok = bool(sleep_cfg.get("ram_enabled", True)) and check_ram(
-            int(self._required_mb(runtime.spec) or 0),
-            int(sleep_cfg.get("ram_reserve_mb", 8192)),
-        ).allowed
+        required_mb = int(self._required_mb(runtime.spec) or 0)
+        ram_ok = check_ram(required_mb, self.ram_reserve_mb).allowed
+        if not ram_ok:
+            ram_ok = self._reclaim_ram(model_id, required_mb)
         if ram_ok and runtime.loader is not None and runtime.loader.sleep_to_ram():
             runtime.state, runtime.sleep_location = "SLEEPING_RAM", "ram"
             self._save_snapshot(runtime)
@@ -446,11 +462,8 @@ class ModelsMgr:
             return True
 
     def reap_idle(self) -> list[str]:
-        sleep_cfg = self.sleep_settings
-        if not sleep_cfg.get("enabled", True):
-            return []
-        timeout = int(sleep_cfg.get("idle_timeout_sec", 0))
-        if timeout <= 0:
+        timeout = self.sleep_time
+        if timeout <= 0:            # 常驻，不自动休眠
             return []
         now = time.time()
         changed: list[str] = []

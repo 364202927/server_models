@@ -35,6 +35,8 @@ try:
 except ImportError:
     psutil = None
 
+from ...utils.common import info as log_info
+
 
 def detect_model_type(name: str) -> str:
     """从模型名/路径粗略猜测模型系列,仅用于诊断信息展示。"""
@@ -117,6 +119,8 @@ class baseInference(ABC):
         self._model_info: ModelInfo | None = None
         self._effective_load: dict[str, Any] = {}
         self._tool_parser: str | None = None
+        self._sleeping = False
+        self._sleep_capable = False
 
     @property
     def model_info(self) -> ModelInfo | None:
@@ -141,13 +145,76 @@ class baseInference(ABC):
     def unload(self) -> None:
         """卸载模型,释放显存"""
 
+    # ---------------------------------------------------------------- 休眠:模板方法
+    #
+    # 默认实现覆盖"校验状态 -> 调一次引擎的休眠/唤醒 API -> 维护休眠标记"这一形状。
+    # 子类只实现 `_engine_sleep`/`_engine_wake`：不做状态判断、不打日志、不捕异常，
+    # 直接抛。异常由基类按调用方约定翻译——ModelsMgr._release 只看 sleep_to_ram() 的
+    # bool 返回且不捕异常，ModelsMgr._resume 却依赖 wake() 抛异常来保留 SLEEPING_RAM
+    # 以便重试，所以这里必须做不对称处理。
+
+    @property
+    def is_sleeping(self) -> bool:
+        return self._sleeping
+
+    def supports_sleep_to_ram(self) -> bool:
+        """引擎是否真能把权重挪出显存；由 load() 按构造实际结果置位。"""
+        return self._sleep_capable
+
+    def sleep_holds_ram(self) -> bool:
+        """休眠期间权重是否真占着本进程的 RAM。
+
+        vLLM/SGLang 把权重搬进 CPU 内存，占真实 RSS，卸载它能腾出 RAM；GGUF 靠 OS 页缓存，
+        卸载它腾不出 MemAvailable。ModelsMgr 的 RAM 回收靠这个区分，避免白丢热状态。
+        """
+        return True
+
     def sleep_to_ram(self) -> bool:
         """将模型权重移出 GPU 保留在 RAM;引擎不支持时返回 False。"""
-        return False
+        if self._model is None or self._sleeping:
+            return self._sleeping
+        if not self.supports_sleep_to_ram():
+            return False
+        start = time.perf_counter()
+        try:
+            self._engine_sleep()
+        except Exception as exc:
+            log_info("引擎休眠失败", type(self).__name__, type(exc).__name__, exc)
+            return False
+        self._sleeping = True
+        self.release_cache()
+        log_info("引擎已休眠", type(self).__name__, "耗时秒=", round(time.perf_counter() - start, 2))
+        return True
 
     def wake(self) -> None:
         """唤醒 RAM 中的模型;不支持休眠的引擎无需实现。"""
-        return None
+        if not self._sleeping:
+            return
+        start = time.perf_counter()
+        try:
+            self._engine_wake()
+        except Exception as exc:
+            log_info("引擎唤醒失败", type(self).__name__, type(exc).__name__, exc)
+            raise
+        self._sleeping = False
+        log_info("引擎已唤醒", type(self).__name__, "耗时秒=", round(time.perf_counter() - start, 2))
+
+    def _engine_sleep(self) -> None:
+        """把权重挪出显存；支持休眠的子类必须实现。"""
+        raise NotImplementedError(f"{type(self).__name__} 未实现 _engine_sleep")
+
+    def _engine_wake(self) -> None:
+        """把权重搬回显存；支持休眠的子类必须实现。"""
+        raise NotImplementedError(f"{type(self).__name__} 未实现 _engine_wake")
+
+    def _mark_unloaded(self) -> None:
+        """清空跨引擎共有的加载态；子类 unload() 做完引擎侧清理后调用。"""
+        self._model = None
+        self._tokenizer = None
+        self._model_info = None
+        self._effective_load = {}
+        self._sleeping = False
+        self._sleep_capable = False
 
     def supports_state_snapshot(self) -> bool:
         return True
