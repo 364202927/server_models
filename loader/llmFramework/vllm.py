@@ -20,6 +20,10 @@ try:
     from vllm import LLM, SamplingParams
 except ImportError:
     torch = LLM = SamplingParams = None
+try:
+    from vllm.lora.request import LoRARequest
+except ImportError:
+    LoRARequest = None
 
 
 class vllm(baseInference):
@@ -33,6 +37,9 @@ class vllm(baseInference):
         if LLM is None:
             raise RuntimeError("vLLM 模型需要安装 vllm")
 
+        draft, mtp, lora = kwargs.pop("draft", None), kwargs.pop("mtp", False), kwargs.pop("lora", None)
+        if draft and mtp:
+            raise ValueError("draft 与 mtp 不能同时启用")
         llm_kwargs: dict[str, Any] = {
             "model": model_path,
             "trust_remote_code": trust_remote_code,
@@ -46,12 +53,45 @@ class vllm(baseInference):
         if max_model_len:
             llm_kwargs["max_model_len"] = max_model_len
 
+        feature_kwargs: dict[str, Any] = {}
+        if draft:
+            feature_kwargs = {
+                "speculative_model": draft,
+                "num_speculative_tokens": (kwargs.get("num_speculative_tokens")
+                                            if kwargs.get("num_speculative_tokens") is not None else 5),
+            }
+            log_info("启用vLLM Draft", draft)
+        elif mtp:
+            feature_kwargs = {
+                "speculative_model": "[INLINE]",
+                "num_speculative_tokens": (kwargs.get("num_speculative_tokens")
+                                            if kwargs.get("num_speculative_tokens") is not None else 1),
+                "speculative_draft_tensor_parallel_size": (
+                    kwargs.get("speculative_draft_tensor_parallel_size")
+                    if kwargs.get("speculative_draft_tensor_parallel_size") is not None else 1),
+            }
+            log_info("启用vLLM MTP")
+        if lora:
+            feature_kwargs.update({
+                "enable_lora": True,
+                "max_loras": kwargs.get("max_loras") if kwargs.get("max_loras") is not None else 1,
+                "max_lora_rank": (kwargs.get("max_lora_rank")
+                                  if kwargs.get("max_lora_rank") is not None else 16),
+            })
+            if LoRARequest is None:
+                raise RuntimeError("当前 vLLM 未提供 LoRARequest")
+            self._lora_request = LoRARequest("configured-lora", 1, lora)
+            log_info("启用vLLM LoRA", lora)
+        else:
+            self._lora_request = None
         enable_sleep_mode = kwargs.get("enable_sleep_mode", True)
         optional_kwargs = self._accepted_engine_kwargs(
             LLM, kwargs, {"model", "trust_remote_code", "tensor_parallel_size", "dtype",
                           "max_model_len", "quantization", "gpu_memory_utilization",
                           "enable_sleep_mode", "enable_memory_saver", "tool_parser"})
         llm_kwargs.update(optional_kwargs)
+        # 顶层 draft/mtp/lora 是功能开关，派生出的构造参数优先于同名可选字段。
+        llm_kwargs.update(feature_kwargs)
         if enable_sleep_mode:
             llm_kwargs["enable_sleep_mode"] = True
             try:
@@ -75,7 +115,8 @@ class vllm(baseInference):
         except Exception:
             pass
 
-        self._effective_load = {
+        effective_load = dict(optional_kwargs)
+        effective_load.update({
             "engine": "vllm", "dtype": dtype,
             "context_length": self._model_info.context_length if self._model_info else max_model_len,
             "tensor_parallel": tensor_parallel_size,
@@ -84,8 +125,9 @@ class vllm(baseInference):
             "enable_sleep_mode": self._sleep_capable,
             "trust_remote_code": trust_remote_code,
             "tool_parser": self._tool_parser,
-            **optional_kwargs,
-        }
+        })
+        effective_load.update(feature_kwargs)
+        self._effective_load = effective_load
         return self
 
     def _apply_context_length(self) -> None:
@@ -107,7 +149,9 @@ class vllm(baseInference):
 
     def _run_engine(self, rendered_prompt: str, sampling: dict[str, Any]) -> tuple[str, int, int]:
         sampling_params = SamplingParams(**sampling)
-        outputs = self._model.generate([rendered_prompt], sampling_params)
+        generate_kwargs = ({"lora_request": self._lora_request}
+                           if self._lora_request is not None else {})
+        outputs = self._model.generate([rendered_prompt], sampling_params, **generate_kwargs)
         output = outputs[0]
         return (output.outputs[0].text, len(output.outputs[0].token_ids), len(output.prompt_token_ids))
 
@@ -120,7 +164,9 @@ class vllm(baseInference):
         sampling_params = SamplingParams(max_tokens=max_new_tokens, temperature=max(temperature, 0.01),
                                          top_p=top_p)
         start_time = time.perf_counter()
-        outputs = self._model.generate(prompts, sampling_params)
+        generate_kwargs = ({"lora_request": self._lora_request}
+                           if self._lora_request is not None else {})
+        outputs = self._model.generate(prompts, sampling_params, **generate_kwargs)
         total_time = time.perf_counter() - start_time
 
         # 按比例分配时间到各个输出
@@ -172,6 +218,7 @@ class vllm(baseInference):
     def _unload_engine(self) -> None:
         """卸载模型,释放显存"""
         self._mark_unloaded()
+        self._lora_request = None
         gc.collect()
         if torch is not None and torch.cuda.is_available():
             torch.cuda.empty_cache()

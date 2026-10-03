@@ -21,7 +21,6 @@ LOAD_DEFAULTS: dict[str, Any] = {
     "gpu_offload_layers": -1,
     "batch_size": 1,
     "flash_attention": True,
-    "speculative_decoding": False,
     "tensor_parallel_size": 1,
     "gpu_split": None,
     "trust_remote_code": True,
@@ -242,6 +241,8 @@ class ModelsMgr:
         model_id = spec.model_id
         runtime.state = "LOADING"
         try:
+            if spec.draft and spec.mtp:
+                raise ValueError("draft 与 mtp 不能同时启用")
             log_info("开始加载模型", model_id, "context_length=", spec.load.context_length)
             self._admit(spec)
             # 加载前后的整卡差值才是本模型的占用；torch 的计数器是进程级累计。
@@ -262,8 +263,8 @@ class ModelsMgr:
                 field_name = LOAD_ARG_FIELDS.get(name, name)
                 if field_name in LOAD_KEYS and getattr(spec.load, field_name) is None:
                     setattr(spec.load, field_name, load_kwargs[name])
-            runtime.loader.load(spec.path, **load_kwargs)
-            runtime.loader._expand(spec.draft, spec.mtp, spec.lora)
+            runtime.loader.load(spec.path, draft=spec.draft, mtp=spec.mtp,
+                                lora=spec.lora, **load_kwargs)
             self._measure_vram(runtime, used_before)
             self._apply_effective_load(runtime)
             self._persist_spec(spec)
@@ -314,9 +315,13 @@ class ModelsMgr:
         for name, value in effective.items():
             if name in LOAD_KEYS:
                 setattr(spec.load, name, value)
-        accepted_extra = set(effective) - LOAD_KEYS - {"engine"}
+        accepted_extra = set(effective) - LOAD_KEYS - {
+            "engine", "draft", "mtp", "lora", "speculative_model",
+            "speculative_draft_model_path", "lora_paths", "enable_lora",
+        }
         spec.load.extra = {key: value for key, value in spec.load.extra.items()
                            if key in accepted_extra}
+        spec.load.extra.update({key: effective[key] for key in accepted_extra})
         spec.load_fields.update(name for name in effective if name in LOAD_KEYS or name in spec.load.extra)
         spec.load_present = True
 

@@ -74,6 +74,8 @@ class llama(baseInference):
         super().__init__()
         # 唤醒时重建 Llama 对象要用的原始构造参数；unload()/_mark_unloaded() 之外单独清空。
         self._saved_llm_kwargs: dict[str, Any] | None = None
+        self._saved_draft_kwargs: dict[str, Any] | None = None
+        self._draft_model = None
 
     _SAMPLING_KEY_MAP = {"repetition_penalty": "repeat_penalty", "mirostat": "mirostat_mode"}
     _EXTRA_SAMPLING_KEYS = ("min_p", "seed", "mirostat", "mirostat_eta", "mirostat_tau",
@@ -170,15 +172,40 @@ class llama(baseInference):
 
         self._chat_format = kwargs.get("chat_format")
         self._tool_parser = kwargs.get("tool_parser")
+        draft, mtp, lora = kwargs.pop("draft", None), kwargs.pop("mtp", False), kwargs.pop("lora", None)
+        if draft and mtp:
+            raise ValueError("draft 与 mtp 不能同时启用")
         llm_kwargs = self._build_llm_kwargs(source, gpu_layers, max_model_len, **kwargs)
         optional_kwargs = self._accepted_engine_kwargs(
             Llama, kwargs, {"model_path", "n_gpu_layers", "n_ctx", "n_batch", "verbose",
                             "gpu_memory_utilization", "gpu_offload_layers", "batch_size",
                             "flash_attention", "gpu_split", "chat_format", "tool_parser",
-                            "draft_model", "speculative_decoding", "enable_memory_saver",
+                            "enable_memory_saver",
                             "enable_sleep_mode"})
         llm_kwargs.update(optional_kwargs)
-        self._saved_llm_kwargs = llm_kwargs
+        if lora:
+            llm_kwargs["lora_path"] = lora
+            llm_kwargs["lora_scale"] = kwargs.get("lora_scale", 1.0)
+            if kwargs.get("lora_base") is not None:
+                llm_kwargs["lora_base"] = kwargs["lora_base"]
+            log_info("启用llama.cpp LoRA", lora)
+        self._saved_draft_kwargs = None
+        if draft:
+            draft_source = self._resolve_gguf_file(draft)
+            draft_layers = kwargs.get("draft_gpu_offload_layers")
+            self._saved_draft_kwargs = {
+                "model_path": str(draft_source),
+                "n_gpu_layers": 0 if draft_layers is None else int(draft_layers),
+            }
+            self._saved_draft_kwargs.update(self._accepted_engine_kwargs(
+                Llama, kwargs, {"model_path", "n_gpu_layers", "draft_gpu_offload_layers"}))
+            self._draft_model = Llama(**self._saved_draft_kwargs)
+            llm_kwargs["draft_model"] = self._draft_model
+            log_info("启用llama.cpp Draft", str(draft_source))
+        elif mtp:
+            log_info("启用llama.cpp MTP；由 GGUF/backend 自动识别")
+        self._saved_llm_kwargs = {key: value for key, value in llm_kwargs.items()
+                                  if key != "draft_model"}
         self._model = Llama(**llm_kwargs)
         self._sleep_capable = True
         self._model_info = self._extract_model_info(str(source), dtype=dtype)
@@ -194,8 +221,13 @@ class llama(baseInference):
             "gpu_offload_layers": llm_kwargs["n_gpu_layers"],
             "batch_size": llm_kwargs["n_batch"],
             "flash_attention": bool(kwargs.get("flash_attention", True)),
-            "draft_model": kwargs.get("draft_model"),
-            "speculative_decoding": bool(kwargs.get("speculative_decoding", False)),
+            "draft": draft,
+            "mtp": bool(mtp),
+            "lora": lora,
+            **({"draft_gpu_offload_layers": self._saved_draft_kwargs["n_gpu_layers"]}
+               if self._saved_draft_kwargs else {}),
+            **({"lora_scale": llm_kwargs["lora_scale"]} if lora else {}),
+            **({"lora_base": llm_kwargs["lora_base"]} if lora and "lora_base" in llm_kwargs else {}),
             "tensor_parallel": tensor_parallel_size,
             "gpu_split": kwargs.get("gpu_split"),
             "trust_remote_code": trust_remote_code,
@@ -367,9 +399,18 @@ class llama(baseInference):
         model, self._model = self._model, None
         if hasattr(model, "close"):
             model.close()
+        draft, self._draft_model = self._draft_model, None
+        if draft is not None and hasattr(draft, "close"):
+            draft.close()
 
     def _engine_wake(self) -> None:
-        self._model = Llama(**self._saved_llm_kwargs)
+        if self._saved_draft_kwargs:
+            self._draft_model = Llama(**self._saved_draft_kwargs)
+        if self._saved_llm_kwargs is not None:
+            llm_kwargs = dict(self._saved_llm_kwargs)
+            if self._draft_model is not None:
+                llm_kwargs["draft_model"] = self._draft_model
+            self._model = Llama(**llm_kwargs)
 
     def sleep_holds_ram(self) -> bool:
         # 权重待在 OS 页缓存里(算可回收内存)，不占本进程 RSS；
@@ -380,6 +421,10 @@ class llama(baseInference):
         model, self._model = self._model, None
         if model is not None and hasattr(model, "close"):
             model.close()
+        draft, self._draft_model = self._draft_model, None
+        if draft is not None and hasattr(draft, "close"):
+            draft.close()
         self._mark_unloaded()
         self._saved_llm_kwargs = None
+        self._saved_draft_kwargs = None
         self.release_cache()

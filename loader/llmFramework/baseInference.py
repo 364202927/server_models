@@ -122,7 +122,6 @@ class baseInference(ABC):
         self._tool_parser: str | None = None
         self._sleeping = False
         self._sleep_capable = False
-        self._expand_config: dict[str, Any] = {"draft": None, "mtp": False, "lora": None}
 
     @property
     def model_info(self) -> ModelInfo | None:
@@ -144,25 +143,7 @@ class baseInference(ABC):
         """加载模型,返回self支持链式调用"""
 
     def unload(self) -> None:
-        """统一清理扩展占位状态并卸载具体推理引擎。"""
-        config = self._expand_config
-
-        def release_draft() -> None:
-            pass
-
-        def release_mtp() -> None:
-            pass
-
-        def release_lora() -> None:
-            pass
-
-        if config["draft"]:
-            release_draft()
-        if config["mtp"]:
-            release_mtp()
-        if config["lora"]:
-            release_lora()
-        self._expand_config = {"draft": None, "mtp": False, "lora": None}
+        """卸载具体推理引擎。"""
         self._unload_engine()
 
     @abstractmethod
@@ -260,27 +241,6 @@ class baseInference(ABC):
 
     def supports_kv_cache_persistence(self) -> bool:
         return False
-
-    def _expand(self, draft: str | None = None, mtp: bool = False,
-                lora: str | None = None) -> None:
-        """登记扩展配置；具体扩展暂不实现。"""
-        self._expand_config = {"draft": draft, "mtp": mtp, "lora": lora}
-
-        def expand_draft() -> None:
-            pass
-
-        def expand_mtp() -> None:
-            pass
-
-        def expand_lora() -> None:
-            pass
-
-        if draft:
-            expand_draft()
-        if mtp:
-            expand_mtp()
-        if lora:
-            expand_lora()
 
     def memory_usage(self, verbose: bool = False) -> MemoryUsage:
         """

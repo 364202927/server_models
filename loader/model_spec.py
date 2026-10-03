@@ -35,8 +35,6 @@ class ModelLoadConfig:
     flash_attention: bool | None = None
     enable_memory_saver: bool | None = None
     enable_sleep_mode: bool | None = None
-    draft_model: str | None = None
-    speculative_decoding: bool | None = None
     tensor_parallel: int | None = None
     gpu_split: list[float] | None = None
     trust_remote_code: bool | None = None
@@ -49,11 +47,14 @@ class ModelLoadConfig:
         values = raw if isinstance(raw, dict) else {}
         known = set(cls.__dataclass_fields__) - {"extra"}
         return cls(**{key: value for key, value in values.items() if key in known},
-                   extra={key: value for key, value in values.items() if key not in known})
+                   extra={key: value for key, value in values.items()
+                          if key not in known and key not in {"draft_model", "speculative_decoding"}})
 
     def to_dict(self) -> dict[str, Any]:
         values = asdict(self)
         extra = values.pop("extra")
+        extra.pop("draft_model", None)
+        extra.pop("speculative_decoding", None)
         values.update(extra)
         return values
 
@@ -70,13 +71,12 @@ class ModelLoadConfig:
             "flash_attention": self.flash_attention,
             "enable_memory_saver": self.enable_memory_saver,
             "enable_sleep_mode": self.enable_sleep_mode,
-            "draft_model": self.draft_model,
-            "speculative_decoding": self.speculative_decoding,
             "gpu_split": self.gpu_split,
             "tool_parser": self.tool_parser,
             "chat_format": self.chat_format,
         }
-        values.update(self.extra)
+        values.update({key: value for key, value in self.extra.items()
+                       if key not in {"draft_model", "speculative_decoding"}})
         return values
 
 

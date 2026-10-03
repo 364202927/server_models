@@ -33,6 +33,9 @@ class sglang(baseInference):
         if sgl is None:
             raise RuntimeError("SGLang 模型需要安装 sglang")
 
+        draft, mtp, lora = kwargs.pop("draft", None), kwargs.pop("mtp", False), kwargs.pop("lora", None)
+        if draft and mtp:
+            raise ValueError("draft 与 mtp 不能同时启用")
         engine_kwargs: dict[str, Any] = {
             "model_path": model_path,
             "trust_remote_code": trust_remote_code,
@@ -46,6 +49,27 @@ class sglang(baseInference):
         if max_model_len:
             engine_kwargs["context_length"] = max_model_len
 
+        feature_kwargs: dict[str, Any] = {}
+        if draft:
+            feature_kwargs = {
+                "speculative_algorithm": kwargs.get("speculative_algorithm") or "EAGLE",
+                "speculative_draft_model_path": draft,
+                "speculative_num_steps": (kwargs.get("speculative_num_steps")
+                                           if kwargs.get("speculative_num_steps") is not None else 5),
+            }
+            log_info("启用SGLang Draft", draft)
+        elif mtp:
+            feature_kwargs = {
+                "speculative_algorithm": kwargs.get("speculative_algorithm") or "EAGLE",
+                "speculative_num_steps": (kwargs.get("speculative_num_steps")
+                                           if kwargs.get("speculative_num_steps") is not None else 1),
+            }
+            log_info("启用SGLang MTP")
+        if lora:
+            feature_kwargs["lora_paths"] = [lora]
+            if kwargs.get("max_loras_per_batch") is not None:
+                feature_kwargs["max_loras_per_batch"] = kwargs["max_loras_per_batch"]
+            log_info("启用SGLang LoRA", lora)
         enable_memory_saver = kwargs.get("enable_memory_saver", True)
         optional_kwargs = self._accepted_engine_kwargs(
             sgl.Engine, kwargs, {"model_path", "model", "trust_remote_code", "tp_size", "dtype",
@@ -53,6 +77,8 @@ class sglang(baseInference):
                                  "gpu_memory_utilization", "enable_memory_saver", "enable_sleep_mode",
                                  "tool_parser"})
         engine_kwargs.update(optional_kwargs)
+        # 顶层 draft/mtp/lora 是功能开关，派生出的构造参数优先于同名可选字段。
+        engine_kwargs.update(feature_kwargs)
         if enable_memory_saver:
             engine_kwargs["enable_memory_saver"] = True
         try:
@@ -72,7 +98,8 @@ class sglang(baseInference):
         if max_model_len:
             self._model_info.context_length = max_model_len
 
-        self._effective_load = {
+        effective_load = dict(optional_kwargs)
+        effective_load.update({
             "engine": "sglang", "dtype": dtype,
             "context_length": self._model_info.context_length,
             "tensor_parallel": tensor_parallel_size,
@@ -81,8 +108,9 @@ class sglang(baseInference):
             "enable_memory_saver": self._sleep_capable,
             "trust_remote_code": trust_remote_code,
             "tool_parser": self._tool_parser,
-            **optional_kwargs,
-        }
+        })
+        effective_load.update(feature_kwargs)
+        self._effective_load = effective_load
         return self
 
     def _get_tokenizer(self) -> Any:

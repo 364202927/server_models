@@ -31,8 +31,6 @@
         "gpu_offload_layers": -1,
         "batch_size": 1,
         "flash_attention": true,
-        "draft_model": null,
-        "speculative_decoding": false,
         "tensor_parallel": 1,
         "gpu_split": null,
         "trust_remote_code": true,
