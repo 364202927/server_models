@@ -199,9 +199,9 @@ class ModelsMgr:
         if ram_ok and runtime.loader is not None and runtime.loader.sleep_to_ram():
             runtime.state, runtime.sleep_location = "SLEEPING_RAM", "ram"
             self._save_snapshot(runtime)
-            log_info("模型休眠到RAM", model_id)
+            log_info("模型休眠到RAM:", model_id)
             return
-        log_info("模型卸载", model_id, "ram_ok=", ram_ok)
+        log_info("模型卸载:", model_id, " ram_ok=", ram_ok)
         self._unload_runtime(model_id)
 
     # ---------------------------------------------------------------- 加载与唤醒
@@ -339,23 +339,28 @@ class ModelsMgr:
             models[spec.model_id] = node
 
         changed = False
+        #写入estimated_vram_mb
         if spec.estimated_vram_mb is not None and node.get("estimated_vram_mb") != spec.estimated_vram_mb:
             node["estimated_vram_mb"] = spec.estimated_vram_mb
             changed = True
+        #写入draft/mtp/lora
+        for name, value in (("draft", spec.draft), ("mtp", spec.mtp), ("lora", spec.lora)):
+            if name not in node or node[name] != value:
+                node[name] = value
+                changed = True
+        #load字段
         load_values = spec.load.to_dict()
         if node.get("load") != load_values:
             node["load"] = load_values
             changed = True
+        #generation字段
         generation_values = self.generation_params(spec.model_id)
         if node.get("generation") != generation_values:
             node["generation"] = generation_values
             changed = True
         spec.generation = generation_values
         spec.generation_present = True
-        for name, value in (("draft", spec.draft), ("mtp", spec.mtp), ("lora", spec.lora)):
-            if name not in node or node[name] != value:
-                node[name] = value
-                changed = True
+        
         if not changed:
             return
 

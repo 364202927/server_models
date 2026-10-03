@@ -19,11 +19,7 @@ CACHE_DEFAULTS: dict[str, Any] = {
 
 @dataclass
 class ModelLoadConfig:
-    """模型第一次加载时使用的参数。
-
-    HF 工具调用显式配置 ``tool_parser: hermes_json``；GGUF 配置
-    ``chat_format: chatml-function-calling``。未配置的模型只支持文本生成。
-    """
+    """模型第一次加载时使用的参数。"""
 
     dtype: str | None = None
     context_length: int | None = None
@@ -38,8 +34,6 @@ class ModelLoadConfig:
     tensor_parallel: int | None = None
     gpu_split: list[float] | None = None
     trust_remote_code: bool | None = None
-    tool_parser: str | None = None
-    chat_format: str | None = None
     extra: dict[str, Any] = field(default_factory=dict, repr=False)
 
     @classmethod
@@ -72,8 +66,6 @@ class ModelLoadConfig:
             "enable_memory_saver": self.enable_memory_saver,
             "enable_sleep_mode": self.enable_sleep_mode,
             "gpu_split": self.gpu_split,
-            "tool_parser": self.tool_parser,
-            "chat_format": self.chat_format,
         }
         values.update({key: value for key, value in self.extra.items()
                        if key not in {"draft_model", "speculative_decoding"}})

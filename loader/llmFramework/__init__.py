@@ -7,11 +7,11 @@
 """
 
 from .baseInference import (
-    GenerationResult, MemoryUsage, ModelInfo, ToolCapabilityError, ToolOutputError,
+    GenerationResult, MemoryUsage, ModelInfo,
     baseInference, detect_model_type,
 )
 
 __all__ = [
     "baseInference", "ModelInfo", "GenerationResult", "MemoryUsage",
-    "ToolCapabilityError", "ToolOutputError", "detect_model_type",
+    "detect_model_type",
 ]

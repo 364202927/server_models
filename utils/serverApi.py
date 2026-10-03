@@ -19,6 +19,7 @@ import json
 import time
 import uuid
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Iterator
 
 from fastapi import Depends, FastAPI, Header, HTTPException
@@ -32,7 +33,7 @@ from ..msgHandler import AdminRequest, ChatRequest, MsgHandler, normalize_genera
 # 会实际影响生成结果的采样/惩罚参数；用于从 extra_body/custom_parameters 中过滤出有效字段。
 # 注意这里同时包含规范名和 OpenAI/Ollama 风格的别名（stop、repeat_penalty）——
 # 别名归一化本身交给 MsgHandler.normalize_generation_params，这里只负责圈定
-# "OpenAIChatRequest 上哪些字段算生成参数"。
+# "openChatReq 上哪些字段算生成参数"。
 _GENERATION_FIELDS = {
     "temperature", "top_p", "top_k", "min_p", "max_tokens", "stop",
     "seed", "logit_bias", "frequency_penalty", "presence_penalty",
@@ -41,7 +42,7 @@ _GENERATION_FIELDS = {
 }
 
 
-class OpenAIChatRequest(BaseModel):
+class openChatReq(BaseModel):
     """OpenAI / Open WebUI 兼容的聊天请求体。
 
     只显式声明会影响生成行为、或被服务实际使用的字段；未识别的字段仍会被接受（见 model_config），
@@ -101,7 +102,7 @@ class OpenAIChatRequest(BaseModel):
     functions: list[dict[str, Any]] | None = None                  # 旧版函数定义；传入即拒绝，提示改用 tools
 
 
-def _to_chat_request(request: OpenAIChatRequest) -> ChatRequest:
+def _to_chat_request(request: openChatReq) -> ChatRequest:
     """把 OpenAI 协议字段翻译为规范化的 ChatRequest；只做字段名翻译，不做校验/生成——
     那些工作交给 MsgHandler.chat()。"""
     if request.max_tokens is not None and request.max_completion_tokens not in (None, request.max_tokens):
@@ -120,7 +121,7 @@ def _to_chat_request(request: OpenAIChatRequest) -> ChatRequest:
         system_prompt=request.system_prompt or "")
 
 
-def _to_admin_request(request: OpenAIChatRequest) -> AdminRequest:
+def _to_admin_request(request: openChatReq) -> AdminRequest:
     """把管理指令请求（message_id 1001~1007）里的 model/args 翻译为规范化的 AdminRequest；
     不再需要 MsgHandler 那边对 args 形状（dict/list/字符串）做猜测。"""
     payload = request.args if isinstance(request.args, dict) else {}
@@ -217,9 +218,38 @@ class serverApi:
             return {"object": "list", "data": [
                 {"id": model_id, "object": "model", "created": now, "owned_by": "local"}
                 for model_id in self.manager.specs]}
+        # Ollama 兼容：Open WebUI 等客户端靠这个接口判断"后端是不是 Ollama"、
+        # 列出模型供选择，字段只给客户端实际会读的最小集合。
+        # @app.get("/api/tags")
+        # async def tags(_: None = Depends(self._require_api_key)) -> dict[str, Any]:
+        #     now = datetime.now(timezone.utc).isoformat()
+        #     return {"models": [
+        #         {
+        #             "name": model_id, "model": model_id,
+        #             "modified_at": now, "size": 0, "digest": "",
+        #             "details": {
+        #                 "format": "gguf", "family": "", "families": None,
+        #                 "parameter_size": "",
+        #                 "quantization_level": spec.load.quantization or "",
+        #             },
+        #         }
+        #         for model_id, spec in self.manager.specs.items()]}
+        # llama.cpp server 兼容：客户端靠 default_generation_settings.n_ctx 显示真实
+        # 上下文窗口，不传 model 时取第一个已注册模型（多模型场景下只能二选一兜底）。
+        @app.get("/v1/props")
+        async def props(model: str | None = None,
+                        _: None = Depends(self._require_api_key)) -> dict[str, Any]:
+            model_id = model or next(iter(self.manager.specs), "")
+            spec = self.manager.specs.get(model_id)
+            n_ctx = (spec.load.context_length if spec else None) or 4096
+            return {
+                "model_path": spec.path if spec else "",
+                "total_slots": 1,
+                "default_generation_settings": {"n_ctx": n_ctx, "model": model_id},
+            }
         # openai支持
         @app.post("/v1/chat/completions", response_model=None)
-        async def chat_completions(request: OpenAIChatRequest,
+        async def chat_completions(request: openChatReq,
                                     _: None = Depends(self._require_api_key)) -> Any:
             if request.function_call is not None or request.functions:
                 raise HTTPException(status_code=400,detail="旧版 functions/function_call 不受支持，请使用 tools/tool_choice")

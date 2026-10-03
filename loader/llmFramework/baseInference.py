@@ -2,7 +2,7 @@
 baseInference.py
 推理框架抽象基类。
 
-统一"模型逻辑"(messages 归一化、工具提示词渲染、采样参数组装、显存/内存
+统一"模型逻辑"(messages 归一化、采样参数组装、显存/内存
 统计、休眠唤醒默认行为),子类(vllm/sglang/llama...)只负责:
 - 创建/持有具体推理引擎实例(``_create_engine`` / ``load``)
 - 单次引擎调用(``_run_engine``,或整体覆盖 ``generate`` —— 引擎形状差异
@@ -73,14 +73,6 @@ class GenerationResult:
     finish_reason: str = "stop"
 
 
-class ToolCapabilityError(ValueError):
-    """The configured model backend cannot honor a tool request."""
-
-
-class ToolOutputError(RuntimeError):
-    """The model produced an invalid tool call."""
-
-
 @dataclass
 class MemoryUsage:
     """模型内存/显存占用信息"""
@@ -111,15 +103,12 @@ class baseInference(ABC):
     _SAMPLING_KEY_MAP: dict[str, str] = {}
     # 除通用五个采样键外,该引擎还认识的可选采样字段(从 kwargs 里按需摘取)。
     _EXTRA_SAMPLING_KEYS: tuple[str, ...] = ()
-    # HF/vLLM 类模型解码后残留的特殊 token,工具输出解析后需要清理。
-    _STRIP_TOKENS: tuple[str, ...] = ()
 
     def __init__(self):
         self._model = None
         self._tokenizer = None
         self._model_info: ModelInfo | None = None
         self._effective_load: dict[str, Any] = {}
-        self._tool_parser: str | None = None
         self._sleeping = False
         self._sleep_capable = False
 
@@ -357,14 +346,7 @@ class baseInference(ABC):
             raise RuntimeError("Model not loaded. Call load() first.")
 
         messages = self._normalize_messages(prompt, system_prompt, kwargs)
-        tools = kwargs.get("tools") or []
-        tool_choice = kwargs.get("tool_choice")
-        tool_mode = bool(tools and tool_choice != "none")
-
-        # 分支键是 tools,不是 messages:没有工具时走普通聊天模板,
-        # 和只有一条 user 消息时的行为完全一致。
-        rendered = (self._build_tool_prompt(messages, tools, tool_choice)
-                   if tool_mode else self._build_chat_prompt(messages))
+        rendered = self._build_chat_prompt(messages)
         sampling = self._build_sampling(max_new_tokens, temperature, top_p, top_k,
                                         repetition_penalty, stop_sequences, kwargs)
 
@@ -372,12 +354,11 @@ class baseInference(ABC):
         text, tokens_generated, prompt_tokens = self._run_engine(rendered, sampling)
         elapsed = time.perf_counter() - start_time
 
-        content, tool_calls = self._parse_tool_output(text) if tool_mode else (text, [])
         return GenerationResult(
-            text=content, tokens_generated=tokens_generated, time_seconds=elapsed,
+            text=text, tokens_generated=tokens_generated, time_seconds=elapsed,
             tokens_per_second=tokens_generated / elapsed if elapsed > 0 else 0,
-            prompt_tokens=prompt_tokens, tool_calls=tool_calls,
-            finish_reason=self._finish_reason(tool_calls, tokens_generated, max_new_tokens),
+            prompt_tokens=prompt_tokens,
+            finish_reason=self._finish_reason(tokens_generated, max_new_tokens),
         )
 
     def _run_engine(self, rendered_prompt: str, sampling: dict[str, Any]) -> tuple[str, int, int]:
@@ -409,46 +390,6 @@ class baseInference(ABC):
         except (AttributeError, ValueError, TypeError):
             return "\n".join(f"{item.get('role', 'user')}: {item.get('content', '')}" for item in messages)
 
-    def _build_tool_prompt(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]],
-                           tool_choice: Any) -> str:
-        """有工具场景:渲染带工具 schema 的 chat template。当前要求 tool_parser=hermes_json。"""
-        import copy
-        import json
-
-        if self._tool_parser != "hermes_json":
-            raise ToolCapabilityError(f"{type(self).__name__} 工具调用需要配置 load.tool_parser=hermes_json")
-        prepared = copy.deepcopy(messages)
-        for message in prepared:
-            for call in message.get("tool_calls", []):
-                arguments = call.get("function", {}).get("arguments")
-                if isinstance(arguments, str):
-                    call["function"]["arguments"] = json.loads(arguments)
-        if tool_choice == "none":
-            tools = []
-        elif tool_choice == "required":
-            prepared.insert(0, {"role": "system", "content": "你必须调用至少一个可用工具。"})
-        elif isinstance(tool_choice, dict):
-            name = tool_choice["function"]["name"]
-            tools = [tool for tool in tools if tool["function"]["name"] == name]
-            prepared.insert(0, {"role": "system", "content": f"你必须调用工具 {name}。"})
-        try:
-            tokenizer = self._get_tokenizer()
-            return tokenizer.apply_chat_template(prepared, tools=tools, tokenize=False,
-                                                 add_generation_prompt=True)
-        except (AttributeError, ValueError, TypeError) as exc:
-            raise ToolCapabilityError(f"当前 {type(self).__name__} tokenizer 缺少可用的工具聊天模板") from exc
-
-    def _parse_tool_output(self, text: str) -> tuple[str, list[dict[str, Any]]]:
-        # 延迟导入避免循环:tool_format 需要从本模块导入 ToolOutputError。
-        from ..tool_format import parse_hermes_tool_calls
-
-        if self._tool_parser != "hermes_json":
-            raise ToolCapabilityError(f"{type(self).__name__} 工具调用需要配置 load.tool_parser=hermes_json")
-        content, calls = parse_hermes_tool_calls(text)
-        for token in self._STRIP_TOKENS:
-            content = content.replace(token, "")
-        return content.strip(), calls
-
     def _build_sampling(self, max_new_tokens: int, temperature: float, top_p: float, top_k: int,
                         repetition_penalty: float, stop_sequences: list[str] | None,
                         extra: dict[str, Any]) -> dict[str, Any]:
@@ -464,8 +405,5 @@ class baseInference(ABC):
         return sampling
 
     @staticmethod
-    def _finish_reason(tool_calls: list[dict[str, Any]], tokens_generated: int,
-                       max_new_tokens: int) -> str:
-        if tool_calls:
-            return "tool_calls"
+    def _finish_reason(tokens_generated: int, max_new_tokens: int) -> str:
         return "length" if tokens_generated >= max_new_tokens else "stop"

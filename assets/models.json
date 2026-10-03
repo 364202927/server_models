@@ -4,7 +4,7 @@
       "host": "0.0.0.0",
       "api_port": 8666,
       "api_key": "",
-      "sleepTime": 600
+      "sleepTime": 60
     },
     "generation": {
       "temperature": 0.3,
@@ -21,31 +21,35 @@
     "qwen3.8-27B": {
       "path": "D:/ai/models/Qwen3.8-27B-Uncensored-GGUF/Qwen3.8-27B-Uncensored-IQ4_XS.gguf",
       "engine": "llama",
+      "estimated_vram_mb": 14890,
       "draft": null,
       "mtp": false,
       "lora": null,
-      "estimated_vram_mb": 15170,
       "load": {
-        "dtype": "float16",
-        "context_length": 15384,
+        "dtype": "bfloat16",
+        "context_length": 32768,
+        "gpu_memory_utilization": null,
+        "quantization": null,
         "gpu_offload_layers": -1,
-        "batch_size": 1,
+        "batch_size": 512,
         "flash_attention": true,
+        "enable_memory_saver": null,
+        "enable_sleep_mode": null,
         "tensor_parallel": 1,
         "gpu_split": null,
-        "trust_remote_code": true,
-        "tool_parser": null,
-        "chat_format": null
+        "trust_remote_code": true
       },
       "generation": {
         "temperature": 0.3,
         "top_p": 0.95,
         "top_k": 50,
         "repetition_penalty": 1.05,
-        "max_tokens": 512,
+        "max_tokens": 8192,
         "stop_sequences": [ ],
         "mirostat": 0,
-        "system_prompt": ""
+        "system_prompt": "",
+        "presence_penalty": 0,
+        "frequency_penalty": 0
       }
     }
   }

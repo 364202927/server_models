@@ -88,7 +88,7 @@ class vllm(baseInference):
         optional_kwargs = self._accepted_engine_kwargs(
             LLM, kwargs, {"model", "trust_remote_code", "tensor_parallel_size", "dtype",
                           "max_model_len", "quantization", "gpu_memory_utilization",
-                          "enable_sleep_mode", "enable_memory_saver", "tool_parser"})
+                          "enable_sleep_mode", "enable_memory_saver"})
         llm_kwargs.update(optional_kwargs)
         # 顶层 draft/mtp/lora 是功能开关，派生出的构造参数优先于同名可选字段。
         llm_kwargs.update(feature_kwargs)
@@ -107,7 +107,6 @@ class vllm(baseInference):
             self._model = LLM(**llm_kwargs)
             self._sleep_capable = False
         self._model_info = self._extract_model_info(model_path, quantization=quantization, dtype=dtype)
-        self._tool_parser = kwargs.get("tool_parser")
 
         # 上下文长度是附加信息,读取失败不应阻断模型加载。
         try:
@@ -124,7 +123,6 @@ class vllm(baseInference):
             "quantization": quantization,
             "enable_sleep_mode": self._sleep_capable,
             "trust_remote_code": trust_remote_code,
-            "tool_parser": self._tool_parser,
         })
         effective_load.update(feature_kwargs)
         self._effective_load = effective_load

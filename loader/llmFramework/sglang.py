@@ -74,8 +74,7 @@ class sglang(baseInference):
         optional_kwargs = self._accepted_engine_kwargs(
             sgl.Engine, kwargs, {"model_path", "model", "trust_remote_code", "tp_size", "dtype",
                                  "context_length", "quantization", "mem_fraction_static",
-                                 "gpu_memory_utilization", "enable_memory_saver", "enable_sleep_mode",
-                                 "tool_parser"})
+                                 "gpu_memory_utilization", "enable_memory_saver", "enable_sleep_mode"})
         engine_kwargs.update(optional_kwargs)
         # 顶层 draft/mtp/lora 是功能开关，派生出的构造参数优先于同名可选字段。
         engine_kwargs.update(feature_kwargs)
@@ -93,7 +92,6 @@ class sglang(baseInference):
             self._model = sgl.Engine(**engine_kwargs)
             self._sleep_capable = False
         self._model_info = self._extract_model_info(model_path, quantization=quantization, dtype=dtype)
-        self._tool_parser = kwargs.get("tool_parser")
 
         if max_model_len:
             self._model_info.context_length = max_model_len
@@ -107,7 +105,6 @@ class sglang(baseInference):
             "quantization": quantization,
             "enable_memory_saver": self._sleep_capable,
             "trust_remote_code": trust_remote_code,
-            "tool_parser": self._tool_parser,
         })
         effective_load.update(feature_kwargs)
         self._effective_load = effective_load

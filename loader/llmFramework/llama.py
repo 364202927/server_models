@@ -12,10 +12,9 @@ import time
 from pathlib import Path
 from typing import Any
 
-from ..tool_format import parse_hermes_tool_calls, render_tool_system_prompt
 from ...hardware import detect_gpu
 from ...utils.common import info as log_info, warn, error
-from .baseInference import GenerationResult, MemoryUsage, ToolCapabilityError, ToolOutputError, baseInference
+from .baseInference import GenerationResult, MemoryUsage, baseInference
 
 try:
     from llama_cpp import Llama
@@ -115,14 +114,13 @@ class llama(baseInference):
             "n_ctx": int(max_model_len) if max_model_len else llama._FALLBACK_N_CTX,
             "n_batch": int(kwargs.get("batch_size", 512)),
             "verbose": bool(kwargs.get("verbose", False)),
+            'use_mlock':True             #内存常驻锁定,休眠时保持在oom(ulimit -l:检查可存放无限页)
         }
         if kwargs.get("flash_attention") is not None:
             llm_kwargs["flash_attn"] = bool(kwargs["flash_attention"])
         if kwargs.get("gpu_split"):
             # tensor_split 用每张卡的相对分配比例；None 表示 llama.cpp 自动分配。
             llm_kwargs["tensor_split"] = kwargs["gpu_split"]
-        if kwargs.get("chat_format"):
-            llm_kwargs["chat_format"] = kwargs["chat_format"]
         return llm_kwargs
 
     def _apply_metadata(self, source: Path, max_model_len: int | None) -> dict[str, Any]:
@@ -170,8 +168,6 @@ class llama(baseInference):
                 "请安装带 CUDA 支持的构建版本。"
             )
 
-        self._chat_format = kwargs.get("chat_format")
-        self._tool_parser = kwargs.get("tool_parser")
         draft, mtp, lora = kwargs.pop("draft", None), kwargs.pop("mtp", False), kwargs.pop("lora", None)
         if draft and mtp:
             raise ValueError("draft 与 mtp 不能同时启用")
@@ -179,7 +175,7 @@ class llama(baseInference):
         optional_kwargs = self._accepted_engine_kwargs(
             Llama, kwargs, {"model_path", "n_gpu_layers", "n_ctx", "n_batch", "verbose",
                             "gpu_memory_utilization", "gpu_offload_layers", "batch_size",
-                            "flash_attention", "gpu_split", "chat_format", "tool_parser",
+                            "flash_attention", "gpu_split",
                             "enable_memory_saver",
                             "enable_sleep_mode"})
         llm_kwargs.update(optional_kwargs)
@@ -231,8 +227,6 @@ class llama(baseInference):
             "tensor_parallel": tensor_parallel_size,
             "gpu_split": kwargs.get("gpu_split"),
             "trust_remote_code": trust_remote_code,
-            "tool_parser": self._tool_parser,
-            "chat_format": self._chat_format,
             **optional_kwargs,
         }
         return self
@@ -254,17 +248,10 @@ class llama(baseInference):
         sampling = self._build_sampling(max_new_tokens, temperature, top_p, top_k, repetition_penalty,
                                         stop_sequences, kwargs)
 
-        # 分支键是 tools，不是 messages：没有工具时走普通聊天，
-        # 和不带工具时的普通对话行为一致，只是现在用的是完整多轮 messages。
-        tools = kwargs.get("tools") or []
-        if not tools:
-            return self._chat(messages, sampling, max_new_tokens)
-        if self._chat_format == "chatml-function-calling":
-            return self._chat_with_backend_tools(messages, tools, kwargs.get("tool_choice"), sampling)
-        # 未配置 chatml-function-calling 不再直接报错：先尝试模型自带模板
-        # 支持的 Hermes 风格 <tool_call> 兜底（如 Qwen3 原生就是这个格式）。
-        return self._chat_with_hermes_tools(messages, tools, kwargs.get("tool_choice"),
-                                            sampling, max_new_tokens)
+        # tools/tool_choice 纯透传：客户端怎么传就怎么交给 create_chat_completion，
+        # 由模型自带 chat_template 自己处理，这里不做任何校验/渲染/解析。
+        return self._chat(messages, sampling, max_new_tokens,
+                          tools=kwargs.get("tools") or None, tool_choice=kwargs.get("tool_choice"))
 
     def _clamp_to_context(self, messages: list[dict[str, Any]], max_new_tokens: int) -> int:
         """按 ``n_ctx`` 与已用 prompt token 数裁剪本次可生成的 token 数；
@@ -280,16 +267,28 @@ class llama(baseInference):
         return min(max_new_tokens, available)
 
     def _chat(self, messages: list[dict[str, Any]], sampling: dict[str, Any],
-             max_new_tokens: int) -> GenerationResult:
-        """无工具场景：用后端聊天接口生成完整多轮对话；模型没有 chat template 时
-        退化为普通补全接口。上下文溢出等请求级错误已经在 generate() 里提前拦截，
-        这里只处理"接口本身不可用"，不再吞掉别的异常。"""
+             max_new_tokens: int, tools: list[dict[str, Any]] | None = None,
+             tool_choice: Any = None) -> GenerationResult:
+        """用后端聊天接口生成完整多轮对话；模型没有 chat template 时退化为普通补全接口。
+
+        tools/tool_choice 有值时原样透传给 create_chat_completion，由模型自带
+        chat_template 自己决定怎么处理，这里不做任何校验/渲染/解析。上下文溢出
+        等请求级错误已经在 generate() 里提前拦截，这里只处理"接口本身不可用"，
+        不再吞掉别的异常。"""
+        extra: dict[str, Any] = {}
+        if tools:
+            extra["tools"] = tools
+        if tool_choice is not None:
+            extra["tool_choice"] = tool_choice
+
         start = time.perf_counter()
         try:
-            result = self._model.create_chat_completion(messages=messages, **sampling)
+            result = self._model.create_chat_completion(messages=messages, **extra, **sampling)
             choice = result["choices"][0]
-            text = str(choice["message"]["content"])
-            finish_reason = str(choice.get("finish_reason") or "stop")
+            message = choice["message"]
+            text = str(message.get("content") or "")
+            calls = message.get("tool_calls") or []
+            finish_reason = str(choice.get("finish_reason") or ("tool_calls" if calls else "stop"))
             usage = result.get("usage", {})
             prompt_tokens = int(usage.get("prompt_tokens", 0))
             tokens = int(usage.get("completion_tokens", 0))
@@ -300,7 +299,8 @@ class llama(baseInference):
             error("GGUF聊天模板渲染失败，回退补全接口", type(exc).__name__, exc,
                 "messages=", [(m.get("role"), "content" in m, bool(m.get("tool_calls")))
                               for m in messages])
-            # 没有 chat template 时只能手工拍平多轮消息。
+            # 没有 chat template 时只能手工拍平多轮消息；tools 信息在这条兜底
+            # 路径上没有承载的地方，直接丢弃，不会产生 tool_calls。
             flat = _flatten_messages(messages)
             result = self._model(flat, **sampling)
             text = str(result["choices"][0].get("text", ""))
@@ -308,71 +308,13 @@ class llama(baseInference):
             finish_reason = str(result["choices"][0].get("finish_reason") or
                                 ("length" if tokens >= max_new_tokens else "stop"))
             prompt_tokens = len(self._model.tokenize(flat.encode("utf-8")))
+            calls = []
         elapsed = time.perf_counter() - start
         if finish_reason == "length":
             warn("生成被截断", "tokens=", tokens, "max_new_tokens=", max_new_tokens)
         return GenerationResult(_repair_think_open(text), tokens, elapsed,
                                 tokens / elapsed if elapsed else 0.0,
-                                prompt_tokens, finish_reason=finish_reason)
-
-    def _chat_with_backend_tools(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]],
-                                 tool_choice: Any, sampling: dict[str, Any]) -> GenerationResult:
-        """chat_format=chatml-function-calling 时，走 llama-cpp-python 内置的工具调用支持。"""
-        messages = [dict(item) for item in messages]
-        backend_choice = tool_choice
-        if tool_choice == "required":
-            backend_choice = "auto"
-            messages.insert(0, {"role": "system", "content": "你必须调用至少一个可用工具。"})
-
-        start = time.perf_counter()
-        try:
-            result = self._model.create_chat_completion(messages=messages, tools=tools,
-                                                         tool_choice=backend_choice, **sampling)
-            choice = result["choices"][0]
-            message = choice["message"]
-        except (AttributeError, TypeError, KeyError, ValueError) as exc:
-            raise ToolCapabilityError(f"GGUF 工具聊天接口不可用: {exc}") from exc
-
-        calls = message.get("tool_calls") or []
-        if not isinstance(calls, list):
-            raise ToolOutputError("GGUF 后端返回的 tool_calls 不是数组")
-        usage = result.get("usage", {})
-        elapsed = time.perf_counter() - start
-        tokens = int(usage.get("completion_tokens", 0))
-        return GenerationResult(
-            _repair_think_open(str(message.get("content") or "")), tokens, elapsed,
-            tokens / elapsed if elapsed else 0.0,
-            int(usage.get("prompt_tokens", 0)), calls,
-            str(choice.get("finish_reason") or ("tool_calls" if calls else "stop")),
-        )
-
-    def _chat_with_hermes_tools(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]],
-                                tool_choice: Any, sampling: dict[str, Any],
-                                max_new_tokens: int) -> GenerationResult:
-        """未配置 chatml-function-calling 时的兜底：把工具 schema 渲染进 system 段，
-        用模型自带聊天模板生成，再解析 Hermes 风格的 <tool_call> 标签。
-        适用于原生就输出这种格式的模型（如 Qwen3）。
-
-        注意：这里不把 tools= 传给 create_chat_completion，完全靠 system 段
-        里的 schema 说明 + 模型自身的 Jinja 模板渲染历史消息（包括之前轮次
-        的 assistant.tool_calls / role=tool），依赖模型模板本身支持这些字段。
-        """
-        if tool_choice == "none":
-            return self._chat(messages, sampling, max_new_tokens)
-
-        instruction, tools = render_tool_system_prompt(tools, tool_choice)
-        prepared = [dict(item) for item in messages]
-        if prepared and prepared[0].get("role") == "system":
-            existing = str(prepared[0].get("content") or "")
-            prepared[0]["content"] = f"{instruction}\n\n{existing}" if existing else instruction
-        else:
-            prepared.insert(0, {"role": "system", "content": instruction})
-
-        result = self._chat(prepared, sampling, max_new_tokens)
-        content, calls = parse_hermes_tool_calls(result.text)
-        return GenerationResult(content, result.tokens_generated, result.time_seconds,
-                                result.tokens_per_second, result.prompt_tokens, calls,
-                                "tool_calls" if calls else result.finish_reason)
+                                prompt_tokens, calls, finish_reason)
 
     @staticmethod
     def _guess_quantization(filename: str) -> str | None:
