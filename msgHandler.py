@@ -1,5 +1,6 @@
 from __future__ import annotations
 import uuid, asyncio, json
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -17,7 +18,7 @@ GENERATION_KEYS = frozenset({
     "mirostat", "mirostat_eta", "mirostat_tau", "regex", "json_schema",
 })
 
-#解析think强度serverapi 用
+# 解析think强度serverapi 用
 def resolve_think_level(*, think: Any = None, reasoning_effort: Any = None) -> int:
     REASONING_EFFORT_LEVELS = {"none": 0, "low": 1, "medium": 3, "high": 5}
     if think is not None:
@@ -26,9 +27,9 @@ def resolve_think_level(*, think: Any = None, reasoning_effort: Any = None) -> i
         return max(0, min(5, reasoning_effort))
     return REASONING_EFFORT_LEVELS.get(str(reasoning_effort).lower(), 0)
 
-#合并归一化字段 serverapi 用
+# 合并归一化字段 serverapi 用
 def normalize_generation_params(*sources: dict[str, Any], aliases: dict[str, str] | None = None) -> dict[str, Any]:
-    GENERATION_ALIASES = {"stop": "stop_sequences", "repeat_penalty": "repetition_penalty"} #协议返回的
+    GENERATION_ALIASES = {"stop": "stop_sequences", "repeat_penalty": "repetition_penalty"}  # 协议返回的
     alias_map = {**GENERATION_ALIASES, **(aliases or {})}
     values: dict[str, Any] = {}
     for source in sources:
@@ -37,7 +38,7 @@ def normalize_generation_params(*sources: dict[str, Any], aliases: dict[str, str
                 values.setdefault(alias_map.get(key, key), value)
     return {key: value for key, value in values.items() if key in GENERATION_KEYS}
 
-@dataclass#跨协议的规范化聊天请求
+@dataclass  # 跨协议的规范化聊天请求
 class ChatRequest:
     model: str
     messages: list[dict[str, Any]]
@@ -49,14 +50,14 @@ class ChatRequest:
     system_prompt: str = ""
 
 
-@dataclass#管理员指令结构
+@dataclass  # 管理员指令结构
 class AdminRequest:
     message_id: int
     model: str = ""
     generation: dict[str, Any] = field(default_factory=dict)
 
 
-@dataclass#聊天结构
+@dataclass  # 聊天结构
 class _ChatContext:
     model: str = ""
     prompt: str = ""
@@ -82,6 +83,15 @@ class MsgHandler:
         return self._pending
 
     length = pending  # 兼容外部代码按 length 属性访问排队数（如确认无外部引用可删除）
+
+    @asynccontextmanager
+    async def _queued_lock(self):
+        self._pending += 1
+        try:
+            async with self._lock:
+                yield
+        finally:
+            self._pending -= 1
 
     @staticmethod
     def _response(model: str, message_id: int, status: str, value: Any) -> dict[str, Any]:
@@ -111,20 +121,16 @@ class MsgHandler:
         ctx = _ChatContext(model=model, prompt=prompt, think=think, deploy=deploy or {}, messages=messages,
                             tools=tools or [], tool_choice=tool_choice,
                             parallel_tool_calls=parallel_tool_calls, system_prompt=system_prompt)
-        self._pending += 1
-        try:
-            async with self._lock:
-                info("消息处理", source, message_id, model)
-                result = await self._dispatch(message_id, args, ctx)
-                info("消息处理完成", source, message_id, "status=", result.get("status", "unknown"),
-                     "response_chars=", len(str(result.get("response", ""))))
-                return result
-        finally:
-            self._pending -= 1
+        async with self._queued_lock():
+            info("消息处理", source, message_id, model)
+            result = await self._dispatch(message_id, args, ctx)
+            info("消息处理完成", source, message_id, "status=", result.get("status", "unknown"),
+                 "response_chars=", len(str(result.get("response", ""))))
+            return result
 
     # 服务器正常过来的聊天
     async def chat(self, request: ChatRequest, *, source: str = "unknown") -> dict[str, Any]:
-        def has_non_text_content(messages: list[dict[str, Any]]) -> bool:
+        def _has_non_text_content(messages: list[dict[str, Any]]) -> bool:
             """检测消息中是否包含非文本内容分段（当前服务仅支持纯文本消息，与具体协议无关）。"""
             for item in messages:
                 if not isinstance(item, dict) or not isinstance(item.get("content"), list):
@@ -132,40 +138,38 @@ class MsgHandler:
                 if any(isinstance(part, dict) and part.get("type") != "text" for part in item["content"]):
                     return True
             return False
-        def flatten_messages(messages: list[dict[str, Any]], system_prompt: str | None = None) -> str:
+
+        def _flatten_messages(messages: list[dict[str, Any]], system_prompt: str | None = None) -> str:
             def text_of(content: Any) -> str:
                 if isinstance(content, str):
                     return content
                 if isinstance(content, list):
                     return "".join(part.get("text", "") for part in content
-                                if isinstance(part, dict) and part.get("type") == "text")
+                                   if isinstance(part, dict) and part.get("type") == "text")
                 return str(content or "")
 
             turns = ([{"role": "system", "content": system_prompt}] if system_prompt else []) + list(messages)
             return "\n".join(f"{turn.get('role', 'user')}: {text_of(turn.get('content'))}" for turn in turns)
-        if has_non_text_content(request.messages):
+
+        if _has_non_text_content(request.messages):
             raise ValueError("当前服务仅支持文本消息")
-        #
+
         ctx = _ChatContext(model=request.model,
-                            prompt=flatten_messages(request.messages, request.system_prompt),
-                            think=request.think, 
-                            deploy=request.deploy, 
-                            messages=request.messages,
-                            tools=request.tools, 
-                            tool_choice=request.tool_choice,
-                            parallel_tool_calls=request.parallel_tool_calls,
-                            system_prompt=request.system_prompt)
-        self._pending += 1
-        try:
-            async with self._lock:
-                info("消息处理", source, 0, request.model)
-                result = await self._dispatch(0, None, ctx)
-                info("消息处理完成", source, 0,
-                     "status=", result.get("status", "unknown"),
-                     "response_chars=", len(str(result.get("response", ""))))
-                return result
-        finally:
-            self._pending -= 1
+                           prompt=_flatten_messages(request.messages, request.system_prompt),
+                           think=request.think,
+                           deploy=request.deploy,
+                           messages=request.messages,
+                           tools=request.tools,
+                           tool_choice=request.tool_choice,
+                           parallel_tool_calls=request.parallel_tool_calls,
+                           system_prompt=request.system_prompt)
+        async with self._queued_lock():
+            info("消息处理", source, 0, request.model)
+            result = await self._dispatch(0, None, ctx)
+            info("消息处理完成", source, 0,
+                 "status=", result.get("status", "unknown"),
+                 "response_chars=", len(str(result.get("response", ""))))
+            return result
 
     # 管理指令
     async def admin(self, request: AdminRequest, *, source: str = "unknown") -> dict[str, Any]:
@@ -175,20 +179,16 @@ class MsgHandler:
         args = {"model": request.model, "generation": request.generation} if request.message_id == adim_ID.eUpdateGeneration.value else None
 
         ctx = _ChatContext(model=request.model)
-        self._pending += 1
-        try:
-            async with self._lock:
-                info("消息处理", source, request.message_id, request.model)
-                result = await self._dispatch(request.message_id, args, ctx)
-                info("消息处理完成", source, request.message_id,
-                     "status=", result.get("status", "unknown"))
-                return result
-        finally:
-            self._pending -= 1
+        async with self._queued_lock():
+            info("消息处理", source, request.message_id, request.model)
+            result = await self._dispatch(request.message_id, args, ctx)
+            info("消息处理完成", source, request.message_id,
+                 "status=", result.get("status", "unknown"))
+            return result
 
     async def _dispatch(self, message_id: int, args: Any, ctx: _ChatContext) -> dict[str, Any]:
         model = ctx.model
-        #指令触发
+        # 指令触发
         if message_id == adim_ID.eStatus.value:
             return self._status(model)
         if message_id == adim_ID.eHardwareInfo.value:
@@ -201,7 +201,7 @@ class MsgHandler:
             return await self._ensure_loaded(model or self._model_from(args))
         if message_id == adim_ID.eUpdateGeneration.value:
             return await self._update_generation(model, args)
-        #正常聊天
+        # 正常聊天
         payload = args if isinstance(args, dict) else {}
         model = model or str(payload.get("model", ""))
         prompt = ctx.prompt or str(payload.get("prompt", args if isinstance(args, str) else ""))
@@ -209,7 +209,7 @@ class MsgHandler:
             model = str(args[0])
         if isinstance(args, (list, tuple)) and not prompt and len(args) > 1:
             prompt = str(args[1])
-        info("请求参数解析", "id=", message_id, "model=", model,"prompt_chars=", len(prompt), "args_type=", type(args).__name__)
+        info("请求参数解析", "id=", message_id, "model=", model, "prompt_chars=", len(prompt), "args_type=", type(args).__name__)
         return await self._generate_chat(model, prompt, payload, ctx)
 
     # ---- 管理指令：每个 message_id 对应一个独立方法，便于单独测试/复用 ----
@@ -240,7 +240,7 @@ class MsgHandler:
                    if key in GENERATION_KEYS}
         merged = await asyncio.to_thread(self.manager.update_generation, target, changes)
         return self._response(target, adim_ID.eUpdateGeneration.value, "ok", merged)
-    #
+
     async def _generate_chat(self, model: str, prompt: str, payload: dict[str, Any], ctx: _ChatContext) -> dict[str, Any]:
         def _clean_history(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
             cleaned = []
@@ -251,16 +251,16 @@ class MsgHandler:
                     item["content"] = content.split("</think>", 1)[1].strip() #将历史字段里的</think>去掉
                 cleaned.append(item)
             return cleaned
-        def think_instruction() -> str:
+        def _think_instruction() -> str:
             return f"请以推理等级 {ctx.think}/5 分析后给出最终答案。" if ctx.think else ""
-        def _build_messages(self, prompt: str, ctx: _ChatContext, default_system: str,extra_system: str = "") -> list[dict[str, Any]]:
+        def _build_messages(prompt: str, ctx: _ChatContext, default_system: str,extra_system: str = "") -> list[dict[str, Any]]:
             messages = (_clean_history([dict(item) for item in ctx.messages]) if ctx.messages is not None
                         else [{"role": "user", "content": prompt}])
-            segments = [text for text in (default_system, ctx.system_prompt, think_instruction(), extra_system)
+            segments = [text for text in (default_system, ctx.system_prompt, _think_instruction(), extra_system)
                         if text]
             if not segments:
                 return messages
-            #构建标准消息上下文
+            #合并系统提示词与推理要求
             if messages and messages[0].get("role") == "system":
                 existing = str(messages[0].get("content") or "")
                 messages[0]["content"] = "\n\n".join([*segments, existing] if existing else segments)
@@ -282,10 +282,9 @@ class MsgHandler:
         messages = _build_messages(prompt, ctx, default_system)
         # 将工具发给模型调用处理
         params.update({"messages": messages, "tools": ctx.tools or None,
-                      "tool_choice": ctx.tool_choice,
-                      "parallel_tool_calls": ctx.parallel_tool_calls})
+                        "tool_choice": ctx.tool_choice,
+                        "parallel_tool_calls": ctx.parallel_tool_calls})
         result = await asyncio.to_thread(self.manager.generate, model, prompt, **params)
-
         return self._response(model, 0, "ok", result.text) | {
                         "tool_calls": result.tool_calls,
                         "finish_reason": result.finish_reason,
@@ -294,8 +293,7 @@ class MsgHandler:
                             "time_seconds": result.time_seconds, "tokens_per_second": result.tokens_per_second,}
                         }
 
-
 msgHandler = MsgHandler
 __all__ = ["GENERATION_KEYS",
            "ChatRequest", "AdminRequest", "MsgHandler", "msgHandler",
-           "resolve_think_level", "normalize_generation_params", "", "has_non_text_content"]
+           "resolve_think_level", "normalize_generation_params"]
