@@ -21,14 +21,6 @@ else:
 
 
 REAP_INTERVAL_SEC = 30
-
-manager = ModelsMgr(str(MODELS_FILE))
-handler = MsgHandler(manager)
-server = serverApi(manager, handler)
-console = Console(command_handler=lambda message_id, args: handler.handle(message_id, args, source="console"))
-app = server.app
-
-
 async def _reaper() -> None:
     """空闲模型回收；与入口方式无关，Console-only 模式同样需要。"""
     while True:
@@ -41,7 +33,6 @@ async def _reaper() -> None:
         if reaped:
             info("空闲回收", reaped)
 
-
 if __name__ == "__main__":
     async def _run() -> None:
         tasks = [asyncio.create_task(_reaper(), name="reaper")]
@@ -50,21 +41,28 @@ if __name__ == "__main__":
         if kApi:
             tasks.append(asyncio.create_task(server.run(), name="fastapi"))
         if len(tasks) == 1:
-            # 只有 reaper 时没有任何对外入口，直接退出。
             tasks[0].cancel()
             return
+
         done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
         for task in pending:
             task.cancel()
         await asyncio.gather(*pending, return_exceptions=True)
-        for task in done:
-            if not task.cancelled() and task.exception():
-                raise task.exception()
 
+        for task in done:
+            if not task.cancelled():
+                exc = task.exception()
+                if exc and not isinstance(exc, (KeyboardInterrupt, asyncio.CancelledError)):
+                    raise exc
+    #
+    manager = ModelsMgr(str(MODELS_FILE))
+    handler = MsgHandler(manager)
+    server = serverApi(manager, handler)
+    console = Console(command_handler=lambda message_id, args: handler.handle(message_id, args, source="console"))
+    app = server.app
     try:
         asyncio.run(_run())
     except KeyboardInterrupt:
         pass
     finally:
-        # Ctrl+C 也要落盘，否则缓冲区里的日志直接丢失。
-        save_logs()
+        save_logs()#记录log

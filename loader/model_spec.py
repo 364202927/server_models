@@ -1,12 +1,10 @@
-"""模型注册配置与首次加载参数。"""
-
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-import os
-import sys
+import os,sys
 from pathlib import Path
 from typing import Any
+from ..utils.common import aContainB
 
 
 @dataclass
@@ -17,7 +15,6 @@ class ModelLoadConfig:
     context_length: int | None = None
     gpu_memory_utilization: float | None = None
     quantization: str | None = None
-    # None 表示使用引擎默认；GGUF 默认会尽可能把层放到 GPU。
     gpu_offload_layers: int | None = None
     batch_size: int | None = None
     flash_attention: bool | None = None
@@ -32,9 +29,14 @@ class ModelLoadConfig:
     def from_dict(cls, raw: dict[str, Any] | None) -> "ModelLoadConfig":
         values = raw if isinstance(raw, dict) else {}
         known = set(cls.__dataclass_fields__) - {"extra"}
-        return cls(**{key: value for key, value in values.items() if key in known},
-                   extra={key: value for key, value in values.items()
-                          if key not in known and key not in {"draft_model", "speculative_decoding"}})
+        return cls(
+            **{key: value for key, value in values.items() if key in known},
+            extra={
+                key: value
+                for key, value in values.items()
+                if key not in known and key not in {"draft_model", "speculative_decoding"}
+            },
+        )
 
     def to_dict(self) -> dict[str, Any]:
         values = asdict(self)
@@ -59,16 +61,31 @@ class ModelLoadConfig:
             "enable_sleep_mode": self.enable_sleep_mode,
             "gpu_split": self.gpu_split,
         }
-        values.update({key: value for key, value in self.extra.items()
-                       if key not in {"draft_model", "speculative_decoding"}})
+        values.update({
+            key: value
+            for key, value in self.extra.items()
+            if key not in {"draft_model", "speculative_decoding"}
+        })
         return values
 
 
-# 会影响模型创建、改动后必须重新加载的参数。
 LOAD_KEYS = frozenset(ModelLoadConfig.__dataclass_fields__) - {"extra"}
-
-# 权重文件后缀；估算值缺失时按文件大小推算显存下界。
 WEIGHT_SUFFIXES = ("*.gguf", "*.safetensors", "*.bin")
+
+LOAD_DEFAULTS: dict[str, Any] = {
+    "dtype": "float16",
+    "gpu_offload_layers": -1,
+    "batch_size": 1,
+    "flash_attention": True,
+    "tensor_parallel_size": 1,
+    "gpu_split": None,
+    "trust_remote_code": True,
+}
+ENGINE_LOAD_DEFAULTS: dict[str, dict[str, Any]] = {
+    "vllm": {"gpu_memory_utilization": 0.9, "enable_sleep_mode": True},
+    "sglang": {"gpu_memory_utilization": 0.9, "enable_memory_saver": True},
+}
+LOAD_ARG_FIELDS = {"max_model_len": "context_length", "tensor_parallel_size": "tensor_parallel"}
 
 
 @dataclass
@@ -79,8 +96,6 @@ class ModelSpec:
     path: str
     source_path: str | None = field(default=None, repr=False, compare=False)
     estimated_vram_mb: int | None = None
-    # 显式指定推理框架(vllm/sglang/llama);只在加载时读取一次,运行期改它不生效。
-    # 未配置时按路径后缀推断默认值,见 ModelsMgr._load() 内的 _detect_engine。
     engine: str | None = None
     draft: str | None = None
     mtp: bool = False
@@ -90,23 +105,80 @@ class ModelSpec:
     extra: dict[str, Any] = field(default_factory=dict)
     load_present: bool = field(default=False, repr=False, compare=False)
     generation_present: bool = field(default=False, repr=False, compare=False)
-    # JSON 中实际出现的 load 字段；不把 dataclass 默认值误认为用户配置。
     load_fields: set[str] = field(default_factory=set, repr=False, compare=False)
 
     @property
     def load_configured(self) -> bool:
-        """兼容旧调用：只要至少有一个 load 字段即视为已配置。"""
         return bool(self.load_fields)
 
     @property
     def path_obj(self) -> Path:
         return Path(self.path)
 
-    def size_on_disk_mb(self) -> int | None:
-        """按权重文件大小估算显存下界，用于 ``estimated_vram_mb`` 缺失时的准入兜底。
+    def detect_engine(self) -> str | None:
+        """根据配置或文件路径特征自动推断推理引擎。"""
+        if self.engine:
+            return self.engine.strip().lower()
+        path = self.path_obj
+        if path.suffix.lower() == ".gguf":
+            return "llama"
+        if path.is_dir():
+            if any(path.glob("*.gguf")):
+                return "llama"
+            if (path / "config.json").is_file() and any(path.glob("*.safetensors")):
+                return "vllm"
+        hints = ("fp8", "awq", "gptq")
+        if aContainB(path.name.lower(), hints):
+            return "vllm"
+        return None
 
-        没有它的话首次加载会直接跳过显存检查，撑不下时表现为硬 OOM 而不是先回收。
-        """
+    def resolve_loader_kwargs(self, engine_name: str) -> dict[str, Any]:
+        """合并默认配置并补齐缺失参数，同步回内部 load 结构。"""
+        load_kwargs = self.load.loader_kwargs()
+        defaults = {**LOAD_DEFAULTS, **ENGINE_LOAD_DEFAULTS.get(engine_name, {})}
+        for name, value in defaults.items():
+            if name not in load_kwargs or load_kwargs[name] is None:
+                load_kwargs[name] = value
+            field_name = LOAD_ARG_FIELDS.get(name, name)
+            if field_name in LOAD_KEYS and getattr(self.load, field_name) is None:
+                setattr(self.load, field_name, load_kwargs[name])
+        return load_kwargs
+
+    def apply_effective_load(self, effective: dict[str, Any], model_info: Any = None) -> None:
+        """记录本次实际生效的参数。"""
+        if model_info:
+            effective.setdefault("context_length", model_info.context_length)
+            effective.setdefault("dtype", model_info.dtype)
+        for name, value in effective.items():
+            if name in LOAD_KEYS:
+                setattr(self.load, name, value)
+        accepted_extra = set(effective) - LOAD_KEYS - {
+            "engine", "draft", "mtp", "lora", "speculative_model",
+            "speculative_draft_model_path", "lora_paths", "enable_lora",
+        }
+        self.load.extra = {k: v for k, v in self.load.extra.items() if k in accepted_extra}
+        self.load.extra.update({k: effective[k] for k in accepted_extra})
+        self.load_fields.update(name for name in effective if name in LOAD_KEYS or name in self.load.extra)
+        self.load_present = True
+
+    def update_estimated_vram(self, used_before: int, current_used: int, force: bool = False) -> bool:
+        """根据显存差值更新实测占用，返回是否更新。"""
+        if self.estimated_vram_mb is not None and not force:
+            return False
+        delta = max(0, current_used - used_before)
+        if delta <= 0:
+            return False
+        self.estimated_vram_mb = int(delta)
+        return True
+
+    def required_vram_mb(self) -> int | None:
+        """按实测值或磁盘大小返回显存需求。"""
+        if self.estimated_vram_mb is not None:
+            return int(self.estimated_vram_mb)
+        return self.size_on_disk_mb()
+
+    def size_on_disk_mb(self) -> int | None:
+        """按权重文件大小估算显存下界。"""
         path = self.path_obj
         try:
             if path.is_file():
@@ -122,12 +194,30 @@ class ModelSpec:
                 return None
         except OSError:
             return None
-        # 留 10% 给上下文和推理临时分配。
         return int(total / (1024 ** 2) * 1.1) if total > 0 else None
+
+    def to_config_node(self) -> dict[str, Any]:
+        """将当前模型配置序列化为 dict。"""
+        node: dict[str, Any] = {
+            "path": self.source_path or self.path,
+            "mtp": self.mtp,
+            "load": self.load.to_dict(),
+            "generation": self.generation,
+        }
+        if self.estimated_vram_mb is not None:
+            node["estimated_vram_mb"] = self.estimated_vram_mb
+        if self.engine is not None:
+            node["engine"] = self.engine
+        if self.draft is not None:
+            node["draft"] = self.draft
+        if self.lora is not None:
+            node["lora"] = self.lora
+        node.update(self.extra)
+        return node
 
 
 def load_model_specs(config: dict[str, Any]) -> dict[str, ModelSpec]:
-    """读取 ``models``，仅从每个模型自己的 ``load``/``generation`` 节点取配置。"""
+    """读取 models 配置节点。"""
     result: dict[str, ModelSpec] = {}
     models = config.get("models", {})
     if not isinstance(models, dict):
@@ -167,18 +257,12 @@ def load_model_specs(config: dict[str, Any]) -> dict[str, ModelSpec]:
                 key for key, value in (raw_load.items() if isinstance(raw_load, dict) else [])
                 if value is not None
             },
-            # 未识别的键原样保留，持久化时不会被丢弃。
             extra={key: value for key, value in raw.items() if key not in known},
         )
     return result
 
-#window路径->linux路径
-def normalize_model_path(path: str) -> str:
-    """将配置中的 Windows 路径转换为当前平台可访问的路径。
 
-    WSL/Linux 下 ``D:/x`` 或 ``D:\\x`` 映射为 ``/mnt/d/x``；Windows 保留盘符路径。
-    其他 POSIX/UNC 路径不做猜测性修改。
-    """
+def normalize_model_path(path: str) -> str:
     value = os.path.expandvars(path.strip())
     if sys.platform == "win32":
         return value.replace("/", "\\") if len(value) >= 2 and value[1] == ":" else value
