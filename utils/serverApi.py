@@ -1,18 +1,3 @@
-"""OpenAI / Open WebUI 兼容的 FastAPI 网关。
-
-只做两件事：把 OpenAI 协议字段翻译成 MsgHandler 能理解的规范化请求
-（聊天请求 -> ChatRequest，管理指令 -> AdminRequest），再把 MsgHandler
-返回的内部结果重新包装成 OpenAI 兼容的响应（含 SSE 流式重放）。消息校验、
-生成参数别名归一化、推理等级解析这些协议无关的逻辑都在 MsgHandler 里，
-这里不重复实现，未来接入其它协议时也不需要在这一层重写。
-
-单流程说明：所有聊天请求（message_id == 0）统一把结构化 messages 交给
-MsgHandler，不再区分"要不要走工具"；是否拼普通 prompt、是否渲染工具
-模板，全部下沉到 MsgHandler / Loader 决定（依据是否有 tools，而不是
-是否有 messages）。API 层不再做这个分流。
-
-serverApi.py
-"""
 from __future__ import annotations
 
 import json
@@ -20,7 +5,7 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Any, AsyncIterator, Iterator
+from typing import Any, AsyncGenerator, Iterator
 
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -30,9 +15,7 @@ from starlette.responses import JSONResponse, StreamingResponse
 from ..loader.models_mgr import ModelsMgr
 from ..msgHandler import AdminRequest, ChatRequest, MsgHandler, normalize_generation_params, resolve_think_level
 
-# 会实际影响生成结果的采样/惩罚参数；用于从 extra_body/custom_parameters 中过滤出有效字段。
-# 注意这里同时包含规范名和 OpenAI/Ollama 风格的别名（stop、repeat_penalty）——
-# 别名归一化本身交给 MsgHandler.normalize_generation_params，这里只负责圈定
+
 # "openChatReq 上哪些字段算生成参数"。
 _GENERATION_FIELDS = {
     "temperature", "top_p", "top_k", "min_p", "max_tokens", "stop",
@@ -145,18 +128,9 @@ def _build_payload(result: dict[str, Any], model_id: str) -> dict[str, Any]:
         "usage": {**usage, "total_tokens": usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0)},
     }
 
-
-def _sse(payload: dict[str, Any]) -> str:
-    """把一个 JSON 数据包装为 SSE `data:` 行。"""
-    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
-
-
-def _chunks(text: str, size: int) -> Iterator[str]:
-    """按固定字符数切分文本，用于流式分块输出。"""
-    for start in range(0, len(text), size):
-        yield text[start:start + size]
-
-
+@asynccontextmanager # 空闲回收由 main.py 独立启动，纯 Console 模式（AI_KAPI=false）同样需要。
+async def _lifespan(_: FastAPI) -> AsyncGenerator[None]:
+    yield
 class serverApi:
     """可嵌入或独立运行的 FastAPI 服务。"""
 
@@ -189,12 +163,8 @@ class serverApi:
         if token != expected:
             raise HTTPException(status_code=401, detail="API key 无效")
 
-    @asynccontextmanager # 空闲回收由 main.py 独立启动，纯 Console 模式（AI_KAPI=false）同样需要。
-    async def _lifespan(self, _: FastAPI) -> AsyncIterator[None]:
-        yield
-
     def _create_app(self) -> FastAPI:
-        app = FastAPI(title="AI Multi-Model Service", lifespan=self._lifespan)
+        app = FastAPI(title="AI Multi-Model Service", lifespan=_lifespan)
         app.add_middleware(
             CORSMiddleware,
             allow_origins=self._server_settings().get("allow_origins", ["*"]),
@@ -218,27 +188,8 @@ class serverApi:
             return {"object": "list", "data": [
                 {"id": model_id, "object": "model", "created": now, "owned_by": "local"}
                 for model_id in self.manager.specs]}
-        # Ollama 兼容：Open WebUI 等客户端靠这个接口判断"后端是不是 Ollama"、
-        # 列出模型供选择，字段只给客户端实际会读的最小集合。
-        # @app.get("/api/tags")
-        # async def tags(_: None = Depends(self._require_api_key)) -> dict[str, Any]:
-        #     now = datetime.now(timezone.utc).isoformat()
-        #     return {"models": [
-        #         {
-        #             "name": model_id, "model": model_id,
-        #             "modified_at": now, "size": 0, "digest": "",
-        #             "details": {
-        #                 "format": "gguf", "family": "", "families": None,
-        #                 "parameter_size": "",
-        #                 "quantization_level": spec.load.quantization or "",
-        #             },
-        #         }
-        #         for model_id, spec in self.manager.specs.items()]}
-        # llama.cpp server 兼容：客户端靠 default_generation_settings.n_ctx 显示真实
-        # 上下文窗口，不传 model 时取第一个已注册模型（多模型场景下只能二选一兜底）。
         @app.get("/v1/props")
-        async def props(model: str | None = None,
-                        _: None = Depends(self._require_api_key)) -> dict[str, Any]:
+        async def props(model: str | None = None, _: None = Depends(self._require_api_key)) -> dict[str, Any]:
             model_id = model or next(iter(self.manager.specs), "")
             spec = self.manager.specs.get(model_id)
             n_ctx = (spec.load.context_length if spec else None) or 4096
@@ -247,57 +198,24 @@ class serverApi:
                 "total_slots": 1,
                 "default_generation_settings": {"n_ctx": n_ctx, "model": model_id},
             }
-        # openai支持
+        # openai支持chat接口(单用户)
         @app.post("/v1/chat/completions", response_model=None)
-        async def chat_completions(request: openChatReq,
-                                    _: None = Depends(self._require_api_key)) -> Any:
-            if request.function_call is not None or request.functions:
-                raise HTTPException(status_code=400,detail="旧版 functions/function_call 不受支持，请使用 tools/tool_choice")
-
-            is_chat = request.message_id == 0
-            if is_chat and not request.model:
-                raise HTTPException(status_code=400, detail="model 不能为空")
-            if is_chat and not request.messages:
-                raise HTTPException(status_code=400, detail="messages 不能为空")
-
-            # 单流程：聊天请求翻译成 ChatRequest 交给 handler.chat()，管理指令翻译成
-            # AdminRequest 交给 handler.admin()；两者的校验/生成/错误分类都在 MsgHandler 内部完成。
-            try:
-                if is_chat:
-                    result = await self.handler.chat(_to_chat_request(request), source="openwebui")
-                else:
-                    result = await self.handler.admin(_to_admin_request(request), source="openwebui")
-            except ValueError as exc:
-                raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-            if result.get("status") != "ok":
-                status = {"request": 400, "tool_output": 502}.get(result.get("error_type"), 500)
-                raise HTTPException(status_code=status, detail=result.get("response", "模型生成失败"))
-
-            payload = _build_payload(result, request.model)
-            if not request.stream:
-                return payload
-
-            tool_calls = result.get("tool_calls") or []
-            content = "" if tool_calls else result["response"]
-            chunk_size = request.stream_delta_chunk_size or len(content) or 1
-            base = {"id": payload["id"], "object": "chat.completion.chunk",
-                    "created": payload["created"], "model": payload["model"]}
-            finish_reason = payload["choices"][0]["finish_reason"]
-
-            async def events() -> AsyncIterator[str]:
-                """把一次性生成结果按 OpenAI SSE 协议重放为分块流；后续 Loader 支持真流式后可在此接入。"""
-
+        async def chat_completions(request: openChatReq, _: None = Depends(self._require_api_key)) -> Any:
+            async def events() -> AsyncGenerator[str]:
+                def _sse(payload: dict[str, Any]) -> str: #把 JSON 数据包装为 SSE `data:
+                    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                def _chunks(text: str, size: int) -> Iterator[str]: #固定字符数切分文本，用于流式分块输出
+                    for start in range(0, len(text), size):
+                        yield text[start:start + size]
                 def chunk(delta: dict[str, Any], reason: str | None = None) -> str:
                     return _sse({**base, "choices": [{"index": 0, "delta": delta, "finish_reason": reason}]})
-
+                #告诉客户端调用的工具
                 if tool_calls:
-                    initial = [{"index": i, "id": call["id"], "type": "function",
-                                "function": {"name": call["function"]["name"], "arguments": ""}}
-                               for i, call in enumerate(tool_calls)]
-                    yield chunk({"role": "assistant", "tool_calls": initial})
+                    initial = [{"index": i, "id": call["id"], "type": "function", "function": {"name": call["function"]["name"], "arguments": ""}}
+                                for i, call in enumerate(tool_calls)]
+                    yield chunk({"role": "assistant", "tool_calls": initial}) 
                     for call_index, call in enumerate(tool_calls):
-                        for piece in _chunks(call["function"]["arguments"], chunk_size):
+                        for piece in _chunks(call["function"]["arguments"], chunk_size): #给工具参数
                             yield chunk({"tool_calls": [{"index": call_index, "function": {"arguments": piece}}]})
 
                 for index, piece in enumerate(_chunks(content, chunk_size)):
@@ -306,8 +224,31 @@ class serverApi:
                 yield chunk({}, finish_reason)
                 if (request.stream_options or {}).get("include_usage"):
                     yield _sse({**base, "choices": [], "usage": payload["usage"]})
-                yield "data: [DONE]\n\n"
-
+                yield "data: [DONE]\n\n" 
+            #
+            if request.function_call is not None or request.functions:
+                raise HTTPException(status_code=400,detail="旧版 functions/function_call 不受支持，请使用 tools/tool_choice")
+            is_chat = request.message_id == 0
+            if is_chat and not request.model:
+                raise HTTPException(status_code=400, detail="model 不能为空")
+            if is_chat and not request.messages:
+                raise HTTPException(status_code=400, detail="messages 不能为空")
+            #判断指令or聊天
+            if not is_chat:
+                await self.handler.admin(_to_admin_request(request), source="openwebui")
+                return
+            result = await self.handler.chat(_to_chat_request(request), source="openwebui")
+            #非流式内容(stream=False)
+            payload = _build_payload(result, request.model)
+            if not request.stream:
+                return payload
+            #伪流式（SSE）
+            tool_calls = result.get("tool_calls") or []
+            content = "" if tool_calls else result["response"]
+            chunk_size = request.stream_delta_chunk_size or len(content) or 1
+            base = {"id": payload["id"], "object": "chat.completion.chunk",
+                    "created": payload["created"], "model": payload["model"]}
+            finish_reason = payload["choices"][0]["finish_reason"]
             return StreamingResponse(events(), media_type="text/event-stream")
 
         return app
@@ -315,8 +256,7 @@ class serverApi:
     async def run(self) -> None:
         import uvicorn
         settings = self._server_settings()
-        config = uvicorn.Config(self.app, host=str(settings.get("host", "0.0.0.0")),
-                                 port=self._port(), log_level="info")
+        config = uvicorn.Config(self.app, host=str(settings.get("host", "0.0.0.0")),port=self._port(), log_level="info")
         self._server = uvicorn.Server(config)
         await self._server.serve()
 

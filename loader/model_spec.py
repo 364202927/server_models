@@ -9,14 +9,6 @@ from pathlib import Path
 from typing import Any
 
 
-CACHE_DEFAULTS: dict[str, Any] = {
-    "state_snapshot_enabled": False,
-    "prompt_cache_enabled": False,
-    "kv_cache_enabled": False,
-    "cache_dir": "assets/cache",
-}
-
-
 @dataclass
 class ModelLoadConfig:
     """模型第一次加载时使用的参数。"""
@@ -88,7 +80,7 @@ class ModelSpec:
     source_path: str | None = field(default=None, repr=False, compare=False)
     estimated_vram_mb: int | None = None
     # 显式指定推理框架(vllm/sglang/llama);只在加载时读取一次,运行期改它不生效。
-    # 未配置时按路径后缀推断默认值,见 loader/tool_format.py。
+    # 未配置时按路径后缀推断默认值,见 ModelsMgr._load() 内的 _detect_engine。
     engine: str | None = None
     draft: str | None = None
     mtp: bool = False
@@ -180,7 +172,7 @@ def load_model_specs(config: dict[str, Any]) -> dict[str, ModelSpec]:
         )
     return result
 
-
+#window路径->linux路径
 def normalize_model_path(path: str) -> str:
     """将配置中的 Windows 路径转换为当前平台可访问的路径。
 

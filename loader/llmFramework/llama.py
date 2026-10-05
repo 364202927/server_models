@@ -1,18 +1,10 @@
-"""
-llama.py
-llama.cpp GGUF 模型加载器。
-该模块延迟导入 ``llama_cpp``，因此未安装可选依赖时不会影响 vllm/sglang 的导入。
-"""
-
 from __future__ import annotations
 
-import importlib
-import re
-import time
+import importlib,re,time
 from pathlib import Path
 from typing import Any
 
-from ...hardware import detect_gpu
+from ...utils.hardware import detect_gpu
 from ...utils.common import info as log_info, warn, error
 from .baseInference import GenerationResult, MemoryUsage, baseInference
 
@@ -20,7 +12,6 @@ try:
     from llama_cpp import Llama
 except ImportError:
     Llama = None
-
 
 def _find_gpu_offload_probe() -> Any:
     """``llama_supports_gpu_offload`` 的导出位置随 llama-cpp-python 版本变化，依次尝试已知位置。"""
@@ -31,14 +22,10 @@ def _find_gpu_offload_probe() -> Any:
         except (ImportError, AttributeError):
             continue
     return None
-
-
 _llama_supports_gpu_offload = _find_gpu_offload_probe() if Llama is not None else None
 
-
 def _gpu_offload_supported() -> bool | None:
-    """探测当前 llama-cpp-python 是否编译了 CUDA 支持；
-    探测函数不可用、或旧版本签名不兼容时返回 None（未知，不阻断加载）。"""
+    """探测当前 llama-cpp-python 是否编译了 CUDA 支持；"""
     if not callable(_llama_supports_gpu_offload):
         return None
     try:
@@ -47,24 +34,14 @@ def _gpu_offload_supported() -> bool | None:
         # 旧版本探测函数签名不同，视为未知，交给构造器处理。
         return None
 
-
 def _flatten_messages(messages: list[dict[str, Any]]) -> str:
     """把多轮 messages 拍平成纯文本，仅用于 create_chat_completion 不可用时的兜底补全接口。"""
     return "\n".join(f"{item.get('role', 'user')}: {item.get('content', '')}" for item in messages)
-
-
 def _repair_think_open(text: str) -> str:
-    """补全被截断的 ``<think>`` 开标签。
-
-    Qwen3 等模型的 chat template 会把 ``<think>\\n`` 作为 assistant 段的生成起点
-    拼进 prompt 里，模型只需要续写、最后吐出 ``</think>`` 收尾——所以
-    completion 文本天然是"有尾没头"。不补回开标签的话，客户端（如 OpenWebUI）
-    按 ``<think>...</think>`` 完整标签对识别推理块，会认不出来直接整段当正文
-    显示，看不到折叠/变暗效果。这里只是补标签，不改变、不删除任何内容。"""
+    """补全被截断的 ``<think>`` 标签。"""
     if "</think>" in text and not text.lstrip().startswith("<think>"):
         return "<think>\n" + text
     return text
-
 
 class llama(baseInference):
     """使用 llama-cpp-python 加载单文件或目录中的 GGUF 模型。"""
@@ -89,9 +66,8 @@ class llama(baseInference):
     _CONTEXT_SAFETY_MARGIN = 32
     _MIN_GENERATION_TOKENS = 16
 
-    @staticmethod
+    @staticmethod #取出gguf文件
     def _resolve_gguf_file(model_path: str) -> Path:
-        """若传入目录，取目录下按名称排序的第一个 .gguf 文件；否则要求路径本身就是 .gguf 文件。"""
         source = Path(model_path)
         if source.is_dir():
             files = sorted(source.glob("*.gguf"))
@@ -101,27 +77,6 @@ class llama(baseInference):
         if not source.is_file() or source.suffix.lower() != ".gguf":
             raise ValueError(f"不是有效的 GGUF 文件: {model_path}")
         return source
-
-    @staticmethod
-    def _build_llm_kwargs(source: Path, gpu_layers: int, max_model_len: int | None,
-                          **kwargs: Any) -> dict[str, Any]:
-        """组装传给 ``Llama()`` 构造器的参数。"""
-        llm_kwargs: dict[str, Any] = {
-            "model_path": str(source),
-            # n_gpu_layers 决定有多少层放入 GPU；-1 表示尽可能全部 offload。
-            "n_gpu_layers": gpu_layers,
-            # 未配置时不能省略 n_ctx——llama.cpp 构造器默认只有 512。
-            "n_ctx": int(max_model_len) if max_model_len else llama._FALLBACK_N_CTX,
-            "n_batch": int(kwargs.get("batch_size", 512)),
-            "verbose": bool(kwargs.get("verbose", False)),
-            'use_mlock':True             #内存常驻锁定,休眠时保持在oom(ulimit -l:检查可存放无限页)
-        }
-        if kwargs.get("flash_attention") is not None:
-            llm_kwargs["flash_attn"] = bool(kwargs["flash_attention"])
-        if kwargs.get("gpu_split"):
-            # tensor_split 用每张卡的相对分配比例；None 表示 llama.cpp 自动分配。
-            llm_kwargs["tensor_split"] = kwargs["gpu_split"]
-        return llm_kwargs
 
     def _apply_metadata(self, source: Path, max_model_len: int | None) -> dict[str, Any]:
         """从已加载的 Llama 对象读取 metadata，回填 context_length/quantization 到
@@ -151,12 +106,27 @@ class llama(baseInference):
             self._model_info.quantization = str(quantization)
         return metadata
 
-    def load(self, model_path: str, *, quantization: str | None = None, dtype: str = "float16",
-             max_model_len: int | None = None, tensor_parallel_size: int = 1,
-             trust_remote_code: bool = True, **kwargs: Any) -> "llama":
+    def load(self, model_path: str, *, quantization: str | None = None, dtype: str = "float16", max_model_len: int | None = None, tensor_parallel_size: int = 1, trust_remote_code: bool = True, **kwargs: Any) -> "llama":
+        def _build_llm_kwargs(source: Path, gpu_layers: int, max_model_len: int | None,**kwargs: Any) -> dict[str, Any]:
+            llm_kwargs: dict[str, Any] = {
+                "model_path": str(source),
+                # n_gpu_layers 决定有多少层放入 GPU；-1 表示尽可能全部 offload。
+                "n_gpu_layers": gpu_layers,
+                # 未配置时不能省略 n_ctx——llama.cpp 构造器默认只有 512。
+                "n_ctx": int(max_model_len) if max_model_len else llama._FALLBACK_N_CTX,
+                "n_batch": int(kwargs.get("batch_size", 512)),
+                "verbose": bool(kwargs.get("verbose", False)),
+                'use_mlock':True             #内存常驻锁定,休眠时保持在oom(ulimit -l:检查可存放无限页)
+            }
+            #参数转换
+            if kwargs.get("flash_attention") is not None:
+                llm_kwargs["flash_attn"] = bool(kwargs["flash_attention"])
+            if kwargs.get("gpu_split"):
+                llm_kwargs["tensor_split"] = kwargs["gpu_split"]
+            return llm_kwargs
+        #
         if Llama is None:
-            raise RuntimeError("GGUF 模型需要安装 llama-cpp-python（建议按 CUDA 架构安装）")
-
+            raise RuntimeError("GGUF 模型需要安装 llama-cpp-python（建议按 CUDA 架构安装）")        
         source = self._resolve_gguf_file(model_path)
         gpu_offload_layers = kwargs.get("gpu_offload_layers")
         gpu_layers = int(gpu_offload_layers) if gpu_offload_layers is not None else -1
@@ -171,7 +141,7 @@ class llama(baseInference):
         draft, mtp, lora = kwargs.pop("draft", None), kwargs.pop("mtp", False), kwargs.pop("lora", None)
         if draft and mtp:
             raise ValueError("draft 与 mtp 不能同时启用")
-        llm_kwargs = self._build_llm_kwargs(source, gpu_layers, max_model_len, **kwargs)
+        llm_kwargs = _build_llm_kwargs(source, gpu_layers, max_model_len, **kwargs)
         optional_kwargs = self._accepted_engine_kwargs(
             Llama, kwargs, {"model_path", "n_gpu_layers", "n_ctx", "n_batch", "verbose",
                             "gpu_memory_utilization", "gpu_offload_layers", "batch_size",

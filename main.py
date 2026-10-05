@@ -1,9 +1,6 @@
-"""服务启动入口。"""
-
 from __future__ import annotations
 
-import asyncio
-import sys
+import asyncio,sys
 from pathlib import Path
 if __package__ in (None, ""):
     # 直接执行 ``python main.py`` 时把项目父目录加入导入路径。
@@ -28,8 +25,7 @@ REAP_INTERVAL_SEC = 30
 manager = ModelsMgr(str(MODELS_FILE))
 handler = MsgHandler(manager)
 server = serverApi(manager, handler)
-console = Console(command_handler=lambda message_id, args: handler.handle(
-    message_id, args, source="console"))
+console = Console(command_handler=lambda message_id, args: handler.handle(message_id, args, source="console"))
 app = server.app
 
 
@@ -48,9 +44,6 @@ async def _reaper() -> None:
 
 if __name__ == "__main__":
     async def _run() -> None:
-        # 恢复上次运行时驻留显存的模型；失败只记日志，不阻塞启动。
-        await asyncio.to_thread(manager.restore_from_snapshots)
-
         tasks = [asyncio.create_task(_reaper(), name="reaper")]
         if sys.stdin.isatty():
             tasks.append(asyncio.create_task(console.run(), name="console"))

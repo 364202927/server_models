@@ -1,5 +1,3 @@
-"""当前服务进程资源信息。"""
-
 from __future__ import annotations
 
 import os

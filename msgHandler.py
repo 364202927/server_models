@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from . import adim_ID
-from .hardware import detect_hardware
+from .utils.hardware import detect_hardware
 from .loader.model_spec import LOAD_KEYS
 from .loader.models_mgr import ModelsMgr
 from .utils.common import info, log
@@ -176,8 +176,15 @@ class MsgHandler:
         admin_ids = {e.value for e in adim_ID}
         if request.message_id not in admin_ids:
             raise ValueError(f"不支持的管理指令 message_id: {request.message_id}")
+        #读取的指令直接返回
+        if request.message_id == adim_ID.eStatus.value:
+            return self._status(request.model)
+        if request.message_id == adim_ID.eHardwareInfo.value:
+            return self._hardware_info(request.model)
+        if request.message_id == adim_ID.eModelsList.value:
+            return self._list_models(request.model)
+        #
         args = {"model": request.model, "generation": request.generation} if request.message_id == adim_ID.eUpdateGeneration.value else None
-
         ctx = _ChatContext(model=request.model)
         async with self._queued_lock():
             info("消息处理", source, request.message_id, request.model)

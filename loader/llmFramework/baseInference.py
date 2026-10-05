@@ -1,43 +1,11 @@
-"""
-baseInference.py
-推理框架抽象基类。
-
-统一"模型逻辑"(messages 归一化、采样参数组装、显存/内存
-统计、休眠唤醒默认行为),子类(vllm/sglang/llama...)只负责:
-- 创建/持有具体推理引擎实例(``_create_engine`` / ``load``)
-- 单次引擎调用(``_run_engine``,或整体覆盖 ``generate`` —— 引擎形状差异
-  太大时,如 llama 的消息级 chat-completions 接口)
-- 提供 tokenizer(``_get_tokenizer``)
-
-新增推理框架时,优先复用本类已有的模板方法,只在真正与已有引擎形状不同的
-地方覆盖。
-"""
-
 from __future__ import annotations
 
-import gc
-import inspect
-import os
-import time
+import gc,inspect,os,time,torch,psutil
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-
-# torch/psutil 都是可选依赖:在模块级尝试一次,失败则置为 None,
-# 后续方法用 `is not None` 判断即可,不需要在每个方法里各自 try/except。
-try:
-    import torch
-except ImportError:
-    torch = None
-
-try:
-    import psutil
-except ImportError:
-    psutil = None
-
 from ...utils.common import info as log_info
-
 
 def detect_model_type(name: str) -> str:
     """从模型名/路径粗略猜测模型系列,仅用于诊断信息展示。"""
@@ -46,7 +14,6 @@ def detect_model_type(name: str) -> str:
         if marker in lowered:
             return marker
     return "unknown"
-
 
 @dataclass
 class ModelInfo:
@@ -221,9 +188,6 @@ class baseInference(ABC):
         self._effective_load = {}
         self._sleeping = False
         self._sleep_capable = False
-
-    def supports_state_snapshot(self) -> bool:
-        return True
 
     def supports_prompt_cache(self) -> bool:
         return False

@@ -1,20 +1,15 @@
-"""多模型生命周期管理器：显存准入、RAM 休眠、卸载和空闲回收。"""
-
 from __future__ import annotations
 
-import copy
-import threading
-import time
+import copy,threading,time
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from ..hardware import check_gpu_memory, check_ram, detect_gpu, query_gpu_used_mb
-from ..utils.common import info as log_info, readFile, writeFile
+from ..utils.hardware import check_gpu_memory, check_ram, detect_gpu, query_gpu_used_mb
+from ..utils.common import info as log_info, readFile, writeFile,error, require, aContainB
 from .llmFramework.baseInference import GenerationResult, baseInference
-from .model_spec import CACHE_DEFAULTS, LOAD_KEYS, ModelSpec, load_model_specs
-from .tool_format import create_loader, load_snapshot, save_snapshot
+from .model_spec import LOAD_KEYS, ModelSpec, load_model_specs
 
 LOAD_DEFAULTS: dict[str, Any] = {
     "dtype": "float16",
@@ -64,7 +59,7 @@ class RuntimeModel:
 
 
 class ModelsMgr:
-    """串行场景下的模型注册表和运行时实例管理器。"""
+    """模型实例管理器"""
 
     def __init__(self, config_path: str = "assets/models.json") -> None:
         self.config_path = Path(config_path)
@@ -78,7 +73,6 @@ class ModelsMgr:
         self.settings: dict[str, Any] = copy.deepcopy(defaults) if isinstance(defaults, dict) else {}
         self.specs: dict[str, ModelSpec] = load_model_specs(config)
         self.runtime: dict[str, RuntimeModel] = {}
-        self.asset_root = str(self.config_path.parent)
         self._lock = threading.RLock()
         # 休眠/准入阈值不放配置文件：误调会直接导致 OOM 或永不回收。
         self.ram_reserve_mb = 8192
@@ -88,11 +82,6 @@ class ModelsMgr:
         self.sleep_time = int(server.get("sleepTime", 600)) if isinstance(server, dict) else 600
 
     # ---------------------------------------------------------------- 配置读取
-
-    @property
-    def cache_settings(self) -> dict[str, Any]:
-        value = self.settings.get("cache", {})
-        return {**CACHE_DEFAULTS, **value} if isinstance(value, dict) else dict(CACHE_DEFAULTS)
 
     def generation_params(self, model_id: str) -> dict[str, Any]:
         """解析 ``defaults.generation`` ← 模型 ``generation``。
@@ -107,8 +96,7 @@ class ModelsMgr:
             params.update(spec.generation)
         return params
 
-    # ---------------------------------------------------------------- 状态查询
-
+    # 状态查询
     def list_models(self) -> list[dict[str, Any]]:
         with self._lock:
             return [(self.runtime.get(model_id) or RuntimeModel(spec)).public_dict()
@@ -122,10 +110,8 @@ class ModelsMgr:
             raise KeyError(f"models.json 中不存在模型: {model_id}")
         return self.runtime.setdefault(model_id, RuntimeModel(self.specs[model_id]))
 
-    # ---------------------------------------------------------------- 显存准入
-
+    # 显存准入
     def _required_mb(self, spec: ModelSpec) -> int | None:
-        """模型预计显存；实测值缺失时退回权重文件大小。"""
         if spec.estimated_vram_mb is not None:
             return int(spec.estimated_vram_mb)
         return spec.size_on_disk_mb()
@@ -150,24 +136,17 @@ class ModelsMgr:
             f"模型 {spec.model_id} 需要约 {self._required_mb(spec)} MB 显存，"
             f"释放全部空闲模型后仍不足"
         )
-
+    # 释放空闲模型,(时间+显存)优先
     def _reclaim(self, exclude: str) -> None:
-        """按最久未使用顺序释放空闲模型，直到目标装得下或候选耗尽。
-
-        只按 LRU 排序：主模型通常显存最大也最常用，按显存降序会反复把它挤掉，
-        导致每次切到专家模型都要重载主模型。
-        """
         candidates = [item for model_id, item in self.runtime.items()
-                      if model_id != exclude and item.loader
-                      and not item.active and item.state == "RUNNING"]
+                      if model_id != exclude and item.loader and not item.active and item.state == "RUNNING"]
         candidates.sort(key=lambda item: item.last_used_at)
-        log_info("显存不足，开始回收", "exclude=", exclude,
-                 "candidates=", [item.spec.model_id for item in candidates])
+        log_info("显存不足，开始回收", "exclude=", exclude, "candidates=", [item.spec.model_id for item in candidates])
         for item in candidates:
             self._release(item)
             if self._free_for(self.specs[exclude]):
                 return
-
+    
     def _reclaim_ram(self, exclude: str, required_mb: int) -> bool:
         """RAM 不足时按最久未用顺序卸载已休眠的模型，腾内存给新的休眠请求。
 
@@ -185,12 +164,8 @@ class ModelsMgr:
             if check_ram(required_mb, self.ram_reserve_mb).allowed:
                 return True
         return check_ram(required_mb, self.ram_reserve_mb).allowed
-
+    #单模型释放,优先到ram,次到休眠旧模型,还不足够时才卸载
     def _release(self, runtime: RuntimeModel) -> None:
-        """单个模型的释放：优先休眠到 RAM。
-
-        RAM 不足时先按 LRU 卸载已休眠的旧模型腾地方，仍不够或引擎不支持休眠才真正卸载当前模型。
-        """
         model_id = runtime.spec.model_id
         required_mb = int(self._required_mb(runtime.spec) or 0)
         ram_ok = check_ram(required_mb, self.ram_reserve_mb).allowed
@@ -198,14 +173,12 @@ class ModelsMgr:
             ram_ok = self._reclaim_ram(model_id, required_mb)
         if ram_ok and runtime.loader is not None and runtime.loader.sleep_to_ram():
             runtime.state, runtime.sleep_location = "SLEEPING_RAM", "ram"
-            self._save_snapshot(runtime)
             log_info("模型休眠到RAM:", model_id)
             return
         log_info("模型卸载:", model_id, " ram_ok=", ram_ok)
         self._unload_runtime(model_id)
 
-    # ---------------------------------------------------------------- 加载与唤醒
-
+    # 加载与唤醒
     def ensure_loaded(self, model_id: str) -> RuntimeModel:
         with self._lock:
             runtime = self._get_runtime(model_id)
@@ -214,11 +187,6 @@ class ModelsMgr:
             return self._load(runtime)
 
     def _resume(self, runtime: RuntimeModel) -> RuntimeModel:
-        """命中已加载模型。
-
-        SLEEPING_RAM 的唤醒会把权重搬回显存，必须和冷加载走同一套准入检查，
-        否则其它模型占满显存时唤醒会直接 OOM。
-        """
         model_id = runtime.spec.model_id
         if runtime.state == "RUNNING":
             runtime.last_used_at = time.time()
@@ -232,11 +200,31 @@ class ModelsMgr:
             raise RuntimeError(f"模型 {model_id} 唤醒失败: {exc}") from exc
         runtime.state, runtime.sleep_location = "RUNNING", None
         runtime.last_used_at = time.time()
-        self._save_snapshot(runtime)
         log_info("模型已从RAM唤醒", model_id)
         return runtime
 
     def _load(self, runtime: RuntimeModel) -> RuntimeModel:
+        def _detect_engine(path) -> str | None:
+            _VLLM_PATH_HINTS = ("fp8", "awq", "gptq")
+            if path.suffix.lower() == ".gguf":
+                return "llama"
+            if path.is_dir():
+                if any(path.glob("*.gguf")):
+                    return "llama"
+                if (path / "config.json").is_file() and any(path.glob("*.safetensors")):
+                    return "vllm"
+            if aContainB(path.name.lower(), _VLLM_PATH_HINTS):
+                return "vllm"
+            return None
+        def _create(spec: ModelSpec) -> baseInference | None:
+            _ENGINE_MODULE = f"{__package__}.llmFramework.{{engine}}"
+            engine = spec.engine or _detect_engine(spec.path_obj)
+            if not engine:
+                error("无法确定推理框架，请在 models.json 配置 load.engine：model=", spec.model_id, " path=", spec.path)
+                return None
+            cls = require(_ENGINE_MODULE.format(engine=engine))
+            return cls() if cls else None
+        #
         spec = runtime.spec
         model_id = spec.model_id
         runtime.state = "LOADING"
@@ -247,11 +235,8 @@ class ModelsMgr:
             self._admit(spec)
             # 加载前后的整卡差值才是本模型的占用；torch 的计数器是进程级累计。
             used_before = query_gpu_used_mb()
-            runtime.loader = create_loader(spec)
+            runtime.loader = _create(spec)
             if runtime.loader is None:
-                # create_loader 已经打印了具体原因(未配置 engine 且无法按后缀推断)；
-                # 这里不再包成异常抛出，直接把模型标记为未加载并返回。保留 runtime
-                # 记录(不 pop)以便 status()/list_models() 能看到 error 原因。
                 runtime.state, runtime.error = "UNLOADED", "无法确定推理框架"
                 return runtime
             load_kwargs = spec.load.loader_kwargs()
@@ -270,7 +255,6 @@ class ModelsMgr:
             self._persist_spec(spec)
             runtime.state, runtime.error = "RUNNING", None
             runtime.last_used_at = time.time()
-            self._save_snapshot(runtime)
             info = runtime.loader.model_info
             log_info("模型加载完成", model_id, "vram_mb=", spec.estimated_vram_mb,
                      "context_length=", info.context_length if info else None)
@@ -285,10 +269,6 @@ class ModelsMgr:
             raise RuntimeError(f"模型 {model_id} 加载失败: {exc}") from exc
 
     def _measure_vram(self, runtime: RuntimeModel, used_before: int) -> None:
-        """把加载前后的整卡显存差值归属到本模型。
-
-        已有估算值且 load 未变更时不覆盖，避免多模型驻留时互相污染、估算逐次膨胀。
-        """
         spec = runtime.spec
         if spec.estimated_vram_mb is not None and not runtime.needs_remeasure:
             return
@@ -325,13 +305,8 @@ class ModelsMgr:
         spec.load_fields.update(name for name in effective if name in LOAD_KEYS or name in spec.load.extra)
         spec.load_present = True
 
-    # ---------------------------------------------------------------- 持久化
-
+    #将通用配置写入json
     def _persist_spec(self, spec: ModelSpec) -> None:
-        """写回首次加载后生效的完整参数，并保留模型节点中的其他键。
-
-        写入走临时文件 + rename，避免半写入。
-        """
         models = self._config.setdefault("models", {})
         node = models.get(spec.model_id)
         if not isinstance(node, dict):
@@ -369,39 +344,6 @@ class ModelsMgr:
         writeFile(self._config, str(tmp_path))
         tmp_path.replace(self.config_path)
         log_info("模型配置已补全", spec.model_id)
-
-    def _save_snapshot(self, runtime: RuntimeModel) -> None:
-        if not self.cache_settings.get("state_snapshot_enabled", False):
-            return
-        try:
-            save_snapshot(self.asset_root, runtime.spec, state=runtime.state,
-                          last_used_at=runtime.last_used_at)
-        except OSError as exc:
-            log_info("状态快照写入失败", runtime.spec.model_id, exc)
-
-    def restore_from_snapshots(self) -> list[str]:
-        """启动时把上次处于 RUNNING 的模型恢复回显存，最近使用的优先。"""
-        if not self.cache_settings.get("state_snapshot_enabled", False):
-            return []
-        pending: list[tuple[float, str]] = []
-        for model_id in self.specs:
-            runtime_info = (load_snapshot(self.asset_root, model_id) or {}).get("runtime", {})
-            if not isinstance(runtime_info, dict) or runtime_info.get("state") != "RUNNING":
-                continue
-            try:
-                pending.append((float(runtime_info.get("last_used_at", 0.0)), model_id))
-            except (TypeError, ValueError):
-                pending.append((0.0, model_id))
-        restored: list[str] = []
-        for _, model_id in sorted(pending, reverse=True):
-            try:
-                self.ensure_loaded(model_id)
-                restored.append(model_id)
-            except Exception as exc:
-                # 单个模型恢复失败不能阻塞服务启动。
-                log_info("快照恢复失败", model_id, type(exc).__name__, exc)
-        log_info("快照恢复完成", restored or "无")
-        return restored
 
     # ---------------------------------------------------------------- 推理
 
@@ -497,7 +439,6 @@ class ModelsMgr:
             return
         if runtime.loader:
             runtime.state, runtime.sleep_location = "UNLOADED", None
-            self._save_snapshot(runtime)
             runtime.loader.unload()
         self.runtime.pop(model_id, None)
 
