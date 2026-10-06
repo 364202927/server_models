@@ -1,36 +1,35 @@
 from __future__ import annotations
 
-import gc,inspect,os,time,torch,psutil
+import gc, inspect, os, time,psutil, torch
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
+
 from ...utils.common import info as log_info
 
 def detect_model_type(name: str) -> str:
-    """从模型名/路径粗略猜测模型系列,仅用于诊断信息展示。"""
     lowered = name.lower()
     for marker in ("qwen", "llama", "mistral", "deepseek", "yi", "glm", "baichuan"):
         if marker in lowered:
             return marker
     return "unknown"
 
+
 @dataclass
 class ModelInfo:
-    """模型信息"""
     name: str
     path: str
     model_type: str
     quantization: str | None = None
     dtype: str = "float16"
-    parameters: str = "unknown"         # 参数量 e.g. "7B"
+    parameters: str = "unknown"
     context_length: int = 4096
     extra: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
 class GenerationResult:
-    """生成结果"""
     text: str
     tokens_generated: int
     time_seconds: float
@@ -42,36 +41,22 @@ class GenerationResult:
 
 @dataclass
 class MemoryUsage:
-    """模型内存/显存占用信息"""
-    gpu_allocated_mb: float = 0       # GPU已分配显存 (模型+推理临时)
-    gpu_reserved_mb: float = 0        # GPU预留显存 (含缓存池)
-    gpu_total_mb: float = 0           # GPU总显存
-    gpu_free_mb: float = 0            # GPU空闲显存
-    process_rss_mb: float = 0         # 进程物理内存占用
-    system_available_mb: float = 0    # 系统可用内存
-    details: dict[str, Any] | None = None  # verbose模式下的详细信息
+    gpu_allocated_mb: float = 0
+    gpu_reserved_mb: float = 0
+    gpu_total_mb: float = 0
+    gpu_free_mb: float = 0
+    process_rss_mb: float = 0
+    system_available_mb: float = 0
+    details: dict[str, Any] | None = None
 
 
 class baseInference(ABC):
-    """
-    推理框架抽象基类
+    """推理框架抽象基类"""
 
-    使用方式:
-        with vllm() as engine:
-            engine.load("model_path")
-            result = engine.generate("prompt")
-
-    子类命名与文件名保持一致且全小写(``vllm``/``sglang``/``llama``),
-    这是 ``utils.common.require()`` 动态创建子类的硬性要求——它取模块路径
-    最后一段作为类名去查找。
-    """
-
-    # 采样参数改名映射:通用键 -> 引擎实际接受的关键字。未出现的键原样传递。
     _SAMPLING_KEY_MAP: dict[str, str] = {}
-    # 除通用五个采样键外,该引擎还认识的可选采样字段(从 kwargs 里按需摘取)。
     _EXTRA_SAMPLING_KEYS: tuple[str, ...] = ()
 
-    def __init__(self):
+    def __init__(self) -> None:
         self._model = None
         self._tokenizer = None
         self._model_info: ModelInfo | None = None
@@ -89,99 +74,80 @@ class baseInference(ABC):
 
     @property
     def effective_load(self) -> dict[str, Any]:
-        """返回本次加载实际采用的参数,供 ModelsMgr 同步到 models.json。"""
         return dict(self._effective_load)
 
-    @abstractmethod
-    def load(self, model_path: str, *, quantization: str | None = None, dtype: str = "float16",
-             max_model_len: int | None = None, tensor_parallel_size: int = 1,
-             trust_remote_code: bool = True, **kwargs: Any) -> "baseInference":
-        """加载模型,返回self支持链式调用"""
+    @property
+    def supported_modalities(self) -> set[str]:
+        """模型支持的输入模态，默认纯文本，多模态子类重写覆盖。"""
+        return {"text"}
 
-    def unload(self) -> None:
-        """卸载具体推理引擎。"""
-        self._unload_engine()
+    @abstractmethod
+    def load(
+        self,
+        model_path: str,
+        *,
+        config: dict[str, Any] | None = None,
+        draft: str | None = None,
+        lora: str | None = None,
+        **kwargs: Any,
+    ) -> "baseInference":
+        pass
 
     @abstractmethod
     def _unload_engine(self) -> None:
-        """由子类释放引擎资源并调用 ``_mark_unloaded``。"""
+        pass
 
-    # ---------------------------------------------------------------- 休眠:模板方法
-    #
-    # 默认实现覆盖"校验状态 -> 调一次引擎的休眠/唤醒 API -> 维护休眠标记"这一形状。
-    # 子类只实现 `_engine_sleep`/`_engine_wake`：不做状态判断、不打日志、不捕异常，
-    # 直接抛。异常由基类按调用方约定翻译——ModelsMgr._release 只看 sleep_to_ram() 的
-    # bool 返回且不捕异常，ModelsMgr._resume 却依赖 wake() 抛异常来保留 SLEEPING_RAM
-    # 以便重试，所以这里必须做不对称处理。
+    def unload(self) -> None:
+        self._unload_engine()
+
+    @abstractmethod
+    def count_tokens(self, text_or_messages: str | list[dict[str, Any]]) -> int:
+        """精确统计文本或上下文消息的 Token 数量。"""
+        pass
 
     @property
     def is_sleeping(self) -> bool:
         return self._sleeping
 
     def supports_sleep_to_ram(self) -> bool:
-        """引擎是否真能把权重挪出显存；由 load() 按构造实际结果置位。"""
         return self._sleep_capable
 
     def sleep_holds_ram(self) -> bool:
-        """休眠期间权重是否真占着本进程的 RAM。
-
-        vLLM/SGLang 把权重搬进 CPU 内存，占真实 RSS，卸载它能腾出 RAM；GGUF 靠 OS 页缓存，
-        卸载它腾不出 MemAvailable。ModelsMgr 的 RAM 回收靠这个区分，避免白丢热状态。
-        """
         return True
 
     def sleep_to_ram(self) -> bool:
-        """将模型权重移出 GPU 保留在 RAM;引擎不支持时返回 False。"""
-        if self._model is None or self._sleeping:
+        if self._model is None or self._sleeping or not self.supports_sleep_to_ram():
             return self._sleeping
-        if not self.supports_sleep_to_ram():
-            return False
         start = time.perf_counter()
         try:
             self._engine_sleep()
         except Exception as exc:
-            log_info("引擎休眠失败", type(self).__name__, type(exc).__name__, exc)
+            log_info("引擎休眠失败", type(self).__name__, exc)
             return False
         self._sleeping = True
         self.release_cache()
-        log_info("引擎已休眠", type(self).__name__, "耗时秒=", round(time.perf_counter() - start, 2))
+        log_info("引擎已休眠至 RAM", type(self).__name__, f"{round(time.perf_counter() - start, 2)}s")
         return True
 
     def wake(self) -> None:
-        """唤醒 RAM 中的模型;不支持休眠的引擎无需实现。"""
         if not self._sleeping:
             return
         start = time.perf_counter()
         try:
             self._engine_wake()
         except Exception as exc:
-            log_info("引擎唤醒失败", type(self).__name__, type(exc).__name__, exc)
+            log_info("引擎唤醒失败", type(self).__name__, exc)
             raise
         self._sleeping = False
-        log_info("引擎已唤醒", type(self).__name__, "耗时秒=", round(time.perf_counter() - start, 2))
+        log_info("引擎已唤醒", type(self).__name__, f"{round(time.perf_counter() - start, 2)}s")
 
     def _engine_sleep(self) -> None:
-        """把权重挪出显存；支持休眠的子类必须实现。"""
-        raise NotImplementedError(f"{type(self).__name__} 未实现 _engine_sleep")
+        raise NotImplementedError
 
     def _engine_wake(self) -> None:
-        """把权重搬回显存；支持休眠的子类必须实现。"""
-        raise NotImplementedError(f"{type(self).__name__} 未实现 _engine_wake")
-
-    @staticmethod
-    def _accepted_engine_kwargs(engine: Any, values: dict[str, Any],
-                               excluded: set[str] | None = None) -> dict[str, Any]:
-        """只取引擎构造器明确声明的可选参数，丢弃未知键。"""
-        try:
-            parameters = inspect.signature(engine).parameters
-        except (TypeError, ValueError):
-            return {}
-        ignored = excluded or set()
-        return {key: value for key, value in values.items()
-                if key in parameters and key not in ignored}
+        raise NotImplementedError
 
     def _mark_unloaded(self) -> None:
-        """清空跨引擎共有的加载态；子类引擎卸载完成后调用。"""
         self._model = None
         self._tokenizer = None
         self._model_info = None
@@ -189,98 +155,41 @@ class baseInference(ABC):
         self._sleeping = False
         self._sleep_capable = False
 
-    def supports_prompt_cache(self) -> bool:
-        return False
-
-    def supports_kv_cache_persistence(self) -> bool:
-        return False
+    @staticmethod
+    def _accepted_engine_kwargs(engine: Any, values: dict[str, Any], excluded: set[str] | None = None) -> dict[str, Any]:
+        try:
+            params = inspect.signature(engine).parameters
+        except (TypeError, ValueError):
+            return {}
+        ignored = excluded or set()
+        return {k: v for k, v in values.items() if k in params and k not in ignored}
 
     def memory_usage(self, verbose: bool = False) -> MemoryUsage:
-        """
-        检测当前模型内存/显存占用
-
-        Args:
-            verbose: True时返回详细信息(各GPU设备、模型参数量等)
-        """
         usage = MemoryUsage()
-        if torch is not None and torch.cuda.is_available():
-            self._fill_gpu_usage(usage, verbose)
+        if torch.cuda.is_available():
+            dev = self._get_gpu_device_index()
+            usage.gpu_allocated_mb = round(torch.cuda.memory_allocated(dev) / (1024 ** 2), 1)
+            usage.gpu_reserved_mb = round(torch.cuda.memory_reserved(dev) / (1024 ** 2), 1)
+            usage.gpu_total_mb = round(torch.cuda.get_device_properties(dev).total_memory / (1024 ** 2), 1)
+            usage.gpu_free_mb = round(usage.gpu_total_mb - usage.gpu_reserved_mb, 1)
 
-        usage.process_rss_mb = round(self._get_process_rss_mb(), 1)
-        usage.system_available_mb = round(self._get_system_available_mb(), 1)
+        usage.process_rss_mb = round(psutil.Process(os.getpid()).memory_info().rss / (1024 ** 2), 1)
+        usage.system_available_mb = round(psutil.virtual_memory().available / (1024 ** 2), 1)
 
-        if verbose:
-            usage.details = usage.details or {}
-            usage.details["model_loaded"] = self.is_loaded
-            if self._model_info:
-                usage.details["model_name"] = self._model_info.name
-                usage.details["parameters"] = self._model_info.parameters
-
+        if verbose and self._model_info:
+            usage.details = {"model_name": self._model_info.name, "loaded": self.is_loaded}
         return usage
 
-    def _fill_gpu_usage(self, usage: MemoryUsage, verbose: bool) -> None:
-        """填充当前设备的 GPU 显存占用;verbose 且多卡时附加各设备明细。"""
-        device_index = self._get_gpu_device_index()
-        usage.gpu_allocated_mb = round(torch.cuda.memory_allocated(device_index) / (1024 ** 2), 1)
-        usage.gpu_reserved_mb = round(torch.cuda.memory_reserved(device_index) / (1024 ** 2), 1)
-        usage.gpu_total_mb = round(torch.cuda.get_device_properties(device_index).total_memory / (1024 ** 2), 1)
-        usage.gpu_free_mb = round(usage.gpu_total_mb - usage.gpu_reserved_mb, 1)
-        if verbose and torch.cuda.device_count() > 1:
-            usage.details = usage.details or {}
-            usage.details["gpu_devices"] = [self._gpu_device_detail(i) for i in range(torch.cuda.device_count())]
-
-    @staticmethod
-    def _gpu_device_detail(index: int) -> dict[str, Any]:
-        return {"device": index, "name": torch.cuda.get_device_properties(index).name,
-                "allocated_mb": round(torch.cuda.memory_allocated(index) / (1024 ** 2), 1),
-                "reserved_mb": round(torch.cuda.memory_reserved(index) / (1024 ** 2), 1)}
-
     def release_cache(self) -> MemoryUsage:
-        """
-        释放推理过程中产生的临时显存/内存占用 (KV cache, 临时张量等)
-        保持模型本身已加载状态不变
-
-        Returns:
-            清理后的MemoryUsage
-        """
-        if torch is not None and torch.cuda.is_available():
+        if torch.cuda.is_available():
             torch.cuda.empty_cache()
         gc.collect()
         return self.memory_usage()
 
     def _get_gpu_device_index(self) -> int:
-        """获取模型所在的GPU设备索引,子类可覆盖"""
         return 0
 
-    @staticmethod
-    def _get_process_rss_mb() -> float:
-        """获取当前进程物理内存占用(MB)"""
-        if psutil is not None:
-            return psutil.Process(os.getpid()).memory_info().rss / (1024 ** 2)
-        return baseInference._read_proc_field("/proc/self/status", "VmRSS:")
-
-    @staticmethod
-    def _get_system_available_mb() -> float:
-        """获取系统可用内存(MB)"""
-        if psutil is not None:
-            return psutil.virtual_memory().available / (1024 ** 2)
-        return baseInference._read_proc_field("/proc/meminfo", "MemAvailable:")
-
-    @staticmethod
-    def _read_proc_field(path: str, prefix: str) -> float:
-        """从 /proc 下的键值文件读取一个以 kB 为单位的字段并换算为 MB;
-        文件不存在、无权限或格式异常时返回 0(psutil 不可用时的兜底路径,仅 Linux 有效)。"""
-        try:
-            with open(path) as handle:
-                for line in handle:
-                    if line.startswith(prefix):
-                        return int(line.split()[1]) / 1024  # kB -> MB
-        except (OSError, ValueError, IndexError):
-            pass
-        return 0
-
-    def _extract_model_info(self, model_path: str, **kwargs) -> ModelInfo:
-        """从路径提取模型信息"""
+    def _extract_model_info(self, model_path: str, **kwargs: Any) -> ModelInfo:
         path = Path(model_path)
         name = path.name if path.exists() else model_path.split("/")[-1]
         return ModelInfo(
@@ -294,80 +203,66 @@ class baseInference(ABC):
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
         self.unload()
 
-    # ---------------------------------------------------------------- 生成:模板方法
-    #
-    # 默认实现覆盖"渲染 prompt 字符串 -> 单次调用引擎 -> 解析文本"这一形状,
-    # 适用于 vllm/sglang 这类整段 prompt 进、整段文本出的引擎:子类只需实现
-    # `_run_engine`。llama(GGUF)的后端是消息级 chat-completions 接口,
-    # 形状不同,完整覆盖本方法。
-
-    def generate(self, prompt: str, *, max_new_tokens: int = 512, temperature: float = 0.3,
-                top_p: float = 0.95, top_k: int = 50, repetition_penalty: float = 1.05,
-                stop_sequences: list[str] | None = None, system_prompt: str = "",
-                **kwargs: Any) -> GenerationResult:
-        """生成文本,返回GenerationResult;system_prompt 非空时作为系统角色注入"""
+    def generate(self, prompt: str, *,sampling: dict[str, Any] | None = None, system_prompt: str = "",messages: list[dict[str, Any]] | None = None, **kwargs: Any,) -> GenerationResult:
         if not self.is_loaded:
             raise RuntimeError("Model not loaded. Call load() first.")
 
-        messages = self._normalize_messages(prompt, system_prompt, kwargs)
-        rendered = self._build_chat_prompt(messages)
-        sampling = self._build_sampling(max_new_tokens, temperature, top_p, top_k,
-                                        repetition_penalty, stop_sequences, kwargs)
+        norm_messages = messages or ([{"role": "system", "content": system_prompt}] if system_prompt else []) + [{"role": "user", "content": prompt}]
+        rendered = self._build_chat_prompt(norm_messages)
+        sampling_params = self._build_sampling(sampling or {}, kwargs)
 
-        start_time = time.perf_counter()
-        text, tokens_generated, prompt_tokens = self._run_engine(rendered, sampling)
-        elapsed = time.perf_counter() - start_time
+        start = time.perf_counter()
+        text, gen_tokens, prompt_tokens = self._run_engine(rendered, sampling_params)
+        elapsed = time.perf_counter() - start
 
+        max_tokens = sampling_params.get("max_tokens", 512)
         return GenerationResult(
-            text=text, tokens_generated=tokens_generated, time_seconds=elapsed,
-            tokens_per_second=tokens_generated / elapsed if elapsed > 0 else 0,
+            text=text, tokens_generated=gen_tokens, time_seconds=elapsed,
+            tokens_per_second=gen_tokens / elapsed if elapsed > 0 else 0,
             prompt_tokens=prompt_tokens,
-            finish_reason=self._finish_reason(tokens_generated, max_new_tokens),
+            finish_reason="length" if gen_tokens >= max_tokens else "stop",
         )
 
+    def stream_generate(self,prompt: str, *,sampling: dict[str, Any] | None = None,system_prompt: str = "",messages: list[dict[str, Any]] | None = None,**kwargs: Any,) -> Iterator[str]:
+        if not self.is_loaded:
+            raise RuntimeError("Model not loaded. Call load() first.")
+        norm_messages = messages or ([{"role": "system", "content": system_prompt}] if system_prompt else []) + [{"role": "user", "content": prompt}]
+        rendered = self._build_chat_prompt(norm_messages)
+        sampling_params = self._build_sampling(sampling or {}, kwargs)
+        yield from self._run_engine_stream(rendered, sampling_params)
+
     def _run_engine(self, rendered_prompt: str, sampling: dict[str, Any]) -> tuple[str, int, int]:
-        """执行一次引擎调用,返回 (生成文本, 生成token数, prompt token数)。
+        raise NotImplementedError
 
-        使用默认 ``generate()`` 模板方法的子类(vllm/sglang)必须实现本方法;
-        完整覆盖 ``generate()`` 的子类(llama)不需要。"""
-        raise NotImplementedError(f"{type(self).__name__} 未实现 _run_engine")
-
-    @staticmethod
-    def _normalize_messages(prompt: str, system_prompt: str, kwargs: dict[str, Any]) -> list[dict[str, Any]]:
-        """兼容绕过 MsgHandler 直接调用引擎的场景(脚本/测试);
-        正常链路里 MsgHandler 已经把 prompt 统一成 messages。"""
-        messages = kwargs.get("messages")
-        if messages is not None:
-            return messages
-        messages = [{"role": "system", "content": system_prompt}] if system_prompt else []
-        return messages + [{"role": "user", "content": prompt}]
+    def _run_engine_stream(self, rendered_prompt: str, sampling: dict[str, Any]) -> Iterator[str]:
+        raise NotImplementedError
 
     def _get_tokenizer(self) -> Any:
-        """返回用于渲染 chat template 的 tokenizer 对象,子类覆盖。"""
         return self._tokenizer
 
     def _build_chat_prompt(self, messages: list[dict[str, Any]]) -> str:
-        """无工具场景:优先用 tokenizer 的 chat template 渲染完整多轮对话,不支持时退化为逐条拼接。"""
         try:
             tokenizer = self._get_tokenizer()
             return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        except (AttributeError, ValueError, TypeError):
+        except Exception:
             return "\n".join(f"{item.get('role', 'user')}: {item.get('content', '')}" for item in messages)
 
-    def _build_sampling(self, max_new_tokens: int, temperature: float, top_p: float, top_k: int,
-                        repetition_penalty: float, stop_sequences: list[str] | None,
-                        extra: dict[str, Any]) -> dict[str, Any]:
-        """组装采样参数字典,通用键按 ``_SAMPLING_KEY_MAP`` 改名,并附加
-        ``_EXTRA_SAMPLING_KEYS`` 里已知的可选采样字段(从 extra 按需摘取)。"""
-        sampling = {"max_tokens": max_new_tokens, "temperature": max(temperature, 0.01),
-                   "top_p": top_p, "top_k": top_k, "repetition_penalty": repetition_penalty,
-                   "stop": stop_sequences}
-        sampling.update({key: extra[key] for key in self._EXTRA_SAMPLING_KEYS if key in extra})
-        for old_key, new_key in self._SAMPLING_KEY_MAP.items():
-            if old_key in sampling:
-                sampling[new_key] = sampling.pop(old_key)
-        return sampling
+    def _build_sampling(self, sampling: dict[str, Any], extra: dict[str, Any]) -> dict[str, Any]:
+        merged = {
+            "max_tokens": sampling.get("max_new_tokens", sampling.get("max_tokens", 512)),
+            "temperature": max(sampling.get("temperature", 0.3), 0.01),
+            "top_p": sampling.get("top_p", 0.95),
+            "top_k": sampling.get("top_k", 50),
+            "repetition_penalty": sampling.get("repetition_penalty", 1.05),
+            "stop": sampling.get("stop_sequences"),
+        }
+        for k in self._EXTRA_SAMPLING_KEYS:
+            if k in sampling:
+                merged[k] = sampling[k]
+            elif k in extra:
+                merged[k] = extra[k]
 
-    @staticmethod
-    def _finish_reason(tokens_generated: int, max_new_tokens: int) -> str:
-        return "length" if tokens_generated >= max_new_tokens else "stop"
+        for old_k, new_k in self._SAMPLING_KEY_MAP.items():
+            if old_k in merged:
+                merged[new_k] = merged.pop(old_k)
+        return merged

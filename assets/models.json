@@ -12,7 +12,7 @@
       "top_k": 50,
       "repetition_penalty": 1.05,
       "max_tokens": 512,
-      "stop_sequences": [ ],
+      "stop_sequences": [],
       "mirostat": 0,
       "system_prompt": ""
     }
@@ -20,11 +20,7 @@
   "models": {
     "qwen3.8-27B": {
       "path": "D:/ai/models/Qwen3.8-27B-Uncensored-GGUF/Qwen3.8-27B-Uncensored-IQ4_XS.gguf",
-      "engine": "llama",
-      "estimated_vram_mb": 14890,
-      "draft": null,
       "mtp": false,
-      "lora": null,
       "load": {
         "dtype": "bfloat16",
         "context_length": 32768,
@@ -45,12 +41,14 @@
         "top_k": 50,
         "repetition_penalty": 1.05,
         "max_tokens": 8192,
-        "stop_sequences": [ ],
+        "stop_sequences": [],
         "mirostat": 0,
         "system_prompt": "",
         "presence_penalty": 0,
         "frequency_penalty": 0
-      }
+      },
+      "estimated_vram_mb": 14890,
+      "engine": "llama"
     }
   }
 }

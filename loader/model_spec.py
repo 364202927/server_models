@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-import os,sys
+import os, sys
 from pathlib import Path
 from typing import Any
 from ..utils.common import aContainB
@@ -9,8 +9,6 @@ from ..utils.common import aContainB
 
 @dataclass
 class ModelLoadConfig:
-    """模型第一次加载时使用的参数。"""
-
     dtype: str | None = None
     context_length: int | None = None
     gpu_memory_utilization: float | None = None
@@ -90,8 +88,6 @@ LOAD_ARG_FIELDS = {"max_model_len": "context_length", "tensor_parallel_size": "t
 
 @dataclass
 class ModelSpec:
-    """来自 ``assets/models.json`` 的模型定义。"""
-
     model_id: str
     path: str
     source_path: str | None = field(default=None, repr=False, compare=False)
@@ -116,7 +112,6 @@ class ModelSpec:
         return Path(self.path)
 
     def detect_engine(self) -> str | None:
-        """根据配置或文件路径特征自动推断推理引擎。"""
         if self.engine:
             return self.engine.strip().lower()
         path = self.path_obj
@@ -133,7 +128,6 @@ class ModelSpec:
         return None
 
     def resolve_loader_kwargs(self, engine_name: str) -> dict[str, Any]:
-        """合并默认配置并补齐缺失参数，同步回内部 load 结构。"""
         load_kwargs = self.load.loader_kwargs()
         defaults = {**LOAD_DEFAULTS, **ENGINE_LOAD_DEFAULTS.get(engine_name, {})}
         for name, value in defaults.items():
@@ -145,7 +139,6 @@ class ModelSpec:
         return load_kwargs
 
     def apply_effective_load(self, effective: dict[str, Any], model_info: Any = None) -> None:
-        """记录本次实际生效的参数。"""
         if model_info:
             effective.setdefault("context_length", model_info.context_length)
             effective.setdefault("dtype", model_info.dtype)
@@ -162,7 +155,6 @@ class ModelSpec:
         self.load_present = True
 
     def update_estimated_vram(self, used_before: int, current_used: int, force: bool = False) -> bool:
-        """根据显存差值更新实测占用，返回是否更新。"""
         if self.estimated_vram_mb is not None and not force:
             return False
         delta = max(0, current_used - used_before)
@@ -172,13 +164,13 @@ class ModelSpec:
         return True
 
     def required_vram_mb(self) -> int | None:
-        """按实测值或磁盘大小返回显存需求。"""
+        """显存准入估算：在静态实测值或磁盘大小基础上留出 1024MB 运行时余量。"""
         if self.estimated_vram_mb is not None:
-            return int(self.estimated_vram_mb)
+            return int(self.estimated_vram_mb + 1024)
         return self.size_on_disk_mb()
 
     def size_on_disk_mb(self) -> int | None:
-        """按权重文件大小估算显存下界。"""
+        """根据权重文件大小按 1.25x 估算显存占用，包含上下文开销与基础 KV Cache。"""
         path = self.path_obj
         try:
             if path.is_file():
@@ -194,10 +186,9 @@ class ModelSpec:
                 return None
         except OSError:
             return None
-        return int(total / (1024 ** 2) * 1.1) if total > 0 else None
+        return int(total / (1024 ** 2) * 1.25) if total > 0 else None
 
     def to_config_node(self) -> dict[str, Any]:
-        """将当前模型配置序列化为 dict。"""
         node: dict[str, Any] = {
             "path": self.source_path or self.path,
             "mtp": self.mtp,
@@ -217,7 +208,6 @@ class ModelSpec:
 
 
 def load_model_specs(config: dict[str, Any]) -> dict[str, ModelSpec]:
-    """读取 models 配置节点。"""
     result: dict[str, ModelSpec] = {}
     models = config.get("models", {})
     if not isinstance(models, dict):

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import copy,gc,threading,time
+import copy, gc, threading, time
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -54,18 +54,13 @@ class ModelsMgr:
         self.settings: dict[str, Any] = copy.deepcopy(defaults) if isinstance(defaults, dict) else {}
         self.specs: dict[str, ModelSpec] = load_model_specs(config)
         self.runtime: dict[str, RuntimeModel] = {}
-
-        # 轻量元数据锁：仅保护 self.runtime / specs 状态字典在 Web 轮询时的并发安全
         self._meta_lock = threading.Lock()
 
-        # 32GB GPU + 96GB RAM 保护阈值
         self.ram_reserve_mb = 8192
         self.gpu_reserve_mb = 1024
 
         server = self.settings.get("server", {})
         self.sleep_time = int(server.get("sleepTime", 600)) if isinstance(server, dict) else 600
-
-    # ---------------------------------------------------------------- 配置与状态
 
     def generation_params(self, model_id: str) -> dict[str, Any]:
         params = dict(self.settings.get("generation", {}))
@@ -90,8 +85,6 @@ class ModelsMgr:
         with self._meta_lock:
             return self.runtime.setdefault(model_id, RuntimeModel(self.specs[model_id]))
 
-    # ---------------------------------------------------------------- 显存硬隔离准入与释放
-
     def _free_for(self, spec: ModelSpec) -> bool:
         required = spec.required_vram_mb()
         if required is None or not detect_gpu():
@@ -99,7 +92,6 @@ class ModelsMgr:
         return check_gpu_memory(required, self.gpu_reserve_mb).allowed
 
     def _clean_gpu_cache(self) -> None:
-        """强制清理 PyTorch/CUDA 孤立显存缓存。"""
         gc.collect()
         try:
             import torch
@@ -110,7 +102,6 @@ class ModelsMgr:
             pass
 
     def _admit(self, spec: ModelSpec) -> None:
-        """准入：单卡优先保证独占，如果显存不够，将其他正在运行的模型休眠到 RAM。"""
         if self._free_for(spec):
             return
         self._reclaim_to_ram(exclude=spec.model_id)
@@ -123,7 +114,6 @@ class ModelsMgr:
         )
 
     def _reclaim_to_ram(self, exclude: str) -> None:
-        """将处于 RUNNING 的其他模型移入 RAM。"""
         with self._meta_lock:
             candidates = [
                 item for model_id, item in self.runtime.items()
@@ -138,7 +128,6 @@ class ModelsMgr:
                 return
 
     def _reclaim_ram(self, exclude: str, required_mb: int) -> bool:
-        """RAM (96GB) 不足时，按 LRU 彻底卸载最老的已休眠模型。"""
         with self._meta_lock:
             candidates = [
                 item for model_id, item in self.runtime.items()
@@ -154,7 +143,6 @@ class ModelsMgr:
         return check_ram(required_mb, self.ram_reserve_mb).allowed
 
     def _release(self, runtime: RuntimeModel) -> None:
-        """单模型腾退：优先休眠到 RAM；RAM 也不够时彻底 unload。"""
         model_id = runtime.spec.model_id
         required_mb = int(runtime.spec.required_vram_mb() or 0)
         ram_ok = check_ram(required_mb, self.ram_reserve_mb).allowed
@@ -169,8 +157,6 @@ class ModelsMgr:
 
         log_info("RAM 不足或不支持休眠，彻底卸载:", model_id)
         self._unload_runtime(model_id)
-
-    # ---------------------------------------------------------------- 加载与唤醒
 
     def ensure_loaded(self, model_id: str) -> RuntimeModel:
         runtime = self._get_runtime(model_id)
@@ -210,7 +196,7 @@ class ModelsMgr:
 
             engine = spec.detect_engine()
             if not engine:
-                error("无法确定推理框架，请在 models.json 配置 load.engine: model=", spec.model_id)
+                error("无法确定推理框架: model=", spec.model_id)
                 with self._meta_lock:
                     runtime.state, runtime.error = "UNLOADED", "无法确定推理框架"
                 return runtime
@@ -226,9 +212,8 @@ class ModelsMgr:
             engine_name = type(runtime.loader).__name__.lower()
             load_kwargs = spec.resolve_loader_kwargs(engine_name)
 
-            runtime.loader.load(spec.path, draft=spec.draft, mtp=spec.mtp, lora=spec.lora, **load_kwargs)
+            runtime.loader.load(spec.path,config=load_kwargs, draft=spec.draft, lora=spec.lora)
 
-            # 吸收显存与有效参数
             if spec.update_estimated_vram(used_before, query_gpu_used_mb(), force=runtime.needs_remeasure):
                 runtime.needs_remeasure = False
                 log_info("模型显存实测:", spec.model_id, f"{spec.estimated_vram_mb} MB")
@@ -263,23 +248,21 @@ class ModelsMgr:
         tmp_path.replace(self.config_path)
         log_info("模型配置已补全并写入磁盘", spec.model_id)
 
-    # ---------------------------------------------------------------- 推理
-
-    def generate(self, model_id: str, prompt: str, **kwargs: Any) -> GenerationResult:
-        # 单 Worker 线程独占执行，彻底移除了 generate 全程的大锁
+    def generate(self, model_id: str, prompt: str, *, sampling: dict[str, Any] | None = None, system_prompt: str = "", messages: list[dict[str, Any]] | None = None, **kwargs: Any) -> GenerationResult:
         runtime = self.ensure_loaded(model_id)
         if runtime.loader is None:
             raise RuntimeError(f"模型 {model_id} 未就绪")
 
         runtime.active = True
-        log_info("开始推理:", model_id, " prompt_chars:", len(prompt),
-                 " messages:", len(kwargs.get("messages") or []),
-                 " max_new_tokens:", kwargs.get("max_new_tokens"))
         try:
-            result = runtime.loader.generate(prompt, **kwargs)
+            result = runtime.loader.generate(
+                prompt,
+                sampling=sampling,
+                system_prompt=system_prompt,
+                messages=messages,
+                **kwargs,
+            )
             runtime.last_used_at = time.time()
-            log_info("生成完成:", model_id, " tokens:", result.tokens_generated,
-                     " seconds:", round(result.time_seconds, 2))
             return result
         finally:
             runtime.active = False
@@ -322,8 +305,6 @@ class ModelsMgr:
         tmp_path.replace(self.config_path)
         log_info("生成参数已持久化:", model_id, changes)
         return merged
-
-    # ---------------------------------------------------------------- 释放与清理
 
     def sleep(self, model_id: str) -> bool:
         runtime = self._get_runtime(model_id)

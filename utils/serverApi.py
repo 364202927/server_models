@@ -12,7 +12,8 @@ from pydantic import BaseModel, ConfigDict, Field
 from starlette.responses import JSONResponse, StreamingResponse
 
 from ..loader.models_mgr import ModelsMgr
-from ..msgHandler import AdminRequest, ChatRequest, MsgHandler, normalize_generation_params, resolve_think_level
+from ..loader.chatDataFilter import normalize_generation_params, resolve_think_level
+from ..msgHandler import AdminRequest, ChatRequest, MsgHandler
 
 
 _GENERATION_FIELDS = {
@@ -271,7 +272,7 @@ class serverApi:
             self.app,
             host=str(settings.get("host", "0.0.0.0")),
             port=self._port(),
-            log_level="info",  #warning,error就不会打印了
+            log_level="warning",  #info,warning,error就不会打印了
         )
         self._server = uvicorn.Server(config)
         self._server.install_signal_handlers = lambda: None
