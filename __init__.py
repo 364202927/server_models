@@ -1,7 +1,7 @@
 __version__ = "0.1.0"
 from .utils.hardware import detect_hardware, print_hardware_info, HardwareInfo
 from .loader import (
-    MemoryUsage, ModelSpec, ModelsMgr, RuntimeModel, baseInference,
+    MemoryUsage, ModelSpec, baseInference,
     load_model_specs, normalize_model_path,
 )
 

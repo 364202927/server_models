@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 import importlib
-import time
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 from ...utils.hardware import detect_gpu
-from ...utils.common import info as log_info, error
+from ...utils.common import error
 from ..chatDataFilter import flatten_messages
 from .baseInference import baseInference
 
@@ -28,13 +27,8 @@ def _gpu_offload_supported() -> bool | None:
 
 
 class llama(baseInference):
-    """llama-cpp-python GGUF 推理引擎：只负责物理加载与调用。"""
+    """llama-cpp-python GGUF 推理引擎"""
 
-    _SAMPLING_KEY_MAP = {"repetition_penalty": "repeat_penalty", "mirostat": "mirostat_mode"}
-    _EXTRA_SAMPLING_KEYS = (
-        "min_p", "seed", "mirostat", "mirostat_eta", "mirostat_tau",
-        "repeat_last_n", "tfs_z", "logit_bias", "frequency_penalty", "presence_penalty",
-    )
     _FALLBACK_N_CTX = 8192
     _CONTEXT_SAFETY_MARGIN = 32
     _MIN_GENERATION_TOKENS = 16
@@ -57,59 +51,50 @@ class llama(baseInference):
             raise ValueError(f"不是有效的 GGUF 文件: {model_path}")
         return source
 
-    def load(
-        self,
-        model_path: str,
-        *,
-        config: dict[str, Any] | None = None,
-        draft: str | None = None,
-        lora: str | None = None,
-        **kwargs: Any,
-    ) -> "llama":
+    def load(self, model_path: str, load_cfg: dict[str, Any]) -> "llama":
         if Llama is None:
             raise RuntimeError("GGUF 模型需要安装 llama-cpp-python")
 
-        cfg = {**(config or {}), **kwargs}
         source = self._resolve_gguf_file(model_path)
-        gpu_layers = int(cfg.get("gpu_offload_layers", -1))
-
+        gpu_layers = int(load_cfg.get("gpu_offload_layers", -1))
         if gpu_layers != 0 and detect_gpu() and _gpu_offload_supported() is False:
             raise RuntimeError("当前 llama-cpp-python 未启用 CUDA，请安装 CUDA 构建版本。")
 
-        mtp = cfg.pop("mtp", False)
-        if draft and mtp:
-            raise ValueError("draft 与 mtp 不能同时启用")
+        # 计算并对齐 context 长度
+        context_val = load_cfg.get("context", 0)
+        calculated_n_ctx = llama._FALLBACK_N_CTX
+        if "context_memory_mb" in load_cfg and load_cfg["context_memory_mb"] > 0:
+            # 依据显存换算并对齐到 512 的整数倍
+            calculated_n_ctx = max(2048, int(load_cfg["context_memory_mb"] * 128 // 512 * 512))
+        elif context_val and context_val > 0:
+            calculated_n_ctx = int(context_val)
 
         llm_kwargs: dict[str, Any] = {
             "model_path": str(source),
             "n_gpu_layers": gpu_layers,
-            "n_ctx": int(cfg.get("max_model_len") or llama._FALLBACK_N_CTX),
-            "n_batch": int(cfg.get("batch_size", 512)),
-            "verbose": bool(cfg.get("verbose", False)),
-            "use_mlock": True,
+            "n_ctx": calculated_n_ctx,
+            "n_batch": int(load_cfg.get("batch_size", 512)),
+            "verbose": False,
+            "use_mlock": bool(load_cfg.get("use_mlock", True)),
         }
-        if cfg.get("flash_attention") is not None:
-            llm_kwargs["flash_attn"] = bool(cfg["flash_attention"])
-        if cfg.get("gpu_split"):
-            llm_kwargs["tensor_split"] = cfg["gpu_split"]
+        if "flash_attention" in load_cfg:
+            llm_kwargs["flash_attn"] = bool(load_cfg["flash_attention"])
 
-        optional_kwargs = self._accepted_engine_kwargs(
-            Llama, cfg, {"model_path", "n_gpu_layers", "n_ctx", "n_batch", "verbose", "batch_size", "flash_attention", "gpu_split"}
-        )
-        llm_kwargs.update(optional_kwargs)
-
+        lora = load_cfg.get("lora")
         if lora:
-            llm_kwargs["lora_path"] = lora
-            llm_kwargs["lora_scale"] = cfg.get("lora_scale", 1.0)
-            if cfg.get("lora_base"):
-                llm_kwargs["lora_base"] = cfg["lora_base"]
+            llm_kwargs["lora_path"] = str(lora)
 
+        # draft 处理：[0] 为主草稿模型，[1] 为辅助推测解码
+        draft_list = load_cfg.get("draft") or []
+        if isinstance(draft_list, str):
+            draft_list = [draft_list]
         self._saved_draft_kwargs = None
-        if draft:
-            draft_source = self._resolve_gguf_file(draft)
+
+        if draft_list and len(draft_list) > 0 and draft_list[0]:
+            main_draft = self._resolve_gguf_file(draft_list[0])
             self._saved_draft_kwargs = {
-                "model_path": str(draft_source),
-                "n_gpu_layers": int(cfg.get("draft_gpu_offload_layers", 0)),
+                "model_path": str(main_draft),
+                "n_gpu_layers": int(load_cfg.get("gpu_offload_layers", 0)),
             }
             self._draft_model = Llama(**self._saved_draft_kwargs)
             llm_kwargs["draft_model"] = self._draft_model
@@ -117,16 +102,13 @@ class llama(baseInference):
         self._saved_llm_kwargs = {k: v for k, v in llm_kwargs.items() if k != "draft_model"}
         self._model = Llama(**llm_kwargs)
         self._sleep_capable = True
-        self._model_info = self._extract_model_info(str(source), dtype=cfg.get("dtype", "float16"))
-        self._model_info.context_length = int(self._model.n_ctx())
 
         self._effective_load = {
             "engine": "llama",
-            "dtype": self._model_info.dtype,
-            "context_length": self._model_info.context_length,
+            "context_length": int(self._model.n_ctx()),
             "gpu_offload_layers": llm_kwargs["n_gpu_layers"],
             "batch_size": llm_kwargs["n_batch"],
-            "draft": draft,
+            "draft": draft_list,
             "lora": lora,
         }
         return self
@@ -148,22 +130,36 @@ class llama(baseInference):
     def _response(
         self,
         messages: list[dict[str, Any]],
-        sampling: dict[str, Any],
-        tools: list[dict[str, Any]] | None = None,
-        **kwargs: Any,
+        gen_cfg: dict[str, Any],
     ) -> tuple[str, int, int, list[dict[str, Any]], str]:
-        """纯粹物理调用：输入经过 baseInference 管道预清洗，此处保持极简。"""
-        max_tokens = self._clamp_to_context(messages, sampling.get("max_tokens", 512))
-        sampling["max_tokens"] = max_tokens
+        cfg = dict(gen_cfg)
+        max_tokens = self._clamp_to_context(messages, int(cfg.pop("max_tokens", 512)))
+        cfg["max_tokens"] = max_tokens
 
+        # 1. 字段映射对齐（llama-cpp-python 专有键名）
+        if "repetition_penalty" in cfg:
+            cfg["repeat_penalty"] = cfg.pop("repetition_penalty")
+        if "mirostat" in cfg:
+            cfg["mirostat_mode"] = cfg.pop("mirostat")
+
+        tools = cfg.pop("tools", None)
+        tool_choice = cfg.pop("tool_choice", None)
         extra: dict[str, Any] = {}
         if tools:
             extra["tools"] = tools
-        if kwargs.get("tool_choice"):
-            extra["tool_choice"] = kwargs["tool_choice"]
+        if tool_choice:
+            extra["tool_choice"] = tool_choice
+
+        # 2. 过滤底层不支持的参数，避免 TypeError 崩溃
+        import inspect
+        try:
+            valid_params = inspect.signature(self._model.create_chat_completion).parameters
+            filtered_cfg = {k: v for k, v in cfg.items() if k in valid_params}
+        except Exception:
+            filtered_cfg = cfg
 
         try:
-            result = self._model.create_chat_completion(messages=messages, **extra, **sampling)
+            result = self._model.create_chat_completion(messages=messages, **extra, **filtered_cfg)
             choice = result["choices"][0]
             message = choice["message"]
             text = str(message.get("content") or "")
@@ -175,7 +171,12 @@ class llama(baseInference):
         except Exception as exc:
             error("原生模板推理异常，回退纯文本补全", type(exc).__name__, exc)
             flat = flatten_messages(messages)
-            result = self._model(flat, **sampling)
+            try:
+                call_params = inspect.signature(self._model.__call__).parameters
+                call_cfg = {k: v for k, v in filtered_cfg.items() if k in call_params}
+            except Exception:
+                call_cfg = filtered_cfg
+            result = self._model(flat, **call_cfg)
             text = str(result["choices"][0].get("text", ""))
             tokens = len(self._model.tokenize(text.encode("utf-8")))
             prompt_tokens = len(self._model.tokenize(flat.encode("utf-8")))
@@ -184,44 +185,12 @@ class llama(baseInference):
 
         return text, tokens, prompt_tokens, calls, finish_reason
 
-    def stream_generate(
-        self,
-        prompt: str,
-        *,
-        sampling: dict[str, Any] | None = None,
-        system_prompt: str = "",
-        messages: list[dict[str, Any]] | None = None,
-        **kwargs: Any,
-    ) -> Iterator[str]:
-        if not self.is_loaded:
-            raise RuntimeError("Model not loaded. Call load() first.")
-
-        norm_messages = messages or ([{"role": "system", "content": system_prompt}] if system_prompt else []) + [{"role": "user", "content": prompt}]
-        sampling_params = self._build_sampling(sampling or {}, kwargs)
-        max_new_tokens = self._clamp_to_context(norm_messages, sampling_params.get("max_tokens", 512))
-        sampling_params["max_tokens"] = max_new_tokens
-        sampling_params["stream"] = True
-
-        try:
-            stream_iter = self._model.create_chat_completion(messages=norm_messages, **sampling_params)
-            for chunk in stream_iter:
-                delta = chunk["choices"][0].get("delta", {})
-                content = delta.get("content")
-                if content:
-                    yield content
-        except Exception:
-            flat = flatten_messages(norm_messages)
-            for chunk in self._model(flat, **sampling_params):
-                text = chunk["choices"][0].get("text", "")
-                if text:
-                    yield text
-
     def _clamp_to_context(self, messages: list[dict[str, Any]], max_new_tokens: int) -> int:
         n_ctx = self._model.n_ctx()
         prompt_tokens = self.count_tokens(messages)
         available = n_ctx - prompt_tokens - self._CONTEXT_SAFETY_MARGIN
         if available < self._MIN_GENERATION_TOKENS:
-            raise ValueError(f"上下文不足: prompt约 {prompt_tokens} token, 窗口大小 {n_ctx} token")
+            raise ValueError(f"上下文不足: prompt 约 {prompt_tokens} token, 窗口大小 {n_ctx} token")
         return min(max_new_tokens, available)
 
     def _engine_sleep(self) -> None:
@@ -240,9 +209,6 @@ class llama(baseInference):
             if self._draft_model:
                 kw["draft_model"] = self._draft_model
             self._model = Llama(**kw)
-
-    def sleep_holds_ram(self) -> bool:
-        return False
 
     def _unload_engine(self) -> None:
         self._engine_sleep()

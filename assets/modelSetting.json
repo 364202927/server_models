@@ -1,0 +1,56 @@
+{
+  "template": {
+    "load": {
+      "mtp": false,
+      "lora": "",
+      "draft": [],
+      "context": 0,
+      "think": 0,
+      "batch_size": 512,
+      "gpu_offload_layers": -1,
+      "tensor_parallel": 1,
+      "dtype": "bfloat16"
+    },
+    "generation": {
+      "temperature": 0.3,
+      "top_p": 0.95,
+      "top_k": 50,
+      "repetition_penalty": 1.05,
+      "max_tokens": 4096,
+      "stop": [],
+      "system_prompt": ""
+    }
+  },
+  "llama": {
+    "load": {
+      "flash_attention": true,
+      "use_mlock": true
+    },
+    "generation": {
+      "min_p": 0.05,
+      "mirostat": 0
+    }
+  },
+  "vllm": {
+    "load": {
+      "gpu_memory_utilization": 0.9,
+      "enable_sleep_mode": true,
+      "trust_remote_code": true
+    },
+    "generation": {
+      "presence_penalty": 0.0,
+      "frequency_penalty": 0.0
+    }
+  },
+  "sglang": {
+    "load": {
+      "gpu_memory_utilization": 0.9,
+      "enable_memory_saver": true,
+      "trust_remote_code": true
+    },
+    "generation": {
+      "presence_penalty": 0.0,
+      "frequency_penalty": 0.0
+    }
+  }
+}

@@ -5,4 +5,5 @@ from .model_spec import ModelSpec, load_model_specs, normalize_model_path
 from .models_mgr import ModelsMgr, RuntimeModel
 
 __all__ = ["baseInference", "MemoryUsage",
-           "ModelSpec", "load_model_specs", "normalize_model_path", "ModelsMgr", "RuntimeModel"]
+           "ModelSpec", "load_model_specs", "normalize_model_path",
+           "ModelsMgr", "RuntimeModel"]

@@ -1,39 +1,17 @@
 from __future__ import annotations
 
 import gc
-import inspect
 import os
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any, Iterator
 
 import psutil
 import torch
 
-from ...utils.common import info as log_info, error
+from ...utils.common import info as log_info
 from ..chatDataFilter import chatDataFilter
-
-
-def detect_model_type(name: str) -> str:
-    lowered = name.lower()
-    for marker in ("qwen", "llama", "mistral", "deepseek", "yi", "glm", "baichuan"):
-        if marker in lowered:
-            return marker
-    return "unknown"
-
-
-@dataclass
-class ModelInfo:
-    name: str
-    path: str
-    model_type: str
-    quantization: str | None = None
-    dtype: str = "float16"
-    parameters: str = "unknown"
-    context_length: int = 4096
-    extra: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -55,26 +33,17 @@ class MemoryUsage:
     gpu_free_mb: float = 0
     process_rss_mb: float = 0
     system_available_mb: float = 0
-    details: dict[str, Any] | None = None
 
 
 class baseInference(ABC):
-    """推理框架抽象基类：采用模板方法模式管控全局生命周期。"""
-
-    _SAMPLING_KEY_MAP: dict[str, str] = {}
-    _EXTRA_SAMPLING_KEYS: tuple[str, ...] = ()
+    """推理框架抽象基类：入参规范收敛。"""
 
     def __init__(self) -> None:
         self._model = None
         self._tokenizer = None
-        self._model_info: ModelInfo | None = None
         self._effective_load: dict[str, Any] = {}
         self._sleeping = False
         self._sleep_capable = False
-
-    @property
-    def model_info(self) -> ModelInfo | None:
-        return self._model_info
 
     @property
     def is_loaded(self) -> bool:
@@ -89,15 +58,8 @@ class baseInference(ABC):
         return {"text"}
 
     @abstractmethod
-    def load(
-        self,
-        model_path: str,
-        *,
-        config: dict[str, Any] | None = None,
-        draft: str | None = None,
-        lora: str | None = None,
-        **kwargs: Any,
-    ) -> "baseInference":
+    def load(self, model_path: str, load_cfg: dict[str, Any]) -> "baseInference":
+        """仅需 2 个入参：模型路径与完整加载字典。"""
         pass
 
     @abstractmethod
@@ -111,18 +73,8 @@ class baseInference(ABC):
     def count_tokens(self, text_or_messages: str | list[dict[str, Any]]) -> int:
         pass
 
-    @property
-    def is_sleeping(self) -> bool:
-        return self._sleeping
-
-    def supports_sleep_to_ram(self) -> bool:
-        return self._sleep_capable
-
-    def sleep_holds_ram(self) -> bool:
-        return True
-
     def sleep_to_ram(self) -> bool:
-        if self._model is None or self._sleeping or not self.supports_sleep_to_ram():
+        if self._model is None or self._sleeping or not self._sleep_capable:
             return self._sleeping
         start = time.perf_counter()
         try:
@@ -156,35 +108,9 @@ class baseInference(ABC):
     def _mark_unloaded(self) -> None:
         self._model = None
         self._tokenizer = None
-        self._model_info = None
         self._effective_load = {}
         self._sleeping = False
         self._sleep_capable = False
-
-    @staticmethod
-    def _accepted_engine_kwargs(engine: Any, values: dict[str, Any], excluded: set[str] | None = None) -> dict[str, Any]:
-        try:
-            params = inspect.signature(engine).parameters
-        except (TypeError, ValueError):
-            return {}
-        ignored = excluded or set()
-        return {k: v for k, v in values.items() if k in params and k not in ignored}
-
-    def memory_usage(self, verbose: bool = False) -> MemoryUsage:
-        usage = MemoryUsage()
-        if torch.cuda.is_available():
-            dev = self._get_gpu_device_index()
-            usage.gpu_allocated_mb = round(torch.cuda.memory_allocated(dev) / (1024 ** 2), 1)
-            usage.gpu_reserved_mb = round(torch.cuda.memory_reserved(dev) / (1024 ** 2), 1)
-            usage.gpu_total_mb = round(torch.cuda.get_device_properties(dev).total_memory / (1024 ** 2), 1)
-            usage.gpu_free_mb = round(usage.gpu_total_mb - usage.gpu_reserved_mb, 1)
-
-        usage.process_rss_mb = round(psutil.Process(os.getpid()).memory_info().rss / (1024 ** 2), 1)
-        usage.system_available_mb = round(psutil.virtual_memory().available / (1024 ** 2), 1)
-
-        if verbose and self._model_info:
-            usage.details = {"model_name": self._model_info.name, "loaded": self.is_loaded}
-        return usage
 
     def release_cache(self) -> MemoryUsage:
         if torch.cuda.is_available():
@@ -192,59 +118,43 @@ class baseInference(ABC):
         gc.collect()
         return self.memory_usage()
 
-    def _get_gpu_device_index(self) -> int:
-        return 0
+    def memory_usage(self) -> MemoryUsage:
+        usage = MemoryUsage()
+        if torch.cuda.is_available():
+            usage.gpu_allocated_mb = round(torch.cuda.memory_allocated(0) / (1024 ** 2), 1)
+            usage.gpu_reserved_mb = round(torch.cuda.memory_reserved(0) / (1024 ** 2), 1)
+            usage.gpu_total_mb = round(torch.cuda.get_device_properties(0).total_memory / (1024 ** 2), 1)
+            usage.gpu_free_mb = round(usage.gpu_total_mb - usage.gpu_reserved_mb, 1)
 
-    def _extract_model_info(self, model_path: str, **kwargs: Any) -> ModelInfo:
-        path = Path(model_path)
-        name = path.name if path.exists() else model_path.split("/")[-1]
-        return ModelInfo(
-            name=name, path=model_path, model_type=detect_model_type(name),
-            quantization=kwargs.get("quantization"), dtype=kwargs.get("dtype", "float16"),
-        )
+        usage.process_rss_mb = round(psutil.Process(os.getpid()).memory_info().rss / (1024 ** 2), 1)
+        usage.system_available_mb = round(psutil.virtual_memory().available / (1024 ** 2), 1)
+        return usage
 
-    def __enter__(self) -> "baseInference":
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
-        self.unload()
-
-    # 核心模板方法：禁止子类重写 generate，把控完整的预清洗、执行与后清洗
     def generate(
         self,
-        prompt: str,
-        *,
-        sampling: dict[str, Any] | None = None,
-        messages: list[dict[str, Any]] | None = None,
-        tools: list[dict[str, Any]] | None = None,
-        system_prompt: str = "",
-        **kwargs: Any,
+        messages: list[dict[str, Any]],
+        gen_cfg: dict[str, Any] | None = None,
     ) -> GenerationResult:
+        """核心模板方法：仅 2 个入参。"""
         if not self.is_loaded:
             raise RuntimeError("Model not loaded. Call load() first.")
 
-        sampling_params = self._build_sampling(sampling or {}, kwargs)
+        cfg = dict(gen_cfg or {})
+        system_instruction = str(cfg.pop("system_prompt", "") or "")
 
-        # 1. 前置清洗管道：彻底剥离旧 think、清理空标签、对齐 mapping 结构
         cleaned_messages = chatDataFilter.preprocess_messages(
             messages=messages,
             supported_modalities=self.supported_modalities,
-            default_system=system_prompt,
-            user_prompt=prompt,
+            system_instruction=system_instruction,
         )
 
         start = time.perf_counter()
-
-        # 2. 调用物理执行方法
         raw_text, gen_tokens, prompt_tokens, calls, finish_reason = self._response(
             messages=cleaned_messages,
-            sampling=sampling_params,
-            tools=tools,
-            **kwargs,
+            gen_cfg=cfg,
         )
         elapsed = time.perf_counter() - start
 
-        # 3. 后置清洗、状态纠偏与 ToolCall 补救提取
         final_text, final_calls, final_reason = chatDataFilter.postprocess_result(
             raw_text, calls, finish_reason
         )
@@ -263,60 +173,16 @@ class baseInference(ABC):
     def _response(
         self,
         messages: list[dict[str, Any]],
-        sampling: dict[str, Any],
-        tools: list[dict[str, Any]] | None = None,
-        **kwargs: Any,
+        gen_cfg: dict[str, Any],
     ) -> tuple[str, int, int, list[dict[str, Any]], str]:
-        """子类唯一需要实现的物理执行接口，只负责与底层引擎交互。"""
+        """子类物理调用：仅 2 个入参。"""
         pass
 
-    def stream_generate(
-        self,
-        prompt: str,
-        *,
-        sampling: dict[str, Any] | None = None,
-        system_prompt: str = "",
-        messages: list[dict[str, Any]] | None = None,
-        **kwargs: Any,
-    ) -> Iterator[str]:
-        if not self.is_loaded:
-            raise RuntimeError("Model not loaded. Call load() first.")
-        norm_messages = messages or ([{"role": "system", "content": system_prompt}] if system_prompt else []) + [{"role": "user", "content": prompt}]
-        rendered = self._build_chat_prompt(norm_messages)
-        sampling_params = self._build_sampling(sampling or {}, kwargs)
-        yield from self._run_engine_stream(rendered, sampling_params)
-
-    def _run_engine_stream(self, rendered_prompt: str, sampling: dict[str, Any]) -> Iterator[str]:
-        raise NotImplementedError
-
-    def _get_tokenizer(self) -> Any:
-        return self._tokenizer
-
     def _build_chat_prompt(self, messages: list[dict[str, Any]]) -> str:
+        tokenizer = getattr(self, "_tokenizer", None)
         try:
-            tokenizer = self._get_tokenizer()
             if tokenizer and hasattr(tokenizer, "apply_chat_template"):
                 return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         except Exception:
             pass
         return "\n".join(f"{item.get('role', 'user')}: {item.get('content', '')}" for item in messages)
-
-    def _build_sampling(self, sampling: dict[str, Any], extra: dict[str, Any]) -> dict[str, Any]:
-        merged = {
-            "max_tokens": sampling.get("max_new_tokens", sampling.get("max_tokens", 512)),
-            "temperature": max(sampling.get("temperature", 0.3), 0.01),
-            "top_p": sampling.get("top_p", 0.95),
-            "top_k": sampling.get("top_k", 50),
-            "repetition_penalty": sampling.get("repetition_penalty", 1.05),
-            "stop": sampling.get("stop_sequences"),
-        }
-        for k in self._EXTRA_SAMPLING_KEYS:
-            if k in sampling:
-                merged[k] = sampling[k]
-            elif k in extra:
-                merged[k] = extra[k]
-
-        for old_k, new_k in self._SAMPLING_KEY_MAP.items():
-            if old_k in merged:
-                merged[new_k] = merged.pop(old_k)
-        return merged

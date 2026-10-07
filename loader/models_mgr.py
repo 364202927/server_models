@@ -1,7 +1,10 @@
 from __future__ import annotations
 
-import copy, gc, threading, time
-from dataclasses import dataclass, field, replace
+import copy
+import gc
+import threading
+import time
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -9,13 +12,8 @@ from typing import Any
 from ..utils.hardware import check_gpu_memory, check_ram, detect_gpu, query_gpu_used_mb
 from ..utils.common import info as log_info, readFile, writeFile, error, require
 from .llmFramework.baseInference import GenerationResult, baseInference
-from .model_spec import LOAD_KEYS, ModelSpec, load_model_specs
+from .model_spec import ModelSpec, load_model_specs
 
-GENERATION_DEFAULTS: dict[str, Any] = {
-    "system_prompt": "",
-    "presence_penalty": 0,
-    "frequency_penalty": 0,
-}
 
 @dataclass
 class RuntimeModel:
@@ -42,34 +40,68 @@ class RuntimeModel:
 
 
 class ModelsMgr:
-    """模型实例管理器（针对单卡串行任务优化）。"""
+    """模型实例管理器：双 JSON 闭包参数驱动。"""
 
-    def __init__(self, config_path: str = "assets/models.json") -> None:
+    def __init__(
+        self,
+        config_path: str = "assets/models.json",
+        settings_path: str = "assets/modelSetting.json",
+    ) -> None:
         self.config_path = Path(config_path)
-        config = readFile(str(self.config_path)) or {}
-        if not isinstance(config, dict):
-            raise ValueError("models.json 根节点必须是对象")
-        self._config: dict[str, Any] = config
-        defaults = config.get("defaults", {})
+        self.settings_path = Path(settings_path)
+
+        self._config: dict[str, Any] = readFile(str(self.config_path)) or {}
+        self._model_settings: dict[str, Any] = readFile(str(self.settings_path)) or {}
+
+        defaults = self._config.get("defaults", {})
         self.settings: dict[str, Any] = copy.deepcopy(defaults) if isinstance(defaults, dict) else {}
-        self.specs: dict[str, ModelSpec] = load_model_specs(config)
+        self.specs: dict[str, ModelSpec] = load_model_specs(self._config)
         self.runtime: dict[str, RuntimeModel] = {}
         self._meta_lock = threading.Lock()
 
         self.ram_reserve_mb = 8192
         self.gpu_reserve_mb = 1024
+        self.sleep_time = int(self.settings.get("sleepTime", 60))
 
-        server = self.settings.get("server", {})
-        self.sleep_time = int(server.get("sleepTime", 600)) if isinstance(server, dict) else 600
+        self._check_and_fill_empty_model_load()
 
-    def generation_params(self, model_id: str) -> dict[str, Any]:
-        params = dict(self.settings.get("generation", {}))
-        for name, value in GENERATION_DEFAULTS.items():
-            params.setdefault(name, value)
+    def _check_and_fill_empty_model_load(self) -> None:
+        """规则 2：如 model.load 为空，初始化直接套用 template.load 并写入文件。"""
+        template_load = self._model_settings.get("template", {}).get("load", {})
+        modified = False
+        models = self._config.setdefault("models", {})
+
+        for model_id, spec in self.specs.items():
+            if not spec.load:
+                spec.load = copy.deepcopy(template_load)
+                if model_id in models:
+                    models[model_id]["load"] = copy.deepcopy(template_load)
+                modified = True
+
+        if modified:
+            writeFile(self._config, str(self.config_path))
+            log_info("已自动将 template.load 补齐写入 models.json")
+
+    def get_full_load_config(self, model_id: str) -> dict[str, Any]:
+        """完整加载参数闭包 = template.load + engine.load + model.load"""
+        spec = self.specs[model_id]
+        engine = spec.detect_engine() or "llama"
+
+        full_load = copy.deepcopy(self._model_settings.get("template", {}).get("load", {}))
+        full_load.update(self._model_settings.get(engine, {}).get("load", {}))
+        full_load.update(spec.load)
+        return full_load
+
+    def get_full_generation_config(self, model_id: str) -> dict[str, Any]:
+        """完整生成参数闭包 = template.generation + engine.generation + model.generation"""
         spec = self.specs.get(model_id)
+        engine = (spec.detect_engine() if spec else None) or "llama"
+
+        full_gen = copy.deepcopy(self._model_settings.get("template", {}).get("generation", {}))
+        full_gen.update(self._model_settings.get(engine, {}).get("generation", {}))
         if spec:
-            params.update(spec.generation)
-        return params
+            full_gen.update(spec.generation)
+        return full_gen
 
     def list_models(self) -> list[dict[str, Any]]:
         with self._meta_lock:
@@ -108,10 +140,7 @@ class ModelsMgr:
         self._clean_gpu_cache()
         if self._free_for(spec):
             return
-        raise MemoryError(
-            f"模型 {spec.model_id} 需要约 {spec.required_vram_mb()} MB 显存，"
-            f"移入 RAM 并释放显存后仍不足"
-        )
+        raise MemoryError(f"模型 {spec.model_id} 显存不足")
 
     def _reclaim_to_ram(self, exclude: str) -> None:
         with self._meta_lock:
@@ -120,111 +149,77 @@ class ModelsMgr:
                 if model_id != exclude and item.loader and item.state == "RUNNING"
             ]
         candidates.sort(key=lambda item: item.last_used_at)
-        log_info("显存不足，开始将闲置模型腾退至 RAM", "exclude=", exclude,
-                 "candidates=", [item.spec.model_id for item in candidates])
         for item in candidates:
             self._release(item)
             if self._free_for(self.specs[exclude]):
                 return
 
-    def _reclaim_ram(self, exclude: str, required_mb: int) -> bool:
-        with self._meta_lock:
-            candidates = [
-                item for model_id, item in self.runtime.items()
-                if model_id != exclude and item.loader and item.state == "SLEEPING_RAM"
-            ]
-        candidates.sort(key=lambda item: item.last_used_at)
-        log_info("RAM 不足，开始按 LRU 卸载休眠模型", "exclude=", exclude,
-                 "candidates=", [item.spec.model_id for item in candidates])
-        for item in candidates:
-            self._unload_runtime(item.spec.model_id)
-            if check_ram(required_mb, self.ram_reserve_mb).allowed:
-                return True
-        return check_ram(required_mb, self.ram_reserve_mb).allowed
-
     def _release(self, runtime: RuntimeModel) -> None:
         model_id = runtime.spec.model_id
-        required_mb = int(runtime.spec.required_vram_mb() or 0)
-        ram_ok = check_ram(required_mb, self.ram_reserve_mb).allowed
-        if not ram_ok:
-            ram_ok = self._reclaim_ram(model_id, required_mb)
-
-        if ram_ok and runtime.loader is not None and runtime.loader.sleep_to_ram():
+        if runtime.loader is not None and runtime.loader.sleep_to_ram():
             with self._meta_lock:
                 runtime.state, runtime.sleep_location = "SLEEPING_RAM", "ram"
-            log_info("模型已成功休眠至 RAM:", model_id)
             return
-
-        log_info("RAM 不足或不支持休眠，彻底卸载:", model_id)
         self._unload_runtime(model_id)
 
-    def ensure_loaded(self, model_id: str) -> RuntimeModel:
+    def ensure_loaded(self, model_id: str, load_override: dict[str, Any] | None = None) -> RuntimeModel:
         runtime = self._get_runtime(model_id)
         if runtime.loader and runtime.state in {"RUNNING", "SLEEPING_RAM"}:
             return self._resume(runtime)
-        return self._load(runtime)
+        return self._load(runtime, load_override or {})
 
     def _resume(self, runtime: RuntimeModel) -> RuntimeModel:
-        model_id = runtime.spec.model_id
         if runtime.state == "RUNNING":
             runtime.last_used_at = time.time()
             return runtime
         try:
             self._admit(runtime.spec)
-            log_info("从 RAM 唤醒模型:", model_id)
             runtime.loader.wake()
-        except Exception as exc:
-            log_info("模型唤醒失败，降级为卸载冷重载:", model_id, exc)
-            self._unload_runtime(model_id)
-            return self._load(runtime)
-
+        except Exception:
+            self._unload_runtime(runtime.spec.model_id)
+            return self._load(runtime, {})
         with self._meta_lock:
             runtime.state, runtime.sleep_location = "RUNNING", None
             runtime.last_used_at = time.time()
         return runtime
 
-    def _load(self, runtime: RuntimeModel) -> RuntimeModel:
+    def _load(self, runtime: RuntimeModel, load_override: dict[str, Any]) -> RuntimeModel:
         spec = runtime.spec
         model_id = spec.model_id
         with self._meta_lock:
             runtime.state = "LOADING"
         try:
-            if spec.draft and spec.mtp:
-                raise ValueError("draft 与 mtp 不能同时启用")
-            log_info("开始加载模型", model_id, "context_length=", spec.load.context_length)
             self._admit(spec)
-
             engine = spec.detect_engine()
             if not engine:
-                error("无法确定推理框架: model=", spec.model_id)
-                with self._meta_lock:
-                    runtime.state, runtime.error = "UNLOADED", "无法确定推理框架"
-                return runtime
+                raise ValueError(f"未指定引擎: {model_id}")
 
             cls = require(f"{__package__}.llmFramework.{engine}")
-            runtime.loader = cls() if cls else None
-            if runtime.loader is None:
-                with self._meta_lock:
-                    runtime.state, runtime.error = "UNLOADED", f"未能实例化引擎 {engine}"
-                return runtime
+            runtime.loader = cls()
+
+            # 完整加载参数闭包 + 仅接收存在于完整参数的覆盖值
+            full_load = self.get_full_load_config(model_id)
+            for k, v in load_override.items():
+                if k in full_load:
+                    full_load[k] = v
+
+            # 规则 1：传递参数时直接计算剩余显存 80%，由子类 load 对齐
+            context_val = full_load.get("context", 0)
+            if context_val and context_val > 0:
+                from ..utils.hardware import query_gpu_free_mb
+                free_mb = query_gpu_free_mb()
+                full_load["context_memory_mb"] = free_mb * (context_val / 100.0)
 
             used_before = query_gpu_used_mb()
-            engine_name = type(runtime.loader).__name__.lower()
-            load_kwargs = spec.resolve_loader_kwargs(engine_name)
+            # 规范入参：严格 2 个参数
+            runtime.loader.load(spec.path, full_load)
 
-            runtime.loader.load(spec.path,config=load_kwargs, draft=spec.draft, lora=spec.lora)
-
-            if spec.update_estimated_vram(used_before, query_gpu_used_mb(), force=runtime.needs_remeasure):
-                runtime.needs_remeasure = False
-                log_info("模型显存实测:", spec.model_id, f"{spec.estimated_vram_mb} MB")
-
-            spec.apply_effective_load(runtime.loader.effective_load, runtime.loader.model_info)
-            self._persist_spec(spec)
+            spec.update_estimated_vram(used_before, query_gpu_used_mb(), force=runtime.needs_remeasure)
+            runtime.needs_remeasure = False
 
             with self._meta_lock:
                 runtime.state, runtime.error = "RUNNING", None
                 runtime.last_used_at = time.time()
-            log_info("模型加载完成", model_id, "vram_mb=", spec.estimated_vram_mb)
             return runtime
         except Exception as exc:
             if runtime.loader:
@@ -237,74 +232,24 @@ class ModelsMgr:
             self._clean_gpu_cache()
             raise RuntimeError(f"模型 {model_id} 加载失败: {exc}") from exc
 
-    def _persist_spec(self, spec: ModelSpec) -> None:
-        models = self._config.setdefault("models", {})
-        spec.generation = self.generation_params(spec.model_id)
-        spec.generation_present = True
-        models[spec.model_id] = spec.to_config_node()
-
-        tmp_path = self.config_path.with_name(f".{self.config_path.stem}.tmp.json")
-        writeFile(self._config, str(tmp_path))
-        tmp_path.replace(self.config_path)
-        log_info("模型配置已补全并写入磁盘", spec.model_id)
-
-    def generate(self, model_id: str, prompt: str, *, sampling: dict[str, Any] | None = None, system_prompt: str = "", messages: list[dict[str, Any]] | None = None, **kwargs: Any) -> GenerationResult:
+    def generate(
+        self,
+        model_id: str,
+        messages: list[dict[str, Any]],
+        gen_cfg: dict[str, Any] | None = None,
+    ) -> GenerationResult:
+        """规范入参：缩减为 3 个。"""
         runtime = self.ensure_loaded(model_id)
         if runtime.loader is None:
             raise RuntimeError(f"模型 {model_id} 未就绪")
 
         runtime.active = True
         try:
-            result = runtime.loader.generate(
-                prompt,
-                sampling=sampling,
-                system_prompt=system_prompt,
-                messages=messages,
-                **kwargs,
-            )
+            result = runtime.loader.generate(messages, gen_cfg)
             runtime.last_used_at = time.time()
             return result
         finally:
             runtime.active = False
-
-    def reconfigure(self, model_id: str, changes: dict[str, Any]) -> RuntimeModel:
-        runtime = self._get_runtime(model_id)
-        spec = self.specs[model_id]
-        wanted = {key: value for key, value in changes.items()
-                  if key in LOAD_KEYS and getattr(spec.load, key) != value}
-        if not wanted:
-            return runtime
-        if runtime.active:
-            raise RuntimeError("模型当前正在生成，不能修改加载参数")
-        log_info("重新配置模型:", model_id, wanted)
-        self._unload_runtime(model_id)
-        changed_spec = replace(spec, load=replace(spec.load, **wanted))
-        changed_spec.load_fields = set(spec.load_fields) | set(wanted)
-        changed_spec.load_present = True
-        self.specs[model_id] = changed_spec
-        self._get_runtime(model_id).needs_remeasure = True
-        try:
-            return self.ensure_loaded(model_id)
-        except Exception:
-            self.specs[model_id] = spec
-            raise
-
-    def update_generation(self, model_id: str, changes: dict[str, Any]) -> dict[str, Any]:
-        spec = self.specs.get(model_id)
-        if spec is None:
-            raise KeyError(f"models.json 中不存在模型: {model_id}")
-        merged = self.generation_params(model_id)
-        merged.update(changes)
-        spec.generation = merged
-        spec.generation_present = True
-        models = self._config.setdefault("models", {})
-        node = models.setdefault(spec.model_id, {})
-        node["generation"] = dict(merged)
-        tmp_path = self.config_path.with_name(f".{self.config_path.stem}.tmp.json")
-        writeFile(self._config, str(tmp_path))
-        tmp_path.replace(self.config_path)
-        log_info("生成参数已持久化:", model_id, changes)
-        return merged
 
     def sleep(self, model_id: str) -> bool:
         runtime = self._get_runtime(model_id)
@@ -332,7 +277,7 @@ class ModelsMgr:
             return False
         self._unload_runtime(model_id)
         return True
-
+    
     def reap_idle(self) -> list[str]:
         timeout = self.sleep_time
         if timeout <= 0:
