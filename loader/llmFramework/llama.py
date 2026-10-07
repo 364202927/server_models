@@ -7,8 +7,8 @@ from typing import Any, Iterator
 
 from ...utils.hardware import detect_gpu
 from ...utils.common import info as log_info, error
-from ..chatDataFilter import chatDataFilter, flatten_messages
-from .baseInference import GenerationResult, baseInference
+from ..chatDataFilter import flatten_messages
+from .baseInference import baseInference
 
 try:
     from llama_cpp import Llama
@@ -28,7 +28,7 @@ def _gpu_offload_supported() -> bool | None:
 
 
 class llama(baseInference):
-    """llama-cpp-python GGUF 推理引擎"""
+    """llama-cpp-python GGUF 推理引擎：只负责物理加载与调用。"""
 
     _SAMPLING_KEY_MAP = {"repetition_penalty": "repeat_penalty", "mirostat": "mirostat_mode"}
     _EXTRA_SAMPLING_KEYS = (
@@ -57,7 +57,15 @@ class llama(baseInference):
             raise ValueError(f"不是有效的 GGUF 文件: {model_path}")
         return source
 
-    def load(self, model_path: str, *,config: dict[str, Any] | None = None, draft: str | None = None, lora: str | None = None,**kwargs: Any,) -> "llama":
+    def load(
+        self,
+        model_path: str,
+        *,
+        config: dict[str, Any] | None = None,
+        draft: str | None = None,
+        lora: str | None = None,
+        **kwargs: Any,
+    ) -> "llama":
         if Llama is None:
             raise RuntimeError("GGUF 模型需要安装 llama-cpp-python")
 
@@ -73,19 +81,21 @@ class llama(baseInference):
             raise ValueError("draft 与 mtp 不能同时启用")
 
         llm_kwargs: dict[str, Any] = {
-                    "model_path": str(source),
-                    "n_gpu_layers": gpu_layers,
-                    "n_ctx": int(cfg.get("max_model_len") or llama._FALLBACK_N_CTX),
-                    "n_batch": int(cfg.get("batch_size", 512)),
-                    "verbose": bool(cfg.get("verbose", False)),
-                    "use_mlock": True,
-                }
+            "model_path": str(source),
+            "n_gpu_layers": gpu_layers,
+            "n_ctx": int(cfg.get("max_model_len") or llama._FALLBACK_N_CTX),
+            "n_batch": int(cfg.get("batch_size", 512)),
+            "verbose": bool(cfg.get("verbose", False)),
+            "use_mlock": True,
+        }
         if cfg.get("flash_attention") is not None:
             llm_kwargs["flash_attn"] = bool(cfg["flash_attention"])
         if cfg.get("gpu_split"):
             llm_kwargs["tensor_split"] = cfg["gpu_split"]
 
-        optional_kwargs = self._accepted_engine_kwargs(Llama, cfg, {"model_path", "n_gpu_layers", "n_ctx", "n_batch", "verbose", "batch_size", "flash_attention", "gpu_split"})
+        optional_kwargs = self._accepted_engine_kwargs(
+            Llama, cfg, {"model_path", "n_gpu_layers", "n_ctx", "n_batch", "verbose", "batch_size", "flash_attention", "gpu_split"}
+        )
         llm_kwargs.update(optional_kwargs)
 
         if lora:
@@ -111,12 +121,14 @@ class llama(baseInference):
         self._model_info.context_length = int(self._model.n_ctx())
 
         self._effective_load = {
-                    "engine": "llama", "dtype": self._model_info.dtype,
-                    "context_length": self._model_info.context_length,
-                    "gpu_offload_layers": llm_kwargs["n_gpu_layers"],
-                    "batch_size": llm_kwargs["n_batch"],
-                    "draft": draft, "lora": lora,
-                }
+            "engine": "llama",
+            "dtype": self._model_info.dtype,
+            "context_length": self._model_info.context_length,
+            "gpu_offload_layers": llm_kwargs["n_gpu_layers"],
+            "batch_size": llm_kwargs["n_batch"],
+            "draft": draft,
+            "lora": lora,
+        }
         return self
 
     def count_tokens(self, text_or_messages: str | list[dict[str, Any]]) -> int:
@@ -133,65 +145,54 @@ class llama(baseInference):
             prompt_str = flatten_messages(text_or_messages)
         return len(self._model.tokenize(prompt_str.encode("utf-8")))
 
-    def generate(self, prompt: str,*,sampling: dict[str, Any] | None = None,system_prompt: str = "", messages: list[dict[str, Any]] | None = None, **kwargs: Any) -> GenerationResult:
-        if not self.is_loaded:
-            raise RuntimeError("Model not loaded. Call load() first.")
+    def _response(
+        self,
+        messages: list[dict[str, Any]],
+        sampling: dict[str, Any],
+        tools: list[dict[str, Any]] | None = None,
+        **kwargs: Any,
+    ) -> tuple[str, int, int, list[dict[str, Any]], str]:
+        """纯粹物理调用：输入经过 baseInference 管道预清洗，此处保持极简。"""
+        max_tokens = self._clamp_to_context(messages, sampling.get("max_tokens", 512))
+        sampling["max_tokens"] = max_tokens
 
-        norm_messages = messages or ([{"role": "system", "content": system_prompt}] if system_prompt else []) + [{"role": "user", "content": prompt}]
-        sampling_params = self._build_sampling(sampling or {}, kwargs)
-        max_new_tokens = self._clamp_to_context(norm_messages, sampling_params.get("max_tokens", 512))
-        sampling_params["max_tokens"] = max_new_tokens
-
-        tools = kwargs.get("tools")
-        tool_choice = kwargs.get("tool_choice")
         extra: dict[str, Any] = {}
-        if kwargs.get("tools"):
+        if tools:
             extra["tools"] = tools
-        if kwargs.get("tool_choice") is not None:
-            extra["tool_choice"] = tool_choice
-        
-        log_info("[Llama推理前检查]", 
-                 f"is_sleeping={self._sleeping}",
-                 f" tools_count={len(tools) if tools else 0}",
-                 f" tool_choice={tool_choice}",
-                 f" message_turns={len(norm_messages)}",
-                 f" message={norm_messages}")
+        if kwargs.get("tool_choice"):
+            extra["tool_choice"] = kwargs["tool_choice"]
 
-        start = time.perf_counter()
-        # try
-        result = self._model.create_chat_completion(messages=norm_messages, **extra, **sampling_params)
-        choice = result["choices"][0]
-        message = choice["message"]
-        text = str(message.get("content") or "")
-        calls = message.get("tool_calls") or []
-        finish_reason = str(choice.get("finish_reason") or ("tool_calls" if calls else "stop"))
-        usage = result.get("usage", {})
-        prompt_tokens = int(usage.get("prompt_tcokens", 0))
-        tokens = int(usage.get("completion_tokens", 0))
+        try:
+            result = self._model.create_chat_completion(messages=messages, **extra, **sampling)
+            choice = result["choices"][0]
+            message = choice["message"]
+            text = str(message.get("content") or "")
+            calls = message.get("tool_calls") or []
+            finish_reason = str(choice.get("finish_reason") or ("tool_calls" if calls else "stop"))
+            usage = result.get("usage", {})
+            prompt_tokens = int(usage.get("prompt_tokens", 0))
+            tokens = int(usage.get("completion_tokens", 0))
+        except Exception as exc:
+            error("原生模板推理异常，回退纯文本补全", type(exc).__name__, exc)
+            flat = flatten_messages(messages)
+            result = self._model(flat, **sampling)
+            text = str(result["choices"][0].get("text", ""))
+            tokens = len(self._model.tokenize(text.encode("utf-8")))
+            prompt_tokens = len(self._model.tokenize(flat.encode("utf-8")))
+            finish_reason = "length" if tokens >= max_tokens else "stop"
+            calls = []
 
-        if calls:
-            log_info("[Llama成功捕获工具调用]", f"calls_count={len(calls)}", f"calls={calls}")
-        # except Exception as exc:
-        #     error("[Llama致命异常] create_chat_completion 执行失败，回退到纯文本补全！",
-        #           f" 异常类型={type(exc).__name__}",
-        #           f" 异常详情={exc}",
-        #           f" 当前模型metadata是否存在={bool(getattr(self._model, 'metadata', None))}")
-            
-        #     flat = flatten_messages(norm_messages)
-        #     result = self._model(flat, **sampling_params)
-        #     text = str(result["choices"][0].get("text", ""))
-        #     tokens = len(self._model.tokenize(text.encode("utf-8")))
-        #     prompt_tokens = len(self._model.tokenize(flat.encode("utf-8")))
-        #     finish_reason = "length" if tokens >= max_new_tokens else "stop"
-        #     calls = []
+        return text, tokens, prompt_tokens, calls, finish_reason
 
-        elapsed = time.perf_counter() - start
-        final_text = chatDataFilter.repair_think_tags(text)
-        return GenerationResult( final_text, tokens, elapsed,
-            tokens / elapsed if elapsed else 0.0,
-            prompt_tokens, calls, finish_reason)
-
-    def stream_generate(self,prompt: str,*,sampling: dict[str, Any] | None = None,system_prompt: str = "",messages: list[dict[str, Any]] | None = None,**kwargs: Any) -> Iterator[str]:
+    def stream_generate(
+        self,
+        prompt: str,
+        *,
+        sampling: dict[str, Any] | None = None,
+        system_prompt: str = "",
+        messages: list[dict[str, Any]] | None = None,
+        **kwargs: Any,
+    ) -> Iterator[str]:
         if not self.is_loaded:
             raise RuntimeError("Model not loaded. Call load() first.")
 
@@ -232,24 +233,13 @@ class llama(baseInference):
             draft.close()
 
     def _engine_wake(self) -> None:
-        start_wake = time.perf_counter()
         if self._saved_draft_kwargs:
             self._draft_model = Llama(**self._saved_draft_kwargs)
         if self._saved_llm_kwargs:
             kw = dict(self._saved_llm_kwargs)
             if self._draft_model:
                 kw["draft_model"] = self._draft_model
-
-            log_info("[唤醒检查] 正在使用参数重建 Llama 实例:", {k: v for k, v in kw.items() if k != "draft_model"})
-            
             self._model = Llama(**kw)
-
-            template = getattr(self._model, "chat_template", None) or self._model.metadata.get("tokenizer.chat_template")
-            handler = getattr(self._model, "chat_handler", None)
-            log_info("[唤醒检查] 实例重建完成", 
-                     f"has_chat_handler={handler is not None}", 
-                     f"has_template={template is not None}",
-                     f"耗时={round(time.perf_counter() - start_wake, 2)}s")
 
     def sleep_holds_ram(self) -> bool:
         return False

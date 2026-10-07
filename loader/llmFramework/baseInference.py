@@ -1,12 +1,20 @@
 from __future__ import annotations
 
-import gc, inspect, os, time,psutil, torch
+import gc
+import inspect
+import os
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator
 
-from ...utils.common import info as log_info
+import psutil
+import torch
+
+from ...utils.common import info as log_info, error
+from ..chatDataFilter import chatDataFilter
+
 
 def detect_model_type(name: str) -> str:
     lowered = name.lower()
@@ -51,7 +59,7 @@ class MemoryUsage:
 
 
 class baseInference(ABC):
-    """推理框架抽象基类"""
+    """推理框架抽象基类：采用模板方法模式管控全局生命周期。"""
 
     _SAMPLING_KEY_MAP: dict[str, str] = {}
     _EXTRA_SAMPLING_KEYS: tuple[str, ...] = ()
@@ -78,7 +86,6 @@ class baseInference(ABC):
 
     @property
     def supported_modalities(self) -> set[str]:
-        """模型支持的输入模态，默认纯文本，多模态子类重写覆盖。"""
         return {"text"}
 
     @abstractmethod
@@ -102,7 +109,6 @@ class baseInference(ABC):
 
     @abstractmethod
     def count_tokens(self, text_or_messages: str | list[dict[str, Any]]) -> int:
-        """精确统计文本或上下文消息的 Token 数量。"""
         pass
 
     @property
@@ -203,36 +209,82 @@ class baseInference(ABC):
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
         self.unload()
 
-    def generate(self, prompt: str, *,sampling: dict[str, Any] | None = None, system_prompt: str = "",messages: list[dict[str, Any]] | None = None, **kwargs: Any,) -> GenerationResult:
+    # 核心模板方法：禁止子类重写 generate，把控完整的预清洗、执行与后清洗
+    def generate(
+        self,
+        prompt: str,
+        *,
+        sampling: dict[str, Any] | None = None,
+        messages: list[dict[str, Any]] | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        system_prompt: str = "",
+        **kwargs: Any,
+    ) -> GenerationResult:
         if not self.is_loaded:
             raise RuntimeError("Model not loaded. Call load() first.")
 
-        norm_messages = messages or ([{"role": "system", "content": system_prompt}] if system_prompt else []) + [{"role": "user", "content": prompt}]
-        rendered = self._build_chat_prompt(norm_messages)
         sampling_params = self._build_sampling(sampling or {}, kwargs)
 
-        start = time.perf_counter()
-        text, gen_tokens, prompt_tokens = self._run_engine(rendered, sampling_params)
-        elapsed = time.perf_counter() - start
-
-        max_tokens = sampling_params.get("max_tokens", 512)
-        return GenerationResult(
-            text=text, tokens_generated=gen_tokens, time_seconds=elapsed,
-            tokens_per_second=gen_tokens / elapsed if elapsed > 0 else 0,
-            prompt_tokens=prompt_tokens,
-            finish_reason="length" if gen_tokens >= max_tokens else "stop",
+        # 1. 前置清洗管道：彻底剥离旧 think、清理空标签、对齐 mapping 结构
+        cleaned_messages = chatDataFilter.preprocess_messages(
+            messages=messages,
+            supported_modalities=self.supported_modalities,
+            default_system=system_prompt,
+            user_prompt=prompt,
         )
 
-    def stream_generate(self,prompt: str, *,sampling: dict[str, Any] | None = None,system_prompt: str = "",messages: list[dict[str, Any]] | None = None,**kwargs: Any,) -> Iterator[str]:
+        start = time.perf_counter()
+
+        # 2. 调用物理执行方法
+        raw_text, gen_tokens, prompt_tokens, calls, finish_reason = self._response(
+            messages=cleaned_messages,
+            sampling=sampling_params,
+            tools=tools,
+            **kwargs,
+        )
+        elapsed = time.perf_counter() - start
+
+        # 3. 后置清洗、状态纠偏与 ToolCall 补救提取
+        final_text, final_calls, final_reason = chatDataFilter.postprocess_result(
+            raw_text, calls, finish_reason
+        )
+
+        return GenerationResult(
+            text=final_text,
+            tokens_generated=gen_tokens,
+            time_seconds=elapsed,
+            tokens_per_second=gen_tokens / elapsed if elapsed > 0 else 0.0,
+            prompt_tokens=prompt_tokens,
+            tool_calls=final_calls,
+            finish_reason=final_reason,
+        )
+
+    @abstractmethod
+    def _response(
+        self,
+        messages: list[dict[str, Any]],
+        sampling: dict[str, Any],
+        tools: list[dict[str, Any]] | None = None,
+        **kwargs: Any,
+    ) -> tuple[str, int, int, list[dict[str, Any]], str]:
+        """子类唯一需要实现的物理执行接口，只负责与底层引擎交互。"""
+        pass
+
+    def stream_generate(
+        self,
+        prompt: str,
+        *,
+        sampling: dict[str, Any] | None = None,
+        system_prompt: str = "",
+        messages: list[dict[str, Any]] | None = None,
+        **kwargs: Any,
+    ) -> Iterator[str]:
         if not self.is_loaded:
             raise RuntimeError("Model not loaded. Call load() first.")
         norm_messages = messages or ([{"role": "system", "content": system_prompt}] if system_prompt else []) + [{"role": "user", "content": prompt}]
         rendered = self._build_chat_prompt(norm_messages)
         sampling_params = self._build_sampling(sampling or {}, kwargs)
         yield from self._run_engine_stream(rendered, sampling_params)
-
-    def _run_engine(self, rendered_prompt: str, sampling: dict[str, Any]) -> tuple[str, int, int]:
-        raise NotImplementedError
 
     def _run_engine_stream(self, rendered_prompt: str, sampling: dict[str, Any]) -> Iterator[str]:
         raise NotImplementedError
@@ -243,9 +295,11 @@ class baseInference(ABC):
     def _build_chat_prompt(self, messages: list[dict[str, Any]]) -> str:
         try:
             tokenizer = self._get_tokenizer()
-            return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            if tokenizer and hasattr(tokenizer, "apply_chat_template"):
+                return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         except Exception:
-            return "\n".join(f"{item.get('role', 'user')}: {item.get('content', '')}" for item in messages)
+            pass
+        return "\n".join(f"{item.get('role', 'user')}: {item.get('content', '')}" for item in messages)
 
     def _build_sampling(self, sampling: dict[str, Any], extra: dict[str, Any]) -> dict[str, Any]:
         merged = {

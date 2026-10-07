@@ -1,11 +1,17 @@
 from __future__ import annotations
 
-import gc,torch
+import gc
 from typing import Any, Iterator
+import torch
 
 from ...utils.common import info as log_info
-from .baseInference import MemoryUsage, baseInference
-import sglang as sgl
+from ..chatDataFilter import flatten_messages
+from .baseInference import baseInference
+
+try:
+    import sglang as sgl
+except ImportError:
+    sgl = None
 
 
 class sglang(baseInference):
@@ -72,8 +78,7 @@ class sglang(baseInference):
             rendered = tokenizer.apply_chat_template(text_or_messages, tokenize=False, add_generation_prompt=True)
             return len(tokenizer.encode(rendered))
         except Exception:
-            flat = "\n".join(f"{m.get('role', 'user')}: {m.get('content', '')}" for m in text_or_messages)
-            return len(tokenizer.encode(flat))
+            return len(tokenizer.encode(flatten_messages(text_or_messages)))
 
     def _get_tokenizer(self) -> Any:
         return self._model.tokenizer_manager.tokenizer
@@ -84,16 +89,20 @@ class sglang(baseInference):
     def _engine_wake(self) -> None:
         self._model.resume_memory_occupation()
 
-    def _run_engine(self, rendered_prompt: str, sampling: dict[str, Any]) -> tuple[str, int, int]:
-        result = self._model.generate(prompt=rendered_prompt, sampling_params=sampling)
+    def _response(
+        self,
+        messages: list[dict[str, Any]],
+        sampling: dict[str, Any],
+        tools: list[dict[str, Any]] | None = None,
+        **kwargs: Any,
+    ) -> tuple[str, int, int, list[dict[str, Any]], str]:
+        rendered = self._build_chat_prompt(messages)
+        result = self._model.generate(prompt=rendered, sampling_params=sampling)
         meta = result.get("meta_info", {}) if isinstance(result, dict) else {}
-        return (result["text"], int(meta.get("completion_tokens", 0)), int(meta.get("prompt_tokens", 0)))
-
-    def _run_engine_stream(self, rendered_prompt: str, sampling: dict[str, Any]) -> Iterator[str]:
-        for chunk in self._model.generate_stream(prompt=rendered_prompt, sampling_params=sampling):
-            text = chunk.get("text", "")
-            if text:
-                yield text
+        tokens = int(meta.get("completion_tokens", 0))
+        prompt_tokens = int(meta.get("prompt_tokens", 0))
+        finish_reason = meta.get("finish_reason", "stop")
+        return result["text"], tokens, prompt_tokens, [], finish_reason
 
     def _unload_engine(self) -> None:
         if self._model is not None:
