@@ -61,14 +61,11 @@ class llama(baseInference):
             raise RuntimeError("当前 llama-cpp-python 未启用 CUDA，请安装 CUDA 构建版本。")
 
         # 计算并对齐 context 长度
-        context_val = load_cfg.get("context", 0)
-        calculated_n_ctx = llama._FALLBACK_N_CTX
-        if "context_memory_mb" in load_cfg and load_cfg["context_memory_mb"] > 0:
-            # 依据显存换算并对齐到 512 的整数倍
-            calculated_n_ctx = max(2048, int(load_cfg["context_memory_mb"] * 128 // 512 * 512))
-        elif context_val and context_val > 0:
-            calculated_n_ctx = int(context_val)
+        calculated_n_ctx = load_cfg.get("context", 0)
+        if calculated_n_ctx <= llama._FALLBACK_N_CTX:
+            calculated_n_ctx = llama._FALLBACK_N_CTX
 
+        print("~~~~模型加载:ctx~~~~~~",calculated_n_ctx)
         llm_kwargs: dict[str, Any] = {
             "model_path": str(source),
             "n_gpu_layers": gpu_layers,

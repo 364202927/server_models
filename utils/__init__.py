@@ -34,6 +34,7 @@ from .common import (
     switchFn,
     warn,
     writeFile,
+    vm2tokens,
 )
 from .console import Console, console
 from .recordBuffer import recordBuffer
@@ -43,5 +44,5 @@ __all__ = [
     "joinPath", "str2time", "ASSETS_DIR", "CACHE_DIR", "CHAT_HISTORY_DIR", "MODELS_FILE",
     "RUNTIME_DIR", "ensure_asset_dirs", "RecordBuffer", "recordBuffer", "get_log_buffer", "save_logs",
     "set_console_active", "configure_logging", "get_logger", "log", "info", "warn",
-    "error", "logFormat", "kLog", "kInfo", "kWarn", "kError", "kApi", "Console", "console",
+    "error", "logFormat", "kLog", "kInfo", "kWarn", "kError", "kApi", "Console", "console",'vm2tokens'
 ]

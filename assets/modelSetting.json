@@ -1,11 +1,11 @@
 {
+  "_comment": "这是一个model模版文件,context默认kvcache占用4g显存,max_tokens上下文2g",
   "template": {
     "load": {
       "mtp": false,
       "lora": "",
       "draft": [],
-      "context": 0,
-      "think": 0,
+      "context": 4096,
       "batch_size": 512,
       "gpu_offload_layers": -1,
       "tensor_parallel": 1,
@@ -16,7 +16,7 @@
       "top_p": 0.95,
       "top_k": 50,
       "repetition_penalty": 1.05,
-      "max_tokens": 4096,
+      "max_tokens": 2048,
       "stop": [],
       "system_prompt": ""
     }

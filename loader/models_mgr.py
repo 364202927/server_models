@@ -9,11 +9,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from ..utils.hardware import check_gpu_memory, check_ram, detect_gpu, query_gpu_used_mb
-from ..utils.common import info as log_info, readFile, writeFile, error, require
+from ..utils.hardware import check_gpu_memory, check_ram, detect_gpu, query_gpu_used_mb,query_gpu_free_mb
+from ..utils.common import info as log_info, readFile, writeFile, error, require,info,vm2tokens
 from .llmFramework.baseInference import GenerationResult, baseInference
 from .model_spec import ModelSpec, load_model_specs
-
 
 @dataclass
 class RuntimeModel:
@@ -193,30 +192,21 @@ class ModelsMgr:
             engine = spec.detect_engine()
             if not engine:
                 raise ValueError(f"未指定引擎: {model_id}")
-
             cls = require(f"{__package__}.llmFramework.{engine}")
             runtime.loader = cls()
-
             # 完整加载参数闭包 + 仅接收存在于完整参数的覆盖值
             full_load = self.get_full_load_config(model_id)
             for k, v in load_override.items():
                 if k in full_load:
                     full_load[k] = v
-
-            # 规则 1：传递参数时直接计算剩余显存 80%，由子类 load 对齐
-            context_val = full_load.get("context", 0)
-            if context_val and context_val > 0:
-                from ..utils.hardware import query_gpu_free_mb
-                free_mb = query_gpu_free_mb()
-                full_load["context_memory_mb"] = free_mb * (context_val / 100.0)
-
+            # 显存->token
+            context_val = vm2tokens(spec.engine, spec.path, float(full_load['context']), full_load['dtype'], int(full_load['tensor_parallel']))
+            full_load['context'] = context_val
             used_before = query_gpu_used_mb()
-            # 规范入参：严格 2 个参数
+            #加载模型
             runtime.loader.load(spec.path, full_load)
-
             spec.update_estimated_vram(used_before, query_gpu_used_mb(), force=runtime.needs_remeasure)
             runtime.needs_remeasure = False
-
             with self._meta_lock:
                 runtime.state, runtime.error = "RUNNING", None
                 runtime.last_used_at = time.time()

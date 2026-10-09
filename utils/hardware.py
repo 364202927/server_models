@@ -90,10 +90,22 @@ def query_gpu_used_mb() -> int:
 def gpu_summary() -> dict[str, Any]:
     return {"gpus": [gpu.__dict__ for gpu in detect_gpu()]}
 
+def query_gpu_free_mb() -> int:
+    try:
+        import pynvml
 
-# ==========================================
-# 对外导出：硬件探测 + 准入判定 + 进程资源
-# ==========================================
+        pynvml.nvmlInit()
+        device_count = pynvml.nvmlDeviceGetCount()
+        total_free_bytes = 0
+        for i in range(device_count):
+            handle = pynvml.nvmlDeviceGetHandleByIndex(i)
+            mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+            total_free_bytes += mem_info.free
+        pynvml.nvmlShutdown()
+        return total_free_bytes // (1024 * 1024)
+    except Exception:
+        # 如果 NVML 不可用，回退使用 detector 探测出的显存信息
+        return sum(gpu.memory_free_mb for gpu in detect_gpu())
 
 __all__ = [
     # detector：硬件探测
@@ -117,4 +129,6 @@ __all__ = [
     # process：进程资源
     "process_memory_mb",
     "process_summary",
+    #
+    'query_gpu_free_mb',
 ]
