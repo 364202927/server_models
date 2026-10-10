@@ -168,12 +168,15 @@ class llama(baseInference):
         old = self._last_seq
         info("[DBG] KV现状", f"请求#{self._dbg_n}", f"引擎n_tokens={self._model.n_tokens}",
              f"上轮记录={len(old)}", f"本轮prompt={len(tokens)}", f"(完整prompt已写入 debug/prompt_{self._dbg_n:03d}.txt)")
+        fname = f"prompt_{self._dbg_n:03d}.txt"
         if not old:
+            self.last_diag = {"verdict": "首轮", "file": fname}
             info("[DBG] 分叉诊断: 无上一轮 KV 记录(首轮/刚唤醒)")
             return
         d = next((i for i, (a, b) in enumerate(zip(old, tokens)) if a != b), min(len(old), len(tokens)))
         show = lambda seq: repr(text(seq[max(0, d - 4):d + 6]))
         verdict = "严格延长(应命中)" if d == len(old) else f"在第 {d} 个 token 分叉(需回退 {len(old) - d} 步)"
+        self.last_diag = {"verdict": "延长" if d == len(old) else "分叉", "idx": d, "rollback": len(old) - d, "file": fname}
         info("[DBG] 分叉诊断:", verdict, "| 上轮该处:", show(old), "| 本轮该处:", show(tokens))
         info("[DBG] 公共前缀", f"{d} tokens", "| 开头:", repr(text(tokens[:60])), "| 结尾:", repr(text(tokens[max(0, d - 20):d])))
 

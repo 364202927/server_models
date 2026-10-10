@@ -61,6 +61,8 @@ class baseInference(ABC):
         self._sleep_capable = False
         # 引擎输出记忆库（reasoning/content）：客户端丢掉 think 时，下一轮补回 reasoning_content，避免前缀分叉
         self._raw_memo: OrderedDict[str, dict[str, str]] = OrderedDict()
+        # 最近一次请求的 KV 前缀诊断（引擎自行填充：verdict/idx/rollback/file），供上层打印缓存摘要
+        self.last_diag: dict[str, Any] = {}
 
     @property
     def is_loaded(self) -> bool:

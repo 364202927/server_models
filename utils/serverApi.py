@@ -102,7 +102,7 @@ class serverApi:
             raise HTTPException(status_code=401, detail="API key 无效或未提供")
         return True
     # 聊天指令路由
-    async def _chat(self, request: openChatReq, client_type: str = "openai") -> Any:
+    async def _chat(self, request: openChatReq, client_type: str = "openai", ua: str = "") -> Any:
         if request.message_id != 0:
             admin_req = AdminRequest(
                 message_id=request.message_id,
@@ -115,7 +115,8 @@ class serverApi:
         if not request.model or not request.messages:
             raise HTTPException(status_code=400, detail="model 和 messages 不能为空")
         # 核心引擎内部仅消费标准的 OpenAI 结构请求
-        result = await self.handler.chat(_to_chat_request(request), source=client_type)
+        # source 仅用于日志：协议类型 + User-Agent 前缀，区分 Open WebUI / Claude Code / Hermes
+        result = await self.handler.chat(_to_chat_request(request), source=f"{client_type}/{ua[:30]}")
         payload = _build_payload(result, request.model)
         # 统一由 clientAdapter 出站转换器处理（按 client_type 输出为对应的 Dict 或 Streaming 生成器）
         outbound_res = clientAdapter.outbound(openai_resp=payload,client_type=client_type,stream=request.stream,chunk_size=request.stream_delta_chunk_size)
@@ -147,8 +148,8 @@ class serverApi:
 
         # 1. OpenAI 协议端点
         @app.post("/v1/chat/completions", response_model=None)
-        async def chat_completions(request: openChatReq, _: bool = Depends(self._require_api_key)) -> Any:
-            return await self._chat(request, client_type="openai")
+        async def chat_completions(request: openChatReq, raw_req: Request, _: bool = Depends(self._require_api_key)) -> Any:
+            return await self._chat(request, client_type="openai", ua=raw_req.headers.get("user-agent", ""))
 
         # 2. Claude / Anthropic 协议端点
         @app.post("/v1/messages", response_model=None)
@@ -161,7 +162,7 @@ class serverApi:
             openai_body = clientAdapter.inbound_to_openai(body, client_type="claude")
             info("[DBG] Claude转换后system[:120]", repr(openai_body["messages"][0])[:120])
             request = openChatReq(**openai_body)
-            return await self._chat(request, client_type="claude")
+            return await self._chat(request, client_type="claude", ua=raw_req.headers.get("user-agent", ""))
         return app
 
     async def run(self) -> None:

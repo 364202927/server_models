@@ -46,6 +46,32 @@ class MsgHandler:
         self._queue: asyncio.Queue[_TaskItem] | None = None
         self._worker_task: asyncio.Task | None = None
         self._current_task: _TaskItem | None = None
+        self._prev_req: dict[str, Any] = {}  # 上一次对话请求的特征，用于判断分叉原因
+
+    def _cache_summary(self, task: _TaskItem, tools: list, result: Any, diag: dict[str, Any]) -> None:
+        """[DBG] 每次请求输出一行汇总（来源/形态/复用/分叉/疑似原因），测试时只需收集这一行。"""
+        tools_hash = hashlib.md5(json.dumps(tools, ensure_ascii=False, sort_keys=True).encode()).hexdigest()[:6]
+        msgs = task.messages
+        last = msgs[-1] if msgs else {}
+        text = last.get("content")
+        if isinstance(text, list):
+            text = "".join(p.get("text", "") for p in text if isinstance(p, dict))
+        prev, self._prev_req = self._prev_req, {"tools": tools_hash, "n": len(msgs), "source": task.source}
+
+        verdict = diag.get("verdict", "未知")
+        hint = ""
+        if verdict == "分叉":
+            if prev and prev["tools"] != tools_hash:
+                hint = "工具集与上次不同→疑似旁路请求/换会话覆盖KV"
+            elif prev and len(msgs) <= prev["n"]:
+                hint = "消息数未增加→新会话/重试/回溯"
+            else:
+                hint = "同会话历史被改写→对比 debug/prompt diff"
+        kv = {"延长": "严格延长", "首轮": "首轮", "分叉": f"分叉@{diag.get('idx')}(回退{diag.get('rollback')})"}.get(verdict, verdict)
+        cached = result.cached_tokens
+        info("[缓存摘要]", f"来源={task.source}", f"消息={len(msgs)}", f"末条={last.get('role')}",
+             f"工具={len(tools)}#{tools_hash}", f"复用={cached}/{result.prompt_tokens}", f"KV={kv}",
+             f"文件={diag.get('file', '-')}", f"提示={hint or '-'}", "| 末条开头:", repr((text or "")[:50]))
 
     def _ensure_worker(self) -> None:
         try:
@@ -222,6 +248,8 @@ class MsgHandler:
              f"生成: {result.tokens_generated} tokens, "
              f"耗时: {result.time_seconds:.2f}s, "
              f"剩余 KV Cache: {remaining_kv} tokens")
+
+        self._cache_summary(task, tools, result, getattr(loader, "last_diag", {}))
 
         return self._response(model, 0, "ok", result.text) | {
             "tool_calls": result.tool_calls,
