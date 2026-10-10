@@ -110,6 +110,8 @@ class serverApi:
                 args=request.args,
             )
             return await self.handler.admin(admin_req, source=client_type)
+        info("[DBG] 入站请求", f"client={client_type}", f"stream={request.stream}", f"消息数={len(request.messages)}",
+             f"tools数={len(request.tools or [])}", "额外字段=", sorted((request.model_extra or {}).keys()))
         if not request.model or not request.messages:
             raise HTTPException(status_code=400, detail="model 和 messages 不能为空")
         # 核心引擎内部仅消费标准的 OpenAI 结构请求

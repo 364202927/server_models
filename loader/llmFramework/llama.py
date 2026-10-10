@@ -5,6 +5,7 @@ import inspect
 from pathlib import Path
 from typing import Any
 
+from ...utils import RUNTIME_DIR
 from ...utils.common import info
 from ...utils.hardware import detect_gpu
 from .baseInference import RawOutput, baseInference
@@ -43,6 +44,7 @@ class llama(baseInference):
         self._saved_draft_kwargs: dict[str, Any] | None = None
         self._draft_model = None
         self._formatter = None
+        self._dbg_n = 0
         self._last_seq: list[int] = []  # 上一轮结束时引擎 KV 中的完整 token 序列（仅用于分叉诊断）
 
     @staticmethod
@@ -105,6 +107,11 @@ class llama(baseInference):
         self._saved_llm_kwargs = {k: v for k, v in llm_kwargs.items() if k != "draft_model"}
         self._model = Llama(**llm_kwargs)
         self._sleep_capable = True
+        template = self._model.metadata.get("tokenizer.chat_template", "")
+        self._dump("chat_template.jinja", template)
+        info("[DBG] 模型信息", f"arch={self._model.metadata.get('general.architecture')}",
+             f"chat_template长度={len(template)}(已写入 debug/chat_template.jinja)",
+             f"n_ctx={self._model.n_ctx()}", f"n_batch={llm_kwargs['n_batch']}", f"draft={'有' if self._draft_model else '无'}")
 
         self._effective_load = {
             "engine": "llama",
@@ -144,17 +151,31 @@ class llama(baseInference):
             return len(self._model.tokenize(text_or_messages.encode("utf-8")))
         return len(self._prompt_tokens(text_or_messages, tools))
 
+    def _dump(self, name: str, text: str) -> None:
+        """[DBG] 把调试文本落盘到 assets/runtime/debug/，便于 diff 相邻请求的渲染结果。"""
+        try:
+            path = RUNTIME_DIR / "debug"
+            path.mkdir(parents=True, exist_ok=True)
+            (path / name).write_text(text, encoding="utf-8")
+        except OSError as exc:
+            info("[DBG] 调试文件写入失败", name, exc)
+
     def _debug_divergence(self, tokens: list[int]) -> None:
-        """[DBG] 对比上一轮 KV 序列与本轮 prompt，打印分叉位置及前后文本。"""
+        """[DBG] 落盘本轮渲染后的完整 prompt，并对比上一轮 KV 序列，打印分叉位置、公共前缀与前后文本。"""
+        self._dbg_n += 1
+        text = lambda seq: self._model.detokenize(seq, special=True).decode("utf-8", errors="replace")
+        self._dump(f"prompt_{self._dbg_n:03d}.txt", text(tokens))
         old = self._last_seq
+        info("[DBG] KV现状", f"请求#{self._dbg_n}", f"引擎n_tokens={self._model.n_tokens}",
+             f"上轮记录={len(old)}", f"本轮prompt={len(tokens)}", f"(完整prompt已写入 debug/prompt_{self._dbg_n:03d}.txt)")
         if not old:
             info("[DBG] 分叉诊断: 无上一轮 KV 记录(首轮/刚唤醒)")
             return
         d = next((i for i, (a, b) in enumerate(zip(old, tokens)) if a != b), min(len(old), len(tokens)))
-        show = lambda seq: repr(self._model.detokenize(seq[max(0, d - 4):d + 6]).decode("utf-8", errors="replace"))
+        show = lambda seq: repr(text(seq[max(0, d - 4):d + 6]))
         verdict = "严格延长(应命中)" if d == len(old) else f"在第 {d} 个 token 分叉(需回退 {len(old) - d} 步)"
-        info("[DBG] 分叉诊断:", verdict, f"| 上轮KV={len(old)} 本轮prompt={len(tokens)}",
-             "| 上轮该处:", show(old), "| 本轮该处:", show(tokens))
+        info("[DBG] 分叉诊断:", verdict, "| 上轮该处:", show(old), "| 本轮该处:", show(tokens))
+        info("[DBG] 公共前缀", f"{d} tokens", "| 开头:", repr(text(tokens[:60])), "| 结尾:", repr(text(tokens[max(0, d - 20):d])))
 
     def _response(
         self,
@@ -188,6 +209,9 @@ class llama(baseInference):
         llama_cpp.llama_perf_context_reset(self._model.ctx)
         result = self._model.create_chat_completion(messages=messages, **extra, **filtered_cfg)
         self._last_seq = self._model._input_ids.tolist()
+        perf = llama_cpp.llama_perf_context(self._model.ctx)
+        info("[DBG] 引擎计数器", f"n_p_eval(重算prompt)={perf.n_p_eval}", f"n_eval(生成)={perf.n_eval}",
+             f"生成后n_tokens={self._model.n_tokens}", f"tools={len(tools or [])}", f"tool_choice={tool_choice}")
         choice = result["choices"][0]
         message = choice["message"]
         calls = message.get("tool_calls") or []

@@ -166,8 +166,10 @@ class baseInference(ABC):
             system_instruction=system_instruction,
         )
 
+        roles_in = [m.get("role") for m in cleaned_messages]
         cleaned_messages, restored, missed = chatDataFilter.restore_raw_assistant(cleaned_messages, self._raw_memo)
-        log_info("[DBG] assistant 原文还原", f"命中 {restored} 条, 未命中 {missed} 条, 记忆库 {len(self._raw_memo)} 条")
+        log_info("[DBG] assistant 原文还原", f"命中 {restored} 条, 未命中 {missed} 条, 记忆库 {len(self._raw_memo)} 条",
+                 "| 清洗后角色序列:", roles_in, "| 有system注入:", bool(system_instruction))
 
         start = time.perf_counter()
         raw = self._response(messages=cleaned_messages, gen_cfg=cfg)
@@ -176,6 +178,8 @@ class baseInference(ABC):
         final_text, final_calls, final_reason = chatDataFilter.postprocess_result(
             raw.text, raw.calls, raw.finish_reason
         )
+        log_info("[DBG] 模型原始输出", f"长度={len(raw.text)}", "开头:", repr(raw.text[:150]), "| 结尾:", repr(raw.text[-80:]),
+                 "| 引擎原生tool_calls:", len(raw.calls), "| 解析后tool_calls:", len(final_calls), "| finish:", raw.finish_reason, "->", final_reason)
         key = chatDataFilter.memo_key(
             cleaned_messages[-1] if cleaned_messages else None,
             {"role": "assistant", "content": final_text, "tool_calls": final_calls},

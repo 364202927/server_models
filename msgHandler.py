@@ -201,6 +201,12 @@ class MsgHandler:
              "hash(首条)=", hashlib.md5(json.dumps(first, ensure_ascii=False, sort_keys=True).encode()).hexdigest()[:8],
              "hash(去掉末条)=", hashlib.md5(json.dumps(task.messages[:-1], ensure_ascii=False, sort_keys=True).encode()).hexdigest()[:8])
 
+        tools = full_gen.get("tools") or []
+        info("[DBG] 请求参数", model, f"tools数={len(tools)}",
+             "tools_hash=", hashlib.md5(json.dumps(tools, ensure_ascii=False, sort_keys=True).encode()).hexdigest()[:8],
+             "角色序列=", [m.get("role") for m in task.messages], "tool_choice=", full_gen.get("tool_choice"),
+             "max_tokens=", full_gen.get("max_tokens"), "system_prompt长度=", len(str(full_gen.get("system_prompt") or "")))
+
         # 3. 调度生成
         result = await asyncio.to_thread(self.manager.generate, model, task.messages, full_gen)
 
