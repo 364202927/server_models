@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 import uuid
 from typing import Any, AsyncGenerator, Iterator
@@ -77,40 +78,59 @@ def _claude_message(
     }
 
 
+# Claude Code 每次请求都会在 system 首块带一个变化的计费头，会使前缀 KV 缓存全部失效
+_BILLING_HEADER = re.compile(r"^x-anthropic-billing-header:[^\n]*\n?", re.MULTILINE)
+
+
+def _blocks_to_text(content: Any) -> str:
+    """content（字符串 / text 块列表）→ 纯字符串，非 text 块忽略。"""
+    if not isinstance(content, list):
+        return str(content or "")
+    return "\n".join(
+        p if isinstance(p, str) else p.get("text", "")
+        for p in content
+        if isinstance(p, str) or p.get("type") == "text"
+    )
+
+
+def _system_text(system: Any) -> str:
+    """system（字符串 / 块列表）→ 字符串，同时剥掉 billing header。"""
+    parts = [system] if isinstance(system, str) else (system or [])
+    texts = (_BILLING_HEADER.sub("", _blocks_to_text([p])).strip() for p in parts)
+    return "\n\n".join(t for t in texts if t)
+
+
 def _claude_message_to_openai(msg: dict[str, Any]) -> list[dict[str, Any]]:
-    """单条 Claude 消息 → 若干 OpenAI 消息（tool_result/tool_use 各成一条，文本合并成一条）。"""
+    """单条 Claude 消息 → 若干 OpenAI 消息：tool_result 各成一条 tool 消息；
+    assistant 的 text 与 tool_use 合成一条（按原顺序）；user 文本合并成一条。"""
     role, content = msg.get("role"), msg.get("content")
     if not isinstance(content, list):
         return [{"role": role, "content": str(content or "")}]
 
-    converted: list[dict[str, Any]] = []
+    tool_msgs: list[dict[str, Any]] = []
     texts: list[str] = []
+    calls: list[dict[str, Any]] = []
     for part in content:
         kind = part.get("type")
         if kind == "text":
             texts.append(part.get("text", ""))
         elif kind == "tool_result":
-            converted.append({
+            tool_msgs.append({
                 "role": "tool",
                 "tool_call_id": part.get("tool_use_id", ""),
-                "content": part.get("content", ""),
+                "content": _blocks_to_text(part.get("content")),
             })
         elif kind == "tool_use":
-            converted.append({
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [{
-                    "id": part.get("id", ""),
-                    "type": "function",
-                    "function": {
-                        "name": part.get("name", ""),
-                        "arguments": _as_json_str(part.get("input", {})),
-                    },
-                }],
+            calls.append({
+                "id": part.get("id", ""),
+                "type": "function",
+                "function": {"name": part.get("name", ""), "arguments": _as_json_str(part.get("input", {}))},
             })
-    if texts:
-        converted.append({"role": role, "content": "\n".join(texts)})
-    return converted
+
+    text = "\n".join(texts)
+    if role == "assistant" and calls:
+        return tool_msgs + [{"role": role, "content": text or None, "tool_calls": calls}]
+    return tool_msgs + ([{"role": role, "content": text}] if texts else [])
 
 
 class clientAdapter:
@@ -122,7 +142,8 @@ class clientAdapter:
         if client_type != "claude":
             return payload
 
-        messages = [{"role": "system", "content": payload["system"]}] if payload.get("system") else []
+        system = _system_text(payload.get("system"))
+        messages = [{"role": "system", "content": system}] if system else []
         for msg in payload.get("messages", []):
             messages.extend(_claude_message_to_openai(msg))
 

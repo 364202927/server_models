@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import uuid
 from dataclasses import dataclass, field
@@ -8,7 +9,6 @@ from typing import Any
 
 from . import adim_ID
 from .loader.models_mgr import ModelsMgr
-from .loader.chatDataFilter import chatDataFilter
 from .utils.common import info, warn
 from .utils.hardware import detect_hardware
 
@@ -78,16 +78,18 @@ class MsgHandler:
             self._current_task = task
             try:
                 info("队列任务开始执行", task.source, task.task_id, "model=", task.model)
-                if task.timeout and task.timeout > 0:
-                    result = await asyncio.wait_for(self._dispatch(task), timeout=task.timeout)
-                else:
-                    result = await self._dispatch(task)
-
-                if not task.future.cancelled():
-                    task.future.set_result(result)
-            except asyncio.TimeoutError:
-                if not task.future.cancelled():
-                    task.future.set_exception(TimeoutError(f"任务超时 ({task.timeout}s)"))
+                job = asyncio.ensure_future(self._dispatch(task))
+                wait_s = task.timeout if task.timeout and task.timeout > 0 else None
+                done, _ = await asyncio.wait({job}, timeout=wait_s)
+                if not done:
+                    # 先通知调用方超时，但 to_thread 里的线程无法中断；
+                    # 必须等它真正结束再放行下一个任务，否则会并发操作同一个非线程安全的引擎对象
+                    if not task.future.cancelled():
+                        task.future.set_exception(TimeoutError(f"任务超时 ({task.timeout}s)"))
+                    warn("任务超时，等待后台推理线程结束后再放行队列", task.task_id)
+                    await asyncio.gather(job, return_exceptions=True)
+                elif not task.future.cancelled():
+                    task.future.set_result(job.result())
             except Exception as exc:
                 if not task.future.cancelled():
                     task.future.set_exception(exc)
@@ -175,40 +177,6 @@ class MsgHandler:
 
         return await self._generate_chat(task)
 
-    # async def _generate_chat(self, task: _TaskItem) -> dict[str, Any]:
-    #     model = task.model
-    #     incoming_args = dict(task.deploy)
-
-    #     # 1. 确保模型就绪 (支持加载时覆写已存在字段)
-    #     await asyncio.to_thread(self.manager.ensure_loaded, model, incoming_args)
-
-    #     # 2. 闭包参数生成：只有在完整配置中存在的键才会被覆盖
-    #     full_gen = self.manager.get_full_generation_config(model)
-    #     for k, v in incoming_args.items():
-    #         if k in full_gen and v is not None:
-    #             full_gen[k] = v
-
-    #     # 提取特殊参数
-    #     if "tools" in incoming_args:
-    #         full_gen["tools"] = incoming_args["tools"]
-    #     if "tool_choice" in incoming_args:
-    #         full_gen["tool_choice"] = incoming_args["tool_choice"]
-
-    #     # 3. 调度生成
-    #     result = await asyncio.to_thread(self.manager.generate, model, task.messages, full_gen)
-
-    #     final_text = chatDataFilter.repair_think_tags(result.text)
-    #     return self._response(model, 0, "ok", final_text) | {
-    #         "tool_calls": result.tool_calls,
-    #         "finish_reason": result.finish_reason,
-    #         "usage": {
-    #             "prompt_tokens": result.prompt_tokens,
-    #             "completion_tokens": result.tokens_generated,
-    #             "time_seconds": result.time_seconds,
-    #             "tokens_per_second": result.tokens_per_second,
-    #         },
-    #     }
-
     async def _generate_chat(self, task: _TaskItem) -> dict[str, Any]:
         model = task.model
         incoming_args = dict(task.deploy)
@@ -227,39 +195,37 @@ class MsgHandler:
         if "tool_choice" in incoming_args:
             full_gen["tool_choice"] = incoming_args["tool_choice"]
 
-        # 3. [功能 1] 生成前预估 Token
-        runtime = self.manager.runtime.get(model)
-        req_max = full_gen.get("max_tokens")
-        metrics = runtime.loader.estimate_genTokens(task.messages)
-        info(f"[{model}] 预估输入: 总计 {metrics['total_prompt_tokens']} tokens | "
-            f"缓存复用 {metrics['cached_tokens']} tokens ({metrics['hit_rate_pct']}%) | "
-            f"本轮实际新增(Delta) {metrics['delta_tokens']} tokens | "
-            f"可用生成空间: {metrics['available_generation_tokens']} tokens")
+        # [DBG] 临时：system 前 120 字符 + 全部 messages 的前缀 hash，用于核对相邻请求前缀是否逐字一致
+        first = task.messages[0] if task.messages else {}
+        info("[DBG] 送入引擎", model, f"共{len(task.messages)}条", "system[:120]=", repr(first)[:120],
+             "hash(首条)=", hashlib.md5(json.dumps(first, ensure_ascii=False, sort_keys=True).encode()).hexdigest()[:8],
+             "hash(去掉末条)=", hashlib.md5(json.dumps(task.messages[:-1], ensure_ascii=False, sort_keys=True).encode()).hexdigest()[:8])
 
-        # 4. 调度生成
+        # 3. 调度生成
         result = await asyncio.to_thread(self.manager.generate, model, task.messages, full_gen)
 
-        # 5. [功能 2 & 3] 计算生成速率 (token/s) 与 剩余 KV Cache
-        speed = result.tokens_per_second
-        total_used = result.prompt_tokens + result.tokens_generated
-        
-        remaining_kv = 0
-        remaining_kv = runtime.loader.remaining_kvCache(total_used)
+        # 4. 指标取自引擎返回的真值（事后统计，不做生成前估算）
+        loader = self.manager.runtime[model].loader
+        remaining_kv = loader.remaining_kvCache(result.prompt_tokens + result.tokens_generated)
+        cached = result.cached_tokens
+        cache_info = (f"缓存复用 {cached}/{result.prompt_tokens} tokens "
+                      f"({cached / max(1, result.prompt_tokens) * 100:.1f}%), 本轮重算 {result.prompt_tokens - cached} tokens"
+                      if cached >= 0 else "缓存复用: 引擎未提供")
+        info(f"[{model}] 生成完成 -> {cache_info} | "
+             f"速率: {result.tokens_per_second:.2f} token/s, "
+             f"生成: {result.tokens_generated} tokens, "
+             f"耗时: {result.time_seconds:.2f}s, "
+             f"剩余 KV Cache: {remaining_kv} tokens")
 
-        info(f"[{model}] 生成完成 -> 速率: {speed:.2f} token/s, "
-            f"生成: {result.tokens_generated} tokens, "
-            f"耗时: {result.time_seconds:.2f}s, "
-            f"剩余 KV Cache: {remaining_kv} tokens")
-
-        final_text = chatDataFilter.repair_think_tags(result.text)
-        return self._response(model, 0, "ok", final_text) | {
+        return self._response(model, 0, "ok", result.text) | {
             "tool_calls": result.tool_calls,
             "finish_reason": result.finish_reason,
             "usage": {
                 "prompt_tokens": result.prompt_tokens,
                 "completion_tokens": result.tokens_generated,
+                "cached_tokens": result.cached_tokens,
                 "time_seconds": result.time_seconds,
-                "tokens_per_second": round(speed, 2),
+                "tokens_per_second": round(result.tokens_per_second, 2),
                 "kv_cache_remaining": remaining_kv,
             },
         }

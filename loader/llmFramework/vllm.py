@@ -2,8 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 from ...utils.common import info as log_info
-from ..chatDataFilter import flatten_messages
-from .baseInference import baseInference
+from .baseInference import RawOutput, baseInference
 
 try:
     from vllm import LLM, SamplingParams
@@ -63,18 +62,11 @@ class vllm(baseInference):
             self._model = LLM(**llm_kwargs)
             self._sleep_capable = False
 
-        self._effective_load = {"engine": "vllm", **llm_kwargs}
+        self._tokenizer = self._model.get_tokenizer()
+        # 以引擎实际生效的 max_model_len 为准（未显式配置时由模型 config 决定）
+        max_len = self._model.llm_engine.model_config.max_model_len
+        self._effective_load = {"engine": "vllm", **llm_kwargs, "context_length": int(max_len)}
         return self
-
-    def count_tokens(self, text_or_messages: str | list[dict[str, Any]]) -> int:
-        tokenizer = self._model.get_tokenizer()
-        if isinstance(text_or_messages, str):
-            return len(tokenizer.encode(text_or_messages))
-        try:
-            rendered = tokenizer.apply_chat_template(text_or_messages, tokenize=False, add_generation_prompt=True)
-            return len(tokenizer.encode(rendered))
-        except Exception:
-            return len(tokenizer.encode(flatten_messages(text_or_messages)))
 
     def _engine_sleep(self) -> None:
         self._model.sleep(level=1)
@@ -86,23 +78,23 @@ class vllm(baseInference):
         self,
         messages: list[dict[str, Any]],
         gen_cfg: dict[str, Any],
-    ) -> tuple[str, int, int, list[dict[str, Any]], str]:
-        rendered = self._build_chat_prompt(messages)
+    ) -> RawOutput:
         sampling = dict(gen_cfg)
-        sampling.pop("tools", None)
+        rendered = self._build_chat_prompt(messages, sampling.pop("tools", None))
         sampling.pop("tool_choice", None)
-
-        if "stop" in sampling:
-            sampling["stop"] = sampling.pop("stop")
         params = SamplingParams(**sampling)
 
         extra = {"lora_request": self._lora_request} if self._lora_request else {}
         output = self._model.generate([rendered], params, **extra)[0]
         choice = output.outputs[0]
-        tokens = len(choice.token_ids)
-        prompt_tokens = len(output.prompt_token_ids)
-        finish_reason = choice.finish_reason or "stop"
-        return choice.text, tokens, prompt_tokens, [], finish_reason
+        cached = getattr(output, "num_cached_tokens", None)  # 前缀缓存(APC)命中的 prompt token 数
+        return RawOutput(
+            text=choice.text,
+            tokens=len(choice.token_ids),
+            prompt_tokens=len(output.prompt_token_ids),
+            finish_reason=choice.finish_reason or "stop",
+            cached_tokens=-1 if cached is None else int(cached),
+        )
 
     def _unload_engine(self) -> None:
         self._mark_unloaded()

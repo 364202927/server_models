@@ -1,18 +1,21 @@
 from __future__ import annotations
 
 import importlib
+import inspect
 from pathlib import Path
 from typing import Any
 
 from ...utils.hardware import detect_gpu
-from ...utils.common import error
-from ..chatDataFilter import flatten_messages
-from .baseInference import baseInference
+from .baseInference import RawOutput, baseInference
 
 try:
+    import llama_cpp
     from llama_cpp import Llama
+    from llama_cpp.llama_chat_format import Jinja2ChatFormatter
 except ImportError:
+    llama_cpp = None
     Llama = None
+    Jinja2ChatFormatter = None
 
 
 def _gpu_offload_supported() -> bool | None:
@@ -38,6 +41,7 @@ class llama(baseInference):
         self._saved_llm_kwargs: dict[str, Any] | None = None
         self._saved_draft_kwargs: dict[str, Any] | None = None
         self._draft_model = None
+        self._formatter = None
 
     @staticmethod
     def _resolve_gguf_file(model_path: str) -> Path:
@@ -71,7 +75,7 @@ class llama(baseInference):
             "n_gpu_layers": gpu_layers,
             "n_ctx": calculated_n_ctx,
             "n_batch": int(load_cfg.get("batch_size", 512)),
-            "verbose": False,
+            "verbose": True,  # [DBG] 临时开启：stderr 输出前缀命中/partial kv removal 日志
             "use_mlock": bool(load_cfg.get("use_mlock", True)),
         }
         if "flash_attention" in load_cfg:
@@ -110,28 +114,40 @@ class llama(baseInference):
         }
         return self
 
-    def count_tokens(self, text_or_messages: str | list[dict[str, Any]]) -> int:
+    def _chat_formatter(self):
+        """按 GGUF 内嵌 chat template 构造渲染器（与 create_chat_completion 实际喂给模型的 prompt 一致），惰性缓存。"""
+        if self._formatter is None:
+            template = self._model.metadata.get("tokenizer.chat_template")
+            if not template:
+                raise RuntimeError("GGUF 缺少 tokenizer.chat_template，无法计算消息 token 数")
+            token_str = lambda tid: self._model.detokenize([tid]).decode("utf-8", errors="ignore")
+            self._formatter = Jinja2ChatFormatter(
+                template=template,
+                eos_token=token_str(self._model.token_eos()),
+                bos_token=token_str(self._model.token_bos()),
+                add_generation_prompt=True,
+            )
+        return self._formatter
+
+    def count_tokens(self, text_or_messages: str | list[dict[str, Any]], tools: list[dict[str, Any]] | None = None) -> int:
         if not self.is_loaded:
             raise RuntimeError("Model not loaded.")
         if isinstance(text_or_messages, str):
             return len(self._model.tokenize(text_or_messages.encode("utf-8")))
 
-        try:
-            prompt_str = self._model.chat_template(messages=text_or_messages) if hasattr(self._model, "chat_template") else None
-            if not prompt_str:
-                prompt_str = flatten_messages(text_or_messages)
-        except Exception:
-            prompt_str = flatten_messages(text_or_messages)
-        return len(self._model.tokenize(prompt_str.encode("utf-8")))
+        prompt = self._chat_formatter()(messages=text_or_messages, tools=tools or None).prompt
+        # 模板已含 BOS 时不再重复添加，与 llama-cpp-python 的 chat handler 行为一致
+        return len(self._model.tokenize(prompt.encode("utf-8"), add_bos=False, special=True))
 
     def _response(
         self,
         messages: list[dict[str, Any]],
         gen_cfg: dict[str, Any],
-    ) -> tuple[str, int, int, list[dict[str, Any]], str]:
+    ) -> RawOutput:
         cfg = dict(gen_cfg)
-        max_tokens = self._clamp_to_context(messages, int(cfg.pop("max_tokens", 512)))
-        cfg["max_tokens"] = max_tokens
+        tools = cfg.pop("tools", None)
+        tool_choice = cfg.pop("tool_choice", None)
+        cfg["max_tokens"] = self._clamp_to_context(messages, int(cfg.pop("max_tokens", 512)), tools)
 
         # 1. 字段映射对齐（llama-cpp-python 专有键名）
         if "repetition_penalty" in cfg:
@@ -139,8 +155,6 @@ class llama(baseInference):
         if "mirostat" in cfg:
             cfg["mirostat_mode"] = cfg.pop("mirostat")
 
-        tools = cfg.pop("tools", None)
-        tool_choice = cfg.pop("tool_choice", None)
         extra: dict[str, Any] = {}
         if tools:
             extra["tools"] = tools
@@ -148,43 +162,32 @@ class llama(baseInference):
             extra["tool_choice"] = tool_choice
 
         # 2. 过滤底层不支持的参数，避免 TypeError 崩溃
-        import inspect
-        try:
-            valid_params = inspect.signature(self._model.create_chat_completion).parameters
-            filtered_cfg = {k: v for k, v in cfg.items() if k in valid_params}
-        except Exception:
-            filtered_cfg = cfg
+        valid_params = inspect.signature(self._model.create_chat_completion).parameters
+        filtered_cfg = {k: v for k, v in cfg.items() if k in valid_params}
 
-        try:
-            result = self._model.create_chat_completion(messages=messages, **extra, **filtered_cfg)
-            choice = result["choices"][0]
-            message = choice["message"]
-            text = str(message.get("content") or "")
-            calls = message.get("tool_calls") or []
-            finish_reason = str(choice.get("finish_reason") or ("tool_calls" if calls else "stop"))
-            usage = result.get("usage", {})
-            prompt_tokens = int(usage.get("prompt_tokens", 0))
-            tokens = int(usage.get("completion_tokens", 0))
-        except Exception as exc:
-            error("原生模板推理异常，回退纯文本补全", type(exc).__name__, exc)
-            flat = flatten_messages(messages)
-            try:
-                call_params = inspect.signature(self._model.__call__).parameters
-                call_cfg = {k: v for k, v in filtered_cfg.items() if k in call_params}
-            except Exception:
-                call_cfg = filtered_cfg
-            result = self._model(flat, **call_cfg)
-            text = str(result["choices"][0].get("text", ""))
-            tokens = len(self._model.tokenize(text.encode("utf-8")))
-            prompt_tokens = len(self._model.tokenize(flat.encode("utf-8")))
-            finish_reason = "length" if tokens >= max_tokens else "stop"
-            calls = []
+        # 3. 生成：perf 计数器的 n_p_eval = 本轮真正被重新计算的 prompt token 数
+        llama_cpp.llama_perf_context_reset(self._model.ctx)
+        result = self._model.create_chat_completion(messages=messages, **extra, **filtered_cfg)
+        choice = result["choices"][0]
+        message = choice["message"]
+        calls = message.get("tool_calls") or []
+        usage = result.get("usage", {})
+        prompt_tokens = int(usage.get("prompt_tokens", 0))
+        # 投机解码会让 n_p_eval 混入草稿验证批次，此时无法得到准确值
+        cached = -1 if self._draft_model else max(0, prompt_tokens - llama_cpp.llama_perf_context(self._model.ctx).n_p_eval)
 
-        return text, tokens, prompt_tokens, calls, finish_reason
+        return RawOutput(
+            text=str(message.get("content") or ""),
+            tokens=int(usage.get("completion_tokens", 0)),
+            prompt_tokens=prompt_tokens,
+            calls=calls,
+            finish_reason=str(choice.get("finish_reason") or ("tool_calls" if calls else "stop")),
+            cached_tokens=cached,
+        )
 
-    def _clamp_to_context(self, messages: list[dict[str, Any]], max_new_tokens: int) -> int:
+    def _clamp_to_context(self, messages: list[dict[str, Any]], max_new_tokens: int, tools: list[dict[str, Any]] | None) -> int:
         n_ctx = self._model.n_ctx()
-        prompt_tokens = self.count_tokens(messages)
+        prompt_tokens = self.count_tokens(messages, tools)
         available = n_ctx - prompt_tokens - self._CONTEXT_SAFETY_MARGIN
         if available < self._MIN_GENERATION_TOKENS:
             raise ValueError(f"上下文不足: prompt 约 {prompt_tokens} token, 窗口大小 {n_ctx} token")
@@ -210,6 +213,7 @@ class llama(baseInference):
     def _unload_engine(self) -> None:
         self._engine_sleep()
         self._mark_unloaded()
+        self._formatter = None
         self._saved_llm_kwargs = None
         self._saved_draft_kwargs = None
         self.release_cache()

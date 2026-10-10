@@ -6,27 +6,6 @@ import uuid
 from typing import Any
 
 
-def flatten_messages(messages: list[dict[str, Any]], system_prompt: str = "") -> str:
-    def _text(turn: dict[str, Any]) -> str:
-        role = turn.get("role", "user")
-        content = turn.get("content")
-        if role == "tool":
-            return f"[Tool Result]: {content or ''}"
-        parts = []
-        if isinstance(content, str) and content:
-            parts.append(content)
-        elif isinstance(content, list):
-            parts.append("".join(p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text"))
-        if turn.get("tool_calls"):
-            for tc in turn["tool_calls"]:
-                fn = tc.get("function", {})
-                parts.append(f"[Call Tool: {fn.get('name')}({fn.get('arguments', '')})]")
-        return "\n".join(parts)
-
-    turns = ([{"role": "system", "content": system_prompt}] if system_prompt else []) + list(messages)
-    return "\n".join(f"{turn.get('role', 'user')}: {_text(turn)}" for turn in turns)
-
-
 def resolve_think_level(*, think: Any = None, reasoning_effort: Any = None) -> int:
     levels = {"none": 0, "low": 1, "medium": 3, "high": 5}
     if think is not None:
@@ -38,12 +17,6 @@ def resolve_think_level(*, think: Any = None, reasoning_effort: Any = None) -> i
 
 class chatDataFilter:
     """聊天数据过滤器：清洗与状态校正。"""
-
-    @staticmethod
-    def repair_think_tags(text: str) -> str:
-        if "</think>" in text and not text.lstrip().startswith("<think>"):
-            return "<think>\n" + text
-        return text
 
     @staticmethod
     def clean_think_history(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:

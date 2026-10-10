@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from starlette.responses import StreamingResponse
 
 from .clientAdapter import clientAdapter
+from .common import info
 from ..loader.models_mgr import ModelsMgr
 from ..msgHandler import AdminRequest, ChatRequest, MsgHandler
 
@@ -154,7 +155,9 @@ class serverApi:
                 body = await raw_req.json()
             except Exception:
                 raise HTTPException(status_code=400, detail="无效的 JSON 请求体")
+            info("[DBG] Claude原始system[:120]", repr(body.get("system"))[:120])
             openai_body = clientAdapter.inbound_to_openai(body, client_type="claude")
+            info("[DBG] Claude转换后system[:120]", repr(openai_body["messages"][0])[:120])
             request = openChatReq(**openai_body)
             return await self._chat(request, client_type="claude")
         return app

@@ -2,8 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 from ...utils.common import info as log_info
-from ..chatDataFilter import flatten_messages
-from .baseInference import baseInference
+from .baseInference import RawOutput, baseInference
 
 try:
     import sglang as sgl
@@ -59,18 +58,11 @@ class sglang(baseInference):
             self._model = sgl.Engine(**engine_kwargs)
             self._sleep_capable = False
 
-        self._effective_load = {"engine": "sglang", **engine_kwargs}
+        self._tokenizer = self._model.tokenizer_manager.tokenizer
+        # 以引擎实际生效的 context_len 为准（未显式配置时由模型 config 决定）
+        ctx_len = self._model.tokenizer_manager.context_len
+        self._effective_load = {"engine": "sglang", **engine_kwargs, "context_length": int(ctx_len)}
         return self
-
-    def count_tokens(self, text_or_messages: str | list[dict[str, Any]]) -> int:
-        tokenizer = self._model.tokenizer_manager.tokenizer
-        if isinstance(text_or_messages, str):
-            return len(tokenizer.encode(text_or_messages))
-        try:
-            rendered = tokenizer.apply_chat_template(text_or_messages, tokenize=False, add_generation_prompt=True)
-            return len(tokenizer.encode(rendered))
-        except Exception:
-            return len(tokenizer.encode(flatten_messages(text_or_messages)))
 
     def _engine_sleep(self) -> None:
         self._model.release_memory_occupation()
@@ -82,20 +74,25 @@ class sglang(baseInference):
         self,
         messages: list[dict[str, Any]],
         gen_cfg: dict[str, Any],
-    ) -> tuple[str, int, int, list[dict[str, Any]], str]:
-        rendered = self._build_chat_prompt(messages)
+    ) -> RawOutput:
         sampling = dict(gen_cfg)
-        sampling.pop("tools", None)
+        rendered = self._build_chat_prompt(messages, sampling.pop("tools", None))
         sampling.pop("tool_choice", None)
         if "max_tokens" in sampling:
             sampling["max_new_tokens"] = sampling.pop("max_tokens")
 
         result = self._model.generate(prompt=rendered, sampling_params=sampling)
         meta = result.get("meta_info", {}) if isinstance(result, dict) else {}
-        tokens = int(meta.get("completion_tokens", 0))
-        prompt_tokens = int(meta.get("prompt_tokens", 0))
         finish_reason = meta.get("finish_reason", "stop")
-        return result["text"], tokens, prompt_tokens, [], finish_reason
+        if isinstance(finish_reason, dict):  # sglang 以 {"type": "stop"|"length", ...} 形式返回
+            finish_reason = finish_reason.get("type", "stop")
+        return RawOutput(
+            text=result["text"],
+            tokens=int(meta.get("completion_tokens", 0)),
+            prompt_tokens=int(meta.get("prompt_tokens", 0)),
+            finish_reason=str(finish_reason),
+            cached_tokens=int(meta.get("cached_tokens", -1)),
+        )
 
     def _unload_engine(self) -> None:
         if self._model is not None:

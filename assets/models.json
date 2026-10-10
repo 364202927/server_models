@@ -1,6 +1,6 @@
 {
   "defaults": {
-    "sleepTime": 60,
+    "sleepTime": 0,
     "server": {
       "host": "0.0.0.0",
       "api_port": 8666,
