@@ -89,18 +89,19 @@ class serverApi:
         self,
         x_api_key: str | None = Header(default=None),
         authorization: str | None = Header(default=None),
-    ) -> None:
-        expected = str(self._server_settings().get("api_key", ""))
+    ) -> bool:
+        """API Key 鉴权：未配置 key 时直接放行返回 True；配置时验证一致性。"""
+        expected = str(self._server_settings().get("api_key", "")).strip()
         if not expected:
-            return
+            return True
+
         bearer = authorization or ""
         token = x_api_key or (bearer[7:].strip() if bearer.lower().startswith("bearer ") else None)
-        if token != expected:
-            raise HTTPException(status_code=401, detail="API key 无效")
-
+        if not token or token != expected:
+            raise HTTPException(status_code=401, detail="API key 无效或未提供")
+        return True
+    # 聊天指令路由
     async def _chat(self, request: openChatReq, client_type: str = "openai") -> Any:
-        """统一聊天处理管道：执行业务校验、调用引擎、按目标协议打包出站响应。"""
-        # 管理指令路由
         if request.message_id != 0:
             admin_req = AdminRequest(
                 message_id=request.message_id,
@@ -108,21 +109,13 @@ class serverApi:
                 args=request.args,
             )
             return await self.handler.admin(admin_req, source=client_type)
-
         if not request.model or not request.messages:
             raise HTTPException(status_code=400, detail="model 和 messages 不能为空")
-
         # 核心引擎内部仅消费标准的 OpenAI 结构请求
         result = await self.handler.chat(_to_chat_request(request), source=client_type)
         payload = _build_payload(result, request.model)
-
         # 统一由 clientAdapter 出站转换器处理（按 client_type 输出为对应的 Dict 或 Streaming 生成器）
-        outbound_res = clientAdapter.outbound(
-            openai_resp=payload,
-            client_type=client_type,
-            stream=request.stream,
-            chunk_size=request.stream_delta_chunk_size,
-        )
+        outbound_res = clientAdapter.outbound(openai_resp=payload,client_type=client_type,stream=request.stream,chunk_size=request.stream_delta_chunk_size)
 
         if request.stream:
             return StreamingResponse(outbound_res, media_type="text/event-stream")
@@ -139,7 +132,7 @@ class serverApi:
         )
 
         @app.get("/v1/models")
-        async def models(_: None = Depends(self._require_api_key)) -> dict[str, Any]:
+        async def models(_: bool = Depends(self._require_api_key)) -> dict[str, Any]:
             now = int(time.time())
             return {
                 "object": "list",
@@ -151,26 +144,22 @@ class serverApi:
 
         # 1. OpenAI 协议端点
         @app.post("/v1/chat/completions", response_model=None)
-        async def chat_completions(request: openChatReq, _: None = Depends(self._require_api_key)) -> Any:
+        async def chat_completions(request: openChatReq, _: bool = Depends(self._require_api_key)) -> Any:
             return await self._chat(request, client_type="openai")
 
         # 2. Claude / Anthropic 协议端点
         @app.post("/v1/messages", response_model=None)
-        async def claude_messages(raw_req: Request, _: None = Depends(self._require_api_key)) -> Any:
+        async def claude_messages(raw_req: Request, _: bool = Depends(self._require_api_key)) -> Any:
             try:
                 body = await raw_req.json()
             except Exception:
                 raise HTTPException(status_code=400, detail="无效的 JSON 请求体")
-
-            # 将 Claude 入参协议转换为标准 openChatReq
             openai_body = clientAdapter.inbound_to_openai(body, client_type="claude")
             request = openChatReq(**openai_body)
             return await self._chat(request, client_type="claude")
-
         return app
 
     async def run(self) -> None:
-        """启动 uvicorn 服务供 main.py 异步任务调用"""
         import uvicorn
         settings = self._server_settings()
         config = uvicorn.Config(
