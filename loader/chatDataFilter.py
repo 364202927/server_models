@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import uuid
@@ -17,6 +18,56 @@ def resolve_think_level(*, think: Any = None, reasoning_effort: Any = None) -> i
 
 class chatDataFilter:
     """聊天数据过滤器：清洗与状态校正。"""
+
+    @staticmethod
+    def _canon_args(args: Any) -> str:
+        """工具参数规范化（字符串/字典等价），保证两侧指纹一致。"""
+        if isinstance(args, str):
+            try:
+                args = json.loads(args) if args.strip() else {}
+            except json.JSONDecodeError:
+                return args
+        return json.dumps(args, ensure_ascii=False, sort_keys=True)
+
+    @classmethod
+    def memo_key(cls, prev: dict[str, Any] | None, msg: dict[str, Any]) -> str:
+        """assistant 消息指纹 = 触发它的上一条消息 + 客户端能原样回传的部分。
+        有 tool_calls 时只看调用（伴随文本不会回传），否则看去 think 后的正文。"""
+        calls = msg.get("tool_calls") or []
+        if calls:
+            body = json.dumps(
+                [[tc.get("function", {}).get("name"), cls._canon_args(tc.get("function", {}).get("arguments"))] for tc in calls],
+                ensure_ascii=False,
+            )
+        else:
+            content = msg.get("content")
+            if isinstance(content, list):
+                content = "".join(p.get("text", "") for p in content if isinstance(p, dict))
+            text = content or ""
+            if "</think>" in text:
+                text = text.split("</think>", 1)[1]
+            body = text.strip()
+        prev_part = json.dumps(prev, ensure_ascii=False, sort_keys=True, default=str) if prev else ""
+        return hashlib.md5(f"{prev_part}\x00{body}".encode("utf-8")).hexdigest()
+
+    @classmethod
+    def restore_raw_assistant(
+        cls, messages: list[dict[str, Any]], memo: dict[str, str]
+    ) -> tuple[list[dict[str, Any]], int, int]:
+        """命中记忆库的 assistant 消息还原为引擎当时生成的原文（含 think / 工具调用标签），
+        使渲染出的历史与 KV 缓存逐 token 一致。返回 (消息, 还原条数, 未命中条数)。"""
+        restored = missed = 0
+        out = list(messages)
+        for i, msg in enumerate(messages):
+            if msg.get("role") != "assistant":
+                continue
+            raw = memo.get(cls.memo_key(messages[i - 1] if i else None, msg))
+            if raw is None:
+                missed += 1
+                continue
+            out[i] = {"role": "assistant", "content": raw}
+            restored += 1
+        return out, restored, missed
 
     @staticmethod
     def clean_think_history(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import gc
 import os
 import time
+from collections import OrderedDict
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Iterator
@@ -50,12 +51,16 @@ class MemoryUsage:
 class baseInference(ABC):
     """推理框架抽象基类：入参规范收敛。"""
 
+    _RAW_MEMO_MAX = 256
+
     def __init__(self) -> None:
         self._model = None
         self._tokenizer = None
         self._effective_load: dict[str, Any] = {}
         self._sleeping = False
         self._sleep_capable = False
+        # 引擎原始输出记忆库：下一轮请求把清洗后的历史还原成 KV 里的原文，避免前缀分叉
+        self._raw_memo: OrderedDict[str, str] = OrderedDict()
 
     @property
     def is_loaded(self) -> bool:
@@ -123,6 +128,7 @@ class baseInference(ABC):
         self._effective_load = {}
         self._sleeping = False
         self._sleep_capable = False
+        self._raw_memo.clear()
 
     def release_cache(self) -> MemoryUsage:
         if torch.cuda.is_available():
@@ -160,6 +166,9 @@ class baseInference(ABC):
             system_instruction=system_instruction,
         )
 
+        cleaned_messages, restored, missed = chatDataFilter.restore_raw_assistant(cleaned_messages, self._raw_memo)
+        log_info("[DBG] assistant 原文还原", f"命中 {restored} 条, 未命中 {missed} 条, 记忆库 {len(self._raw_memo)} 条")
+
         start = time.perf_counter()
         raw = self._response(messages=cleaned_messages, gen_cfg=cfg)
         elapsed = time.perf_counter() - start
@@ -167,6 +176,14 @@ class baseInference(ABC):
         final_text, final_calls, final_reason = chatDataFilter.postprocess_result(
             raw.text, raw.calls, raw.finish_reason
         )
+        key = chatDataFilter.memo_key(
+            cleaned_messages[-1] if cleaned_messages else None,
+            {"role": "assistant", "content": final_text, "tool_calls": final_calls},
+        )
+        self._raw_memo[key] = raw.text
+        self._raw_memo.move_to_end(key)
+        while len(self._raw_memo) > self._RAW_MEMO_MAX:
+            self._raw_memo.popitem(last=False)
 
         return GenerationResult(
             text=final_text,

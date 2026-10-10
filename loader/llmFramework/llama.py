@@ -5,6 +5,7 @@ import inspect
 from pathlib import Path
 from typing import Any
 
+from ...utils.common import info
 from ...utils.hardware import detect_gpu
 from .baseInference import RawOutput, baseInference
 
@@ -42,6 +43,7 @@ class llama(baseInference):
         self._saved_draft_kwargs: dict[str, Any] | None = None
         self._draft_model = None
         self._formatter = None
+        self._last_seq: list[int] = []  # 上一轮结束时引擎 KV 中的完整 token 序列（仅用于分叉诊断）
 
     @staticmethod
     def _resolve_gguf_file(model_path: str) -> Path:
@@ -129,15 +131,30 @@ class llama(baseInference):
             )
         return self._formatter
 
+    def _prompt_tokens(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None) -> list[int]:
+        """消息 → 模板渲染 → token 序列，与 llama-cpp-python 的 chat handler 实际喂给模型的序列一致。"""
+        prompt = self._chat_formatter()(messages=messages, tools=tools or None).prompt
+        # 模板已含 BOS 时不再重复添加
+        return self._model.tokenize(prompt.encode("utf-8"), add_bos=False, special=True)
+
     def count_tokens(self, text_or_messages: str | list[dict[str, Any]], tools: list[dict[str, Any]] | None = None) -> int:
         if not self.is_loaded:
             raise RuntimeError("Model not loaded.")
         if isinstance(text_or_messages, str):
             return len(self._model.tokenize(text_or_messages.encode("utf-8")))
+        return len(self._prompt_tokens(text_or_messages, tools))
 
-        prompt = self._chat_formatter()(messages=text_or_messages, tools=tools or None).prompt
-        # 模板已含 BOS 时不再重复添加，与 llama-cpp-python 的 chat handler 行为一致
-        return len(self._model.tokenize(prompt.encode("utf-8"), add_bos=False, special=True))
+    def _debug_divergence(self, tokens: list[int]) -> None:
+        """[DBG] 对比上一轮 KV 序列与本轮 prompt，打印分叉位置及前后文本。"""
+        old = self._last_seq
+        if not old:
+            info("[DBG] 分叉诊断: 无上一轮 KV 记录(首轮/刚唤醒)")
+            return
+        d = next((i for i, (a, b) in enumerate(zip(old, tokens)) if a != b), min(len(old), len(tokens)))
+        show = lambda seq: repr(self._model.detokenize(seq[max(0, d - 4):d + 6]).decode("utf-8", errors="replace"))
+        verdict = "严格延长(应命中)" if d == len(old) else f"在第 {d} 个 token 分叉(需回退 {len(old) - d} 步)"
+        info("[DBG] 分叉诊断:", verdict, f"| 上轮KV={len(old)} 本轮prompt={len(tokens)}",
+             "| 上轮该处:", show(old), "| 本轮该处:", show(tokens))
 
     def _response(
         self,
@@ -147,7 +164,9 @@ class llama(baseInference):
         cfg = dict(gen_cfg)
         tools = cfg.pop("tools", None)
         tool_choice = cfg.pop("tool_choice", None)
-        cfg["max_tokens"] = self._clamp_to_context(messages, int(cfg.pop("max_tokens", 512)), tools)
+        prompt_ids = self._prompt_tokens(messages, tools)
+        self._debug_divergence(prompt_ids)
+        cfg["max_tokens"] = self._clamp_to_context(len(prompt_ids), int(cfg.pop("max_tokens", 512)))
 
         # 1. 字段映射对齐（llama-cpp-python 专有键名）
         if "repetition_penalty" in cfg:
@@ -168,6 +187,7 @@ class llama(baseInference):
         # 3. 生成：perf 计数器的 n_p_eval = 本轮真正被重新计算的 prompt token 数
         llama_cpp.llama_perf_context_reset(self._model.ctx)
         result = self._model.create_chat_completion(messages=messages, **extra, **filtered_cfg)
+        self._last_seq = self._model._input_ids.tolist()
         choice = result["choices"][0]
         message = choice["message"]
         calls = message.get("tool_calls") or []
@@ -185,15 +205,15 @@ class llama(baseInference):
             cached_tokens=cached,
         )
 
-    def _clamp_to_context(self, messages: list[dict[str, Any]], max_new_tokens: int, tools: list[dict[str, Any]] | None) -> int:
+    def _clamp_to_context(self, prompt_tokens: int, max_new_tokens: int) -> int:
         n_ctx = self._model.n_ctx()
-        prompt_tokens = self.count_tokens(messages, tools)
         available = n_ctx - prompt_tokens - self._CONTEXT_SAFETY_MARGIN
         if available < self._MIN_GENERATION_TOKENS:
             raise ValueError(f"上下文不足: prompt 约 {prompt_tokens} token, 窗口大小 {n_ctx} token")
         return min(max_new_tokens, available)
 
     def _engine_sleep(self) -> None:
+        self._last_seq = []
         model, self._model = self._model, None
         if hasattr(model, "close"):
             model.close()
