@@ -50,34 +50,51 @@ class chatDataFilter:
         prev_part = json.dumps(prev, ensure_ascii=False, sort_keys=True, default=str) if prev else ""
         return hashlib.md5(f"{prev_part}\x00{body}".encode("utf-8")).hexdigest()
 
+    @staticmethod
+    def split_raw(raw_text: str) -> dict[str, str]:
+        """引擎原文拆成模板所需的两段：think 正文（reasoning_content）与 </think> 之后的文字（去掉工具调用块）。"""
+        head, sep, tail = raw_text.partition("</think>")
+        if not sep:
+            return {"reasoning": "", "content": ""}
+        reasoning = head.strip().removeprefix("<think>").strip()
+        tail = re.sub(r"<tool_call>.*?(?:</tool_call>|$)", "", tail, flags=re.DOTALL)
+        tail = re.sub(r"<function=.*?(?:</function>|$)", "", tail, flags=re.DOTALL)
+        return {"reasoning": reasoning, "content": tail.strip()}
+
     @classmethod
     def restore_raw_assistant(
-        cls, messages: list[dict[str, Any]], memo: dict[str, str]
+        cls, messages: list[dict[str, Any]], memo: dict[str, dict[str, str]]
     ) -> tuple[list[dict[str, Any]], int, int]:
-        """命中记忆库的 assistant 消息还原为引擎当时生成的原文（含 think / 工具调用标签），
-        使渲染出的历史与 KV 缓存逐 token 一致。返回 (消息, 还原条数, 未命中条数)。"""
+        """客户端丢掉 think 的 assistant 消息，按指纹从记忆库补回 reasoning_content，
+        使模板渲染出的历史与 KV 里的原文逐 token 一致。返回 (消息, 还原条数, 未命中条数)。"""
         restored = missed = 0
         out = list(messages)
         for i, msg in enumerate(messages):
-            if msg.get("role") != "assistant":
+            if msg.get("role") != "assistant" or msg.get("reasoning_content"):
                 continue
-            raw = memo.get(cls.memo_key(messages[i - 1] if i else None, msg))
-            if raw is None:
+            hit = memo.get(cls.memo_key(messages[i - 1] if i else None, msg))
+            if hit is None:
                 missed += 1
                 continue
-            out[i] = {"role": "assistant", "content": raw}
+            item = dict(msg, reasoning_content=hit["reasoning"])
+            if msg.get("tool_calls") and not item.get("content"):
+                item["content"] = hit["content"]  # 客户端不会回传工具调用前的伴随文字
+            out[i] = item
             restored += 1
         return out, restored, missed
 
     @staticmethod
     def clean_think_history(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """content 内联的 <think>…</think> 拆到 reasoning_content（Qwen 模板只认该字段）；
+        不丢弃 think，否则渲染出的历史与 KV 分叉，混合架构整段重算。"""
         cleaned = []
         for item in messages:
             msg = dict(item)
             content = msg.get("content")
             if msg.get("role") == "assistant" and isinstance(content, str):
                 if "</think>" in content:
-                    content = content.split("</think>", 1)[1].strip()
+                    head, _, content = content.partition("</think>")
+                    msg.setdefault("reasoning_content", head.strip().removeprefix("<think>").strip())
                 content = re.sub(r"<tool_call>\s*</tool_call>", "", content, flags=re.DOTALL)
                 msg["content"] = content.strip()
             cleaned.append(msg)

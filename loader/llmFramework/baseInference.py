@@ -59,8 +59,8 @@ class baseInference(ABC):
         self._effective_load: dict[str, Any] = {}
         self._sleeping = False
         self._sleep_capable = False
-        # 引擎原始输出记忆库：下一轮请求把清洗后的历史还原成 KV 里的原文，避免前缀分叉
-        self._raw_memo: OrderedDict[str, str] = OrderedDict()
+        # 引擎输出记忆库（reasoning/content）：客户端丢掉 think 时，下一轮补回 reasoning_content，避免前缀分叉
+        self._raw_memo: OrderedDict[str, dict[str, str]] = OrderedDict()
 
     @property
     def is_loaded(self) -> bool:
@@ -167,9 +167,10 @@ class baseInference(ABC):
         )
 
         roles_in = [m.get("role") for m in cleaned_messages]
+        inline_think = sum(1 for m in cleaned_messages if m.get("reasoning_content"))
         cleaned_messages, restored, missed = chatDataFilter.restore_raw_assistant(cleaned_messages, self._raw_memo)
         log_info("[DBG] assistant 原文还原", f"命中 {restored} 条, 未命中 {missed} 条, 记忆库 {len(self._raw_memo)} 条",
-                 "| 清洗后角色序列:", roles_in, "| 有system注入:", bool(system_instruction))
+                 "| 客户端自带think:", inline_think, "| 清洗后角色序列:", roles_in, "| 有system注入:", bool(system_instruction))
 
         start = time.perf_counter()
         raw = self._response(messages=cleaned_messages, gen_cfg=cfg)
@@ -184,7 +185,7 @@ class baseInference(ABC):
             cleaned_messages[-1] if cleaned_messages else None,
             {"role": "assistant", "content": final_text, "tool_calls": final_calls},
         )
-        self._raw_memo[key] = raw.text
+        self._raw_memo[key] = chatDataFilter.split_raw(raw.text)
         self._raw_memo.move_to_end(key)
         while len(self._raw_memo) > self._RAW_MEMO_MAX:
             self._raw_memo.popitem(last=False)
