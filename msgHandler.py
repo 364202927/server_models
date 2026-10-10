@@ -175,27 +175,81 @@ class MsgHandler:
 
         return await self._generate_chat(task)
 
+    # async def _generate_chat(self, task: _TaskItem) -> dict[str, Any]:
+    #     model = task.model
+    #     incoming_args = dict(task.deploy)
+
+    #     # 1. 确保模型就绪 (支持加载时覆写已存在字段)
+    #     await asyncio.to_thread(self.manager.ensure_loaded, model, incoming_args)
+
+    #     # 2. 闭包参数生成：只有在完整配置中存在的键才会被覆盖
+    #     full_gen = self.manager.get_full_generation_config(model)
+    #     for k, v in incoming_args.items():
+    #         if k in full_gen and v is not None:
+    #             full_gen[k] = v
+
+    #     # 提取特殊参数
+    #     if "tools" in incoming_args:
+    #         full_gen["tools"] = incoming_args["tools"]
+    #     if "tool_choice" in incoming_args:
+    #         full_gen["tool_choice"] = incoming_args["tool_choice"]
+
+    #     # 3. 调度生成
+    #     result = await asyncio.to_thread(self.manager.generate, model, task.messages, full_gen)
+
+    #     final_text = chatDataFilter.repair_think_tags(result.text)
+    #     return self._response(model, 0, "ok", final_text) | {
+    #         "tool_calls": result.tool_calls,
+    #         "finish_reason": result.finish_reason,
+    #         "usage": {
+    #             "prompt_tokens": result.prompt_tokens,
+    #             "completion_tokens": result.tokens_generated,
+    #             "time_seconds": result.time_seconds,
+    #             "tokens_per_second": result.tokens_per_second,
+    #         },
+    #     }
+
     async def _generate_chat(self, task: _TaskItem) -> dict[str, Any]:
         model = task.model
         incoming_args = dict(task.deploy)
 
-        # 1. 确保模型就绪 (支持加载时覆写已存在字段)
+        # 1. 确保模型就绪
         await asyncio.to_thread(self.manager.ensure_loaded, model, incoming_args)
 
-        # 2. 闭包参数生成：只有在完整配置中存在的键才会被覆盖
+        # 2. 参数合并
         full_gen = self.manager.get_full_generation_config(model)
         for k, v in incoming_args.items():
             if k in full_gen and v is not None:
                 full_gen[k] = v
 
-        # 提取特殊参数
         if "tools" in incoming_args:
             full_gen["tools"] = incoming_args["tools"]
         if "tool_choice" in incoming_args:
             full_gen["tool_choice"] = incoming_args["tool_choice"]
 
-        # 3. 调度生成
+        # 3. [功能 1] 生成前预估 Token
+        runtime = self.manager.runtime.get(model)
+        req_max = full_gen.get("max_tokens")
+        metrics = runtime.loader.estimate_genTokens(task.messages)
+        info(f"[{model}] 预估输入: 总计 {metrics['total_prompt_tokens']} tokens | "
+            f"缓存复用 {metrics['cached_tokens']} tokens ({metrics['hit_rate_pct']}%) | "
+            f"本轮实际新增(Delta) {metrics['delta_tokens']} tokens | "
+            f"可用生成空间: {metrics['available_generation_tokens']} tokens")
+
+        # 4. 调度生成
         result = await asyncio.to_thread(self.manager.generate, model, task.messages, full_gen)
+
+        # 5. [功能 2 & 3] 计算生成速率 (token/s) 与 剩余 KV Cache
+        speed = result.tokens_per_second
+        total_used = result.prompt_tokens + result.tokens_generated
+        
+        remaining_kv = 0
+        remaining_kv = runtime.loader.remaining_kvCache(total_used)
+
+        info(f"[{model}] 生成完成 -> 速率: {speed:.2f} token/s, "
+            f"生成: {result.tokens_generated} tokens, "
+            f"耗时: {result.time_seconds:.2f}s, "
+            f"剩余 KV Cache: {remaining_kv} tokens")
 
         final_text = chatDataFilter.repair_think_tags(result.text)
         return self._response(model, 0, "ok", final_text) | {
@@ -205,6 +259,7 @@ class MsgHandler:
                 "prompt_tokens": result.prompt_tokens,
                 "completion_tokens": result.tokens_generated,
                 "time_seconds": result.time_seconds,
-                "tokens_per_second": result.tokens_per_second,
+                "tokens_per_second": round(speed, 2),
+                "kv_cache_remaining": remaining_kv,
             },
         }

@@ -59,9 +59,7 @@ class baseInference(ABC):
 
     @abstractmethod
     def load(self, model_path: str, load_cfg: dict[str, Any]) -> "baseInference":
-        """仅需 2 个入参：模型路径与完整加载字典。"""
         pass
-
     @abstractmethod
     def _unload_engine(self) -> None:
         pass
@@ -177,6 +175,92 @@ class baseInference(ABC):
     ) -> tuple[str, int, int, list[dict[str, Any]], str]:
         """子类物理调用：仅 2 个入参。"""
         pass
+    #当前模型上下文总窗口大小
+    def context_limit(self) -> int:
+        if not self.is_loaded:
+            return 0
+        # 优先读取已生效的 context_length 配置
+        if "context_length" in self._effective_load:
+            return int(self._effective_load["context_length"])
+        # 回退尝试读取底层引擎属性 (例如 llama.cpp 的 n_ctx)
+        if hasattr(self._model, "n_ctx") and callable(self._model.n_ctx):
+            return int(self._model.n_ctx())
+        return int(getattr(self._model, "n_ctx", 0) or 0)
+    #估算下次生成的token数量
+    def estimate_genTokens(
+        self,
+        messages: list[dict[str, Any]],
+    ) -> int:
+        if not self.is_loaded:
+            raise RuntimeError("Model not loaded.")
+
+        # 1. 尝试获取本轮完整 prompt 的 Token IDs
+        tokenizer = getattr(self, "_tokenizer", None)
+        model = getattr(self, "_model", None)
+        total_tokens: list[int] = []
+
+        try:
+            if model and hasattr(model, "tokenize"):
+                # llama-cpp 原生方式
+                prompt_str = self._build_chat_prompt(messages)
+                total_tokens = list(model.tokenize(prompt_str.encode("utf-8")))
+            elif tokenizer and hasattr(tokenizer, "encode"):
+                prompt_str = self._build_chat_prompt(messages)
+                total_tokens = list(tokenizer.encode(prompt_str))
+        except Exception:
+            total_tokens = []
+
+        total_prompt_len = len(total_tokens) if total_tokens else self.count_tokens(messages)
+
+        # 2. 与底层已缓存的 Token 序列进行最长公共前缀比对
+        cached_tokens = getattr(self, "_last_input_tokens", [])
+        matched_tokens = 0
+
+        if total_tokens and cached_tokens:
+            for t_new, t_old in zip(total_tokens, cached_tokens):
+                if t_new == t_old:
+                    matched_tokens += 1
+                else:
+                    break
+
+        # 增量计算：总 Prompt 减去命中的公共前缀
+        delta_tokens = max(0, total_prompt_len - matched_tokens)
+        hit_rate = (matched_tokens / total_prompt_len * 100) if total_prompt_len > 0 else 0.0
+
+        # 3. 计算本轮最大可用生成空间 (窗口上限 - 本轮总输入 - 安全裕度)
+        total_ctx = self.context_limit()
+        available_gen = max(0, total_ctx - total_prompt_len - 32) if total_ctx > 0 else 2048
+
+        # 记录本轮 token 序列，供下一次比对
+        if total_tokens:
+            self._last_input_tokens = total_tokens
+
+        return {
+            "total_prompt_tokens": total_prompt_len,
+            "cached_tokens": matched_tokens,
+            "delta_tokens": delta_tokens,
+            "hit_rate_pct": round(hit_rate, 2),
+            "available_generation_tokens": available_gen,
+        }
+    
+    #计算剩余的 KV Cache 
+    def remaining_kvCache(self, used_tokens: int | None = None) -> int:
+        if not self.is_loaded:
+            return 0
+        total_ctx = self.context_limit()
+        if total_ctx <= 0:
+            return 0
+
+        # 1. 显式传入了当前轮次已用 tokens (prompt + completion)
+        if used_tokens is not None:
+            return max(0, total_ctx - used_tokens)
+
+        # 2. 回退尝试读取底层引擎的实时已用 token 计数 (如 llama.cpp 的 n_tokens)
+        current_used = getattr(self._model, "n_tokens", None)
+        if current_used is not None and isinstance(current_used, int):
+            return max(0, total_ctx - current_used)
+
+        return total_ctx
 
     def _build_chat_prompt(self, messages: list[dict[str, Any]]) -> str:
         tokenizer = getattr(self, "_tokenizer", None)

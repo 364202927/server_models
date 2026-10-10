@@ -9,8 +9,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from ..utils.hardware import check_gpu_memory, check_ram, detect_gpu, query_gpu_used_mb,query_gpu_free_mb
-from ..utils.common import info as log_info, readFile, writeFile, error, require,info,vm2tokens
+from ..utils.hardware import check_gpu_memory, check_ram, detect_gpu, query_gpu_used_mb, query_gpu_free_mb
+from ..utils.common import info as log_info, readFile, writeFile, error, require, info, vm2tokens
 from .llmFramework.baseInference import GenerationResult, baseInference
 from .model_spec import ModelSpec, load_model_specs
 
@@ -31,6 +31,7 @@ class RuntimeModel:
             "state": self.state,
             "path": self.spec.path,
             "estimated_vram_mb": self.spec.estimated_vram_mb,
+            "think_strategy": self.spec.think_strategy,
             "last_used_at": datetime.fromtimestamp(self.last_used_at, tz=timezone.utc).isoformat(),
             "gpu_memory_mb": self.spec.estimated_vram_mb if self.state == "RUNNING" else 0,
             "sleep_location": self.sleep_location,
@@ -61,25 +62,38 @@ class ModelsMgr:
         self.ram_reserve_mb = 8192
         self.gpu_reserve_mb = 1024
         self.sleep_time = int(self.settings.get("sleepTime", 60))
-
-        self._check_and_fill_empty_model_load()
-
-    def _check_and_fill_empty_model_load(self) -> None:
-        """规则 2：如 model.load 为空，初始化直接套用 template.load 并写入文件。"""
+    #load和tink策略写入配置
+    def _reconfigure(self) -> None:
         template_load = self._model_settings.get("template", {}).get("load", {})
-        modified = False
         models = self._config.setdefault("models", {})
+        modified = False
 
-        for model_id, spec in self.specs.items():
-            if not spec.load:
+        for model_id, model_cfg in models.items():
+            if not isinstance(model_cfg, dict):
+                continue
+
+            # 1. 检查并补齐 think_strategy
+            if "think_strategy" not in model_cfg:
+                model_cfg["think_strategy"] = "default"
+                if model_id in self.specs:
+                    self.specs[model_id].think_strategy = "default"
+                modified = True
+
+            # 2. 检查并补齐 model.load
+            spec = self.specs.get(model_id)
+            if spec and not spec.load:
                 spec.load = copy.deepcopy(template_load)
-                if model_id in models:
-                    models[model_id]["load"] = copy.deepcopy(template_load)
+                model_cfg["load"] = copy.deepcopy(template_load)
+                modified = True
+            elif not model_cfg.get("load"):
+                model_cfg["load"] = copy.deepcopy(template_load)
+                if spec:
+                    spec.load = copy.deepcopy(template_load)
                 modified = True
 
         if modified:
             writeFile(self._config, str(self.config_path))
-            log_info("已自动将 template.load 补齐写入 models.json")
+            log_info("已自动补齐 models.json 中的 load 与 think_strategy 并完成持久化")
 
     def get_full_load_config(self, model_id: str) -> dict[str, Any]:
         """完整加载参数闭包 = template.load + engine.load + model.load"""
@@ -203,10 +217,12 @@ class ModelsMgr:
             context_val = vm2tokens(spec.engine, spec.path, float(full_load['context']), full_load['dtype'], int(full_load['tensor_parallel']))
             full_load['context'] = context_val
             used_before = query_gpu_used_mb()
-            #加载模型
+            # 加载模型
             runtime.loader.load(spec.path, full_load)
             spec.update_estimated_vram(used_before, query_gpu_used_mb(), force=runtime.needs_remeasure)
             runtime.needs_remeasure = False
+            # 检查并自动补齐配置后持久化
+            self._reconfigure()
             with self._meta_lock:
                 runtime.state, runtime.error = "RUNNING", None
                 runtime.last_used_at = time.time()
@@ -228,7 +244,6 @@ class ModelsMgr:
         messages: list[dict[str, Any]],
         gen_cfg: dict[str, Any] | None = None,
     ) -> GenerationResult:
-        """规范入参：缩减为 3 个。"""
         runtime = self.ensure_loaded(model_id)
         if runtime.loader is None:
             raise RuntimeError(f"模型 {model_id} 未就绪")

@@ -15,6 +15,7 @@ class ModelSpec:
     source_path: str | None = field(default=None, repr=False, compare=False)
     estimated_vram_mb: int | None = None
     engine: str | None = None
+    think_strategy: str = "default"
     load: dict[str, Any] = field(default_factory=dict)
     generation: dict[str, Any] = field(default_factory=dict)
 
@@ -69,6 +70,7 @@ class ModelSpec:
         node: dict[str, Any] = {
             "path": self.source_path or self.path,
             "engine": self.engine,
+            "think_strategy": self.think_strategy,
             "load": self.load,
             "generation": self.generation,
         }
@@ -92,6 +94,7 @@ def load_model_specs(config: dict[str, Any]) -> dict[str, ModelSpec]:
             source_path=str(raw["path"]),
             estimated_vram_mb=raw.get("estimated_vram_mb"),
             engine=str(raw.get("engine", "")).strip().lower() or None,
+            think_strategy=str(raw.get("think_strategy") or "default"),
             load=dict(raw.get("load", {})),
             generation=dict(raw.get("generation", {})),
         )

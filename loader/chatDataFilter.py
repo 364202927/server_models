@@ -116,7 +116,6 @@ class chatDataFilter:
         supported_modalities: set[str],
         system_instruction: str = "",
     ) -> list[dict[str, Any]]:
-        """收敛为 3 个入参。"""
         current_messages = [dict(m) for m in messages]
         cleaned = cls.clean_think_history(current_messages)
         cleaned = cls.sanitize_multimodal(cleaned, supported_modalities)
@@ -161,7 +160,6 @@ class chatDataFilter:
                     pass
             clean_text = re.sub(r"<tool_call>\s*\{.*?\}\s*</tool_call>", "", clean_text, flags=re.DOTALL)
 
-            # Qwen XML 格式匹配
             for match in re.finditer(r"<function=([^>]+)>(.*?)(?:</function>|(?=<function=)|$)", clean_text, re.DOTALL):
                 fn_name = match.group(1).strip()
                 body = match.group(2)
