@@ -202,6 +202,10 @@ class Console:
             self._log_buffer.save2File()
 
     async def _handle_command(self, command: str) -> Any:
+        if command == "clear":
+            # 清屏并清除滚动缓冲区，光标回到左上角
+            self._write("\033[H\033[2J\033[3J")
+            return None
         if command in {"h", "help"}:
             log(
                 "可用命令:"
@@ -209,6 +213,7 @@ class Console:
                 "\n  <id>,1,2              - 发送参数列表"
                 "\n  <id>,x=1,name=test    - 发送键值参数"
                 "\n  <id>,{'x': 1}         - 发送字典参数"
+                "\n  clear                 - 清空当前终端"
                 "\n  h/help                - 显示帮助"
             )
             return None
