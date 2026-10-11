@@ -137,8 +137,9 @@ class serverApi:
         )
 
         @app.get("/v1/models")
-        async def models(_: bool = Depends(self._require_api_key)) -> dict[str, Any]:
+        async def models(raw_req: Request, _: bool = Depends(self._require_api_key)) -> dict[str, Any]:
             now = int(time.time())
+            info("[DBG] 模型列表请求", f"ua={raw_req.headers.get('user-agent', '')[:30]}", "返回=", list(self.manager.specs))
             return {
                 "object": "list",
                 "data": [
@@ -170,7 +171,7 @@ class serverApi:
             info("[DBG] Claude原始system[:120]", repr(body.get("system"))[:120])
             info("[DBG] Claude入站", f"model={body.get('model')}", f"stream={body.get('stream')}",
                  f"原始角色序列={[m.get('role') for m in body.get('messages', [])]}", f"tools数={len(body.get('tools') or [])}",
-                 f"字段={sorted(body)}")
+                 f"字段={sorted(body)}", f"thinking={body.get('thinking')}", f"output_config={body.get('output_config')}")
             openai_body = clientAdapter.inbound_to_openai(body, client_type="claude")
             info("[DBG] Claude转换后system[:120]", repr(openai_body["messages"][0])[:120])
             info("[DBG] Claude转换后角色序列", [m.get("role") for m in openai_body["messages"]])
