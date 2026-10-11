@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+import traceback
 import uuid
 from contextlib import asynccontextmanager
 from typing import Any, AsyncGenerator
@@ -8,10 +9,10 @@ from typing import Any, AsyncGenerator
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict, Field
-from starlette.responses import StreamingResponse
+from starlette.responses import JSONResponse, StreamingResponse
 
 from .clientAdapter import clientAdapter
-from .common import info
+from .common import error, info
 from ..loader.models_mgr import ModelsMgr
 from ..msgHandler import AdminRequest, ChatRequest, MsgHandler
 
@@ -146,6 +147,14 @@ class serverApi:
                 ],
             }
 
+        @app.exception_handler(Exception)
+        async def unhandled_error(raw_req: Request, exc: Exception) -> JSONResponse:
+            """兜底：打印完整堆栈，并以 Anthropic/OpenAI 通用的 error.message 结构返回，便于客户端直接看到原因。"""
+            error("[请求异常]", raw_req.method, raw_req.url.path, f"{type(exc).__name__}: {exc}",
+                  "\n" + "".join(traceback.format_exception(exc)))
+            body = {"type": "error", "error": {"type": "api_error", "message": f"{type(exc).__name__}: {exc}"}}
+            return JSONResponse(status_code=500, content=body)
+
         # 1. OpenAI 协议端点
         @app.post("/v1/chat/completions", response_model=None)
         async def chat_completions(request: openChatReq, raw_req: Request, _: bool = Depends(self._require_api_key)) -> Any:
@@ -159,8 +168,12 @@ class serverApi:
             except Exception:
                 raise HTTPException(status_code=400, detail="无效的 JSON 请求体")
             info("[DBG] Claude原始system[:120]", repr(body.get("system"))[:120])
+            info("[DBG] Claude入站", f"model={body.get('model')}", f"stream={body.get('stream')}",
+                 f"原始角色序列={[m.get('role') for m in body.get('messages', [])]}", f"tools数={len(body.get('tools') or [])}",
+                 f"字段={sorted(body)}")
             openai_body = clientAdapter.inbound_to_openai(body, client_type="claude")
             info("[DBG] Claude转换后system[:120]", repr(openai_body["messages"][0])[:120])
+            info("[DBG] Claude转换后角色序列", [m.get("role") for m in openai_body["messages"]])
             request = openChatReq(**openai_body)
             return await self._chat(request, client_type="claude", ua=raw_req.headers.get("user-agent", ""))
         return app

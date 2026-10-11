@@ -189,6 +189,7 @@ class llama(baseInference):
         tools = cfg.pop("tools", None)
         tool_choice = cfg.pop("tool_choice", None)
         prompt_ids = self._prompt_tokens(messages, tools)
+        info("[DBG] 模板渲染完成", f"prompt_tokens={len(prompt_ids)}", f"角色序列={[m.get('role') for m in messages]}")
         self._debug_divergence(prompt_ids)
         cfg["max_tokens"] = self._clamp_to_context(len(prompt_ids), int(cfg.pop("max_tokens", 512)))
 

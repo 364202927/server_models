@@ -3,13 +3,14 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import traceback
 import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
 from . import adim_ID
 from .loader.models_mgr import ModelsMgr
-from .utils.common import info, warn
+from .utils.common import error, info, warn
 from .utils.hardware import detect_hardware
 
 
@@ -117,6 +118,8 @@ class MsgHandler:
                 elif not task.future.cancelled():
                     task.future.set_result(job.result())
             except Exception as exc:
+                error("[任务异常]", task.source, task.task_id, "model=", task.model, f"{type(exc).__name__}: {exc}",
+                      "\n" + "".join(traceback.format_exception(exc)))
                 if not task.future.cancelled():
                     task.future.set_exception(exc)
             finally:
