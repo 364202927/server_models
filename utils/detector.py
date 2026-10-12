@@ -126,6 +126,17 @@ def detect_hardware() -> HardwareInfo:
     return HardwareInfo(detect_gpu(), detect_memory(), f"{platform.system()} {platform.release()}", cpu)
 
 
+def hardware_summary() -> str:
+    """启动时的硬件摘要:显卡名称/总显存/剩余显存 + 内存剩余/总量。"""
+    lines = [
+        f"GPU{gpu.index} {gpu.name}: 显存 {gpu.memory_total_mb}MB, 剩余 {gpu.memory_free_mb}MB"
+        for gpu in detect_gpu()
+    ] or ["未检测到 GPU"]
+    mem = detect_memory()
+    lines.append(f"内存: 剩余 {mem.available_mb}MB / 总计 {mem.total_mb}MB")
+    return "\n".join(lines)
+
+
 def print_hardware_info(info: HardwareInfo | None = None) -> None:
     info = info or detect_hardware()
     print(info.to_dict())

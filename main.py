@@ -10,6 +10,7 @@ if __package__ in (None, ""):
     from server_models.utils.serverApi import serverApi
     from server_models.utils.console import Console
     from server_models.utils.common import kApi, info, save_logs
+    from server_models.utils.hardware import hardware_summary
     from server_models.msgHandler import MsgHandler
 else:
     from .loader import ModelsMgr
@@ -17,6 +18,7 @@ else:
     from .utils.serverApi import serverApi
     from .utils.console import Console
     from .utils.common import kApi, info, save_logs
+    from .utils.hardware import hardware_summary
     from .msgHandler import MsgHandler
 
 
@@ -35,6 +37,9 @@ async def _reaper() -> None:
 
 if __name__ == "__main__":
     async def _run() -> None:
+        # 启动顺序:1.初始化并打印硬件 2.按 launch 加载模型
+        info("硬件信息\n" + hardware_summary())
+        await asyncio.to_thread(manager.autolaunch)
         tasks = [asyncio.create_task(_reaper(), name="reaper")]
         if sys.stdin.isatty():
             tasks.append(asyncio.create_task(console.run(), name="console"))

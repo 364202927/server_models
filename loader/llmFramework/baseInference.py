@@ -2,16 +2,19 @@ from __future__ import annotations
 
 import gc
 import os
+import signal
+import socket
+import subprocess
 import time
-from collections import OrderedDict
 from abc import ABC, abstractmethod
+from collections import OrderedDict
 from dataclasses import dataclass, field
-from typing import Any, Iterator
+from typing import Any
 
+import httpx
 import psutil
-import torch
 
-from ...utils.common import info as log_info
+from ...utils.common import info as log_info, error as log_error
 from ..chatDataFilter import chatDataFilter
 
 
@@ -24,12 +27,11 @@ class GenerationResult:
     prompt_tokens: int = 0
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
     finish_reason: str = "stop"
-    cached_tokens: int = -1  # 引擎上报的 prompt 前缀缓存命中数，-1 表示引擎未提供
+    cached_tokens: int = -1
 
 
 @dataclass
 class RawOutput:
-    """引擎 _response 的原始输出（未经 postprocess）。"""
     text: str
     tokens: int
     prompt_tokens: int
@@ -49,24 +51,30 @@ class MemoryUsage:
 
 
 class baseInference(ABC):
-    """推理框架抽象基类：入参规范收敛。"""
+    """推理框架抽象基类：Server 模式基类"""
 
     _RAW_MEMO_MAX = 256
 
     def __init__(self) -> None:
-        self._model = None
-        self._tokenizer = None
+        self._server_process: subprocess.Popen | None = None
+        self._port: int | None = None
+        self._host: str = "127.0.0.1"
+        self._http_client: httpx.Client | None = None
         self._effective_load: dict[str, Any] = {}
         self._sleeping = False
         self._sleep_capable = False
-        # 引擎输出记忆库（reasoning/content）：客户端丢掉 think 时，下一轮补回 reasoning_content，避免前缀分叉
         self._raw_memo: OrderedDict[str, dict[str, str]] = OrderedDict()
-        # 最近一次请求的 KV 前缀诊断（引擎自行填充：verdict/idx/rollback/file），供上层打印缓存摘要
         self.last_diag: dict[str, Any] = {}
 
     @property
+    def base_url(self) -> str:
+        if not self._port:
+            raise RuntimeError("服务未分配端口")
+        return f"http://{self._host}:{self._port}"
+
+    @property
     def is_loaded(self) -> bool:
-        return self._model is not None
+        return self._server_process is not None and self._server_process.poll() is None
 
     @property
     def effective_load(self) -> dict[str, Any]:
@@ -76,24 +84,56 @@ class baseInference(ABC):
     def supported_modalities(self) -> set[str]:
         return {"text"}
 
+    @staticmethod
+    def _find_free_port() -> int:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("", 0))
+            return s.getsockname()[1]
+
+    def _wait_for_server_ready(self, health_url: str, timeout: float = 120.0) -> bool:
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            if self._server_process and self._server_process.poll() is not None:
+                log_error(f"Server 进程意外退出，退出码: {self._server_process.returncode}")
+                return False
+            try:
+                resp = httpx.get(health_url, timeout=2.0)
+                if resp.status_code in {200, 404}:  # 404 表明 http server 已成功接管
+                    return True
+            except httpx.RequestError:
+                pass
+            time.sleep(1.0)
+        return False
+
     @abstractmethod
     def load(self, model_path: str, load_cfg: dict[str, Any]) -> "baseInference":
         pass
-    @abstractmethod
+
     def _unload_engine(self) -> None:
-        pass
+        if self._http_client:
+            self._http_client.close()
+            self._http_client = None
+
+        if self._server_process:
+            try:
+                # 终止子进程组
+                os.killpg(os.getpgid(self._server_process.pid), signal.SIGTERM)
+                self._server_process.wait(timeout=5)
+            except Exception:
+                try:
+                    os.killpg(os.getpgid(self._server_process.pid), signal.SIGKILL)
+                except Exception:
+                    pass
+            self._server_process = None
+
+        self._port = None
+        self._mark_unloaded()
 
     def unload(self) -> None:
         self._unload_engine()
 
-    def count_tokens(self, text_or_messages: str | list[dict[str, Any]], tools: list[dict[str, Any]] | None = None) -> int:
-        """默认用引擎真实 tokenizer 计数；无 tokenizer 的引擎（如 llama）需覆写。"""
-        tokenizer = self._require_tokenizer()
-        text = text_or_messages if isinstance(text_or_messages, str) else self._build_chat_prompt(text_or_messages, tools)
-        return len(tokenizer.encode(text))
-
     def sleep_to_ram(self) -> bool:
-        if self._model is None or self._sleeping or not self._sleep_capable:
+        if not self.is_loaded or self._sleeping or not self._sleep_capable:
             return self._sleeping
         start = time.perf_counter()
         try:
@@ -102,8 +142,7 @@ class baseInference(ABC):
             log_info("引擎休眠失败", type(self).__name__, exc)
             return False
         self._sleeping = True
-        self.release_cache()
-        log_info("引擎已休眠至 RAM", type(self).__name__, f"{round(time.perf_counter() - start, 2)}s")
+        log_info("引擎已休眠", type(self).__name__, f"{round(time.perf_counter() - start, 2)}s")
         return True
 
     def wake(self) -> None:
@@ -119,33 +158,27 @@ class baseInference(ABC):
         log_info("引擎已唤醒", type(self).__name__, f"{round(time.perf_counter() - start, 2)}s")
 
     def _engine_sleep(self) -> None:
-        raise NotImplementedError
+        # 默认使用 SIGSTOP 挂起子进程
+        if self._server_process:
+            os.killpg(os.getpgid(self._server_process.pid), signal.SIGSTOP)
 
     def _engine_wake(self) -> None:
-        raise NotImplementedError
+        # 默认使用 SIGCONT 恢复子进程
+        if self._server_process:
+            os.killpg(os.getpgid(self._server_process.pid), signal.SIGCONT)
 
     def _mark_unloaded(self) -> None:
-        self._model = None
-        self._tokenizer = None
         self._effective_load = {}
         self._sleeping = False
         self._sleep_capable = False
         self._raw_memo.clear()
 
     def release_cache(self) -> MemoryUsage:
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
         gc.collect()
         return self.memory_usage()
 
     def memory_usage(self) -> MemoryUsage:
         usage = MemoryUsage()
-        if torch.cuda.is_available():
-            usage.gpu_allocated_mb = round(torch.cuda.memory_allocated(0) / (1024 ** 2), 1)
-            usage.gpu_reserved_mb = round(torch.cuda.memory_reserved(0) / (1024 ** 2), 1)
-            usage.gpu_total_mb = round(torch.cuda.get_device_properties(0).total_memory / (1024 ** 2), 1)
-            usage.gpu_free_mb = round(usage.gpu_total_mb - usage.gpu_reserved_mb, 1)
-
         usage.process_rss_mb = round(psutil.Process(os.getpid()).memory_info().rss / (1024 ** 2), 1)
         usage.system_available_mb = round(psutil.virtual_memory().available / (1024 ** 2), 1)
         return usage
@@ -155,9 +188,8 @@ class baseInference(ABC):
         messages: list[dict[str, Any]],
         gen_cfg: dict[str, Any] | None = None,
     ) -> GenerationResult:
-        """核心模板方法：仅 2 个入参。"""
         if not self.is_loaded:
-            raise RuntimeError("Model not loaded. Call load() first.")
+            raise RuntimeError("Model not loaded / Server not running. Call load() first.")
 
         cfg = dict(gen_cfg or {})
         system_instruction = str(cfg.pop("system_prompt", "") or "")
@@ -168,11 +200,7 @@ class baseInference(ABC):
             system_instruction=system_instruction,
         )
 
-        roles_in = [m.get("role") for m in cleaned_messages]
-        inline_think = sum(1 for m in cleaned_messages if m.get("reasoning_content"))
         cleaned_messages, restored, missed = chatDataFilter.restore_raw_assistant(cleaned_messages, self._raw_memo)
-        log_info("[DBG] assistant 原文还原", f"命中 {restored} 条, 未命中 {missed} 条, 记忆库 {len(self._raw_memo)} 条",
-                 "| 客户端自带think:", inline_think, "| 清洗后角色序列:", roles_in, "| 有system注入:", bool(system_instruction))
 
         start = time.perf_counter()
         raw = self._response(messages=cleaned_messages, gen_cfg=cfg)
@@ -181,8 +209,7 @@ class baseInference(ABC):
         final_text, final_calls, final_reason = chatDataFilter.postprocess_result(
             raw.text, raw.calls, raw.finish_reason
         )
-        log_info("[DBG] 模型原始输出", f"长度={len(raw.text)}", "开头:", repr(raw.text[:150]), "| 结尾:", repr(raw.text[-80:]),
-                 "| 引擎原生tool_calls:", len(raw.calls), "| 解析后tool_calls:", len(final_calls), "| finish:", raw.finish_reason, "->", final_reason)
+
         key = chatDataFilter.memo_key(
             cleaned_messages[-1] if cleaned_messages else None,
             {"role": "assistant", "content": final_text, "tool_calls": final_calls},
@@ -209,23 +236,10 @@ class baseInference(ABC):
         messages: list[dict[str, Any]],
         gen_cfg: dict[str, Any],
     ) -> RawOutput:
-        """子类物理调用：仅 2 个入参。cached_tokens 须取引擎真实上报值。"""
         pass
+
     def context_limit(self) -> int:
-        """上下文总窗口；各引擎需在 load() 末尾把实际生效值写入 _effective_load["context_length"]。"""
         return int(self._effective_load.get("context_length", 0)) if self.is_loaded else 0
 
     def remaining_kvCache(self, used_tokens: int) -> int:
-        """剩余 KV Cache = 上下文窗口 - 本轮已用 (prompt + completion)。"""
         return max(0, self.context_limit() - used_tokens)
-
-    def _require_tokenizer(self):
-        if self._tokenizer is None:
-            raise RuntimeError("当前引擎未提供 tokenizer")
-        return self._tokenizer
-
-    def _build_chat_prompt(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None) -> str:
-        """用模型自带 chat template（含 tools）渲染 prompt；渲染失败直接抛出，不回退拼接。"""
-        return self._require_tokenizer().apply_chat_template(
-            messages, tools=tools or None, tokenize=False, add_generation_prompt=True
-        )

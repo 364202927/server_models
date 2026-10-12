@@ -131,8 +131,8 @@ def ensure_asset_dirs() -> None:
         path.mkdir(parents=True, exist_ok=True)
 
 #显存转换成token
-def vm2tokens(engine: str, path: str, context: float | int, dtype: str, tensor_parallel: int = 1, align_step: int = 512) -> int:
-    if float(context) <= 1000:
+def vm2tokens(engine: str, path: str, useVram: float | int, dtype: str, tensor_parallel: int = 1, align_step: int = 512) -> int:
+    if float(useVram) <= 1000:
         return 2048
 
     # KV cache 每元素字节数 (llama.cpp 量化类型带 block scale, 不是整数字节)
@@ -279,7 +279,7 @@ def vm2tokens(engine: str, path: str, context: float | int, dtype: str, tensor_p
     if bytes_per_token <= 0:
         raise ValueError(f"模型没有带 KV cache 的注意力层: {path}")
 
-    budget = float(context) * 1024 * 1024 - fixed
+    budget = float(useVram) * 1024 * 1024 - fixed
     tokens = max(0, int(budget // bytes_per_token)) // align_step * align_step
     print(f"vm2tokens engine={engine} dtype={dtype_key} tp={tp} attn_layers={len(kv_heads)} "
       f"kv_heads={sorted(set(kv_heads))} k/v_dim={k_dim}/{v_dim} "

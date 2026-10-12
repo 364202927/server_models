@@ -8,15 +8,16 @@
     }
   },
   "models": {
-    "qwen3.8-27B": {
+    "claude-sonnet-4-5": {
       "path": "D:/ai/models/Qwen3.8-27B-Uncensored-GGUF/Qwen3.8-27B-Uncensored-IQ4_XS.gguf",
       "engine": "llama",
-      "think_strategy": "default",
+      "launch": false,
+      "data_compression": "default",
       "load": {
         "mtp": false,
         "lora": "",
-        "draft": [],
-        "context": 4096,
+        "draft": [ ],
+        "useVram": 32786,
         "batch_size": 512,
         "gpu_offload_layers": -1,
         "tensor_parallel": 1,

@@ -42,15 +42,16 @@ class _TaskItem:
 
 
 class MsgHandler:
-    def __init__(self, manager: ModelsMgr) -> None:
+    def __init__(self, manager: ModelsMgr, max_concurrency: int = 32) -> None:
         self.manager = manager
         self._queue: asyncio.Queue[_TaskItem] | None = None
         self._worker_task: asyncio.Task | None = None
-        self._current_task: _TaskItem | None = None
-        self._prev_req: dict[str, Any] = {}  # 上一次对话请求的特征，用于判断分叉原因
+        self._running_tasks: set[_TaskItem] = set()
+        self._prev_req: dict[str, Any] = {}
+        # 允许并发将请求转发至已拉起的模型服务
+        self._semaphore = asyncio.Semaphore(max_concurrency)
 
     def _cache_summary(self, task: _TaskItem, tools: list, result: Any, diag: dict[str, Any]) -> None:
-        """[DBG] 每次请求输出一行汇总（来源/形态/复用/分叉/疑似原因），测试时只需收集这一行。"""
         tools_hash = hashlib.md5(json.dumps(tools, ensure_ascii=False, sort_keys=True).encode()).hexdigest()[:6]
         msgs = task.messages
         last = msgs[-1] if msgs else {}
@@ -91,8 +92,8 @@ class MsgHandler:
     def queue_info(self) -> dict[str, Any]:
         return {
             "pending_count": self.pending,
-            "current_task_id": self._current_task.task_id if self._current_task else None,
-            "current_model": self._current_task.model if self._current_task else None,
+            "running_count": len(self._running_tasks),
+            "running_task_ids": [t.task_id for t in self._running_tasks],
         }
 
     async def _worker_loop(self) -> None:
@@ -102,19 +103,21 @@ class MsgHandler:
                 self._queue.task_done()
                 continue
 
-            self._current_task = task
+            # 使用任务池并发分发，不再单任务串行阻塞
+            asyncio.create_task(self._execute_task(task))
+
+    async def _execute_task(self, task: _TaskItem) -> None:
+        self._running_tasks.add(task)
+        async with self._semaphore:
             try:
-                info("队列任务开始执行", task.source, task.task_id, "model=", task.model)
+                info("任务开始执行", task.source, task.task_id, "model=", task.model)
                 job = asyncio.ensure_future(self._dispatch(task))
                 wait_s = task.timeout if task.timeout and task.timeout > 0 else None
                 done, _ = await asyncio.wait({job}, timeout=wait_s)
                 if not done:
-                    # 先通知调用方超时，但 to_thread 里的线程无法中断；
-                    # 必须等它真正结束再放行下一个任务，否则会并发操作同一个非线程安全的引擎对象
                     if not task.future.cancelled():
                         task.future.set_exception(TimeoutError(f"任务超时 ({task.timeout}s)"))
-                    warn("任务超时，等待后台推理线程结束后再放行队列", task.task_id)
-                    await asyncio.gather(job, return_exceptions=True)
+                    warn("任务执行超时", task.task_id)
                 elif not task.future.cancelled():
                     task.future.set_result(job.result())
             except Exception as exc:
@@ -123,7 +126,7 @@ class MsgHandler:
                 if not task.future.cancelled():
                     task.future.set_exception(exc)
             finally:
-                self._current_task = None
+                self._running_tasks.discard(task)
                 self._queue.task_done()
 
     @staticmethod
@@ -168,6 +171,24 @@ class MsgHandler:
             source=source,
         )
 
+    async def handle(self, message_id: int, data: Any = None, *, source: str = "console") -> dict[str, Any]:
+        """Console 入口适配:按 message_id 分发到 admin()/chat(),业务异常转为统一 error 响应。"""
+        payload = data if isinstance(data, dict) else {}
+        seq = data if isinstance(data, (list, tuple)) else []
+        model = str(payload.get("model") or (seq[0] if seq else (data if isinstance(data, str) else "")))
+        try:
+            if message_id in {e.value for e in adim_ID}:
+                return await self.admin(AdminRequest(message_id, model, data), source=source)
+            prompt = str(payload.get("prompt") or (seq[1] if len(seq) > 1 else ""))
+            return await self.chat(ChatRequest(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                deploy=dict(payload.get("deploy", {})),
+            ), source=source)
+        except (KeyError, RuntimeError, MemoryError, ValueError, TimeoutError) as exc:
+            warn("消息处理失败:", exc)
+            return self._response(model, message_id, "error", str(exc))
+
     async def _enqueue_task(
         self,
         message_id: int,
@@ -210,7 +231,7 @@ class MsgHandler:
         model = task.model
         incoming_args = dict(task.deploy)
 
-        # 1. 确保模型就绪
+        # 1. 确保模型服务就绪
         await asyncio.to_thread(self.manager.ensure_loaded, model, incoming_args)
 
         # 2. 参数合并
@@ -224,7 +245,6 @@ class MsgHandler:
         if "tool_choice" in incoming_args:
             full_gen["tool_choice"] = incoming_args["tool_choice"]
 
-        # [DBG] 临时：system 前 120 字符 + 全部 messages 的前缀 hash，用于核对相邻请求前缀是否逐字一致
         first = task.messages[0] if task.messages else {}
         info("[DBG] 送入引擎", model, f"共{len(task.messages)}条", "system[:120]=", repr(first)[:120],
              "hash(首条)=", hashlib.md5(json.dumps(first, ensure_ascii=False, sort_keys=True).encode()).hexdigest()[:8],
@@ -236,10 +256,10 @@ class MsgHandler:
              "角色序列=", [m.get("role") for m in task.messages], "tool_choice=", full_gen.get("tool_choice"),
              "max_tokens=", full_gen.get("max_tokens"), "system_prompt长度=", len(str(full_gen.get("system_prompt") or "")))
 
-        # 3. 调度生成
+        # 3. 调度生成（底层通过 HTTP 转发给对应 Server 实例）
         result = await asyncio.to_thread(self.manager.generate, model, task.messages, full_gen)
 
-        # 4. 指标取自引擎返回的真值（事后统计，不做生成前估算）
+        # 4. 指标统计
         loader = self.manager.runtime[model].loader
         remaining_kv = loader.remaining_kvCache(result.prompt_tokens + result.tokens_generated)
         cached = result.cached_tokens

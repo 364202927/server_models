@@ -13,6 +13,7 @@ from .detector import (
     detect_gpu,
     detect_hardware,
     detect_memory,
+    hardware_summary,
     print_hardware_info,
 )
 from .process import process_memory_mb, process_summary
@@ -116,6 +117,7 @@ __all__ = [
     "detect_gpu",
     "detect_hardware",
     "detect_memory",
+    "hardware_summary",
     "print_hardware_info",
     # 显存准入
     "GpuMemoryDecision",

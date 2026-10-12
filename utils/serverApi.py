@@ -68,8 +68,13 @@ def _build_payload(result: dict[str, Any], model_id: str) -> dict[str, Any]:
 
 
 @asynccontextmanager
-async def _lifespan(_: FastAPI) -> AsyncGenerator[None]:
+async def _lifespan(app: FastAPI) -> AsyncGenerator[None]:
     yield
+    # FastAPI 服务退出时，安全卸载所有后端常驻模型进程
+    mgr = getattr(app.state, "manager", None)
+    if mgr and hasattr(mgr, "unload_all"):
+        info("FastAPI 停机中，正在销毁所有常驻推理引擎 Server 进程...")
+        mgr.unload_all()
 
 
 class serverApi:
@@ -79,6 +84,7 @@ class serverApi:
         self.manager = manager
         self.handler = handler or MsgHandler(manager)
         self.app = self._create_app()
+        self.app.state.manager = self.manager
         self._server: Any = None
 
     def _server_settings(self) -> dict[str, Any]:
@@ -102,6 +108,7 @@ class serverApi:
         if not token or token != expected:
             raise HTTPException(status_code=401, detail="API key 无效或未提供")
         return True
+
     # 聊天指令路由
     async def _chat(self, request: openChatReq, client_type: str = "openai", ua: str = "") -> Any:
         if request.message_id != 0:
@@ -115,12 +122,16 @@ class serverApi:
              f"tools数={len(request.tools or [])}", "额外字段=", sorted((request.model_extra or {}).keys()))
         if not request.model or not request.messages:
             raise HTTPException(status_code=400, detail="model 和 messages 不能为空")
-        # 核心引擎内部仅消费标准的 OpenAI 结构请求
-        # source 仅用于日志：协议类型 + User-Agent 前缀，区分 Open WebUI / Claude Code / Hermes
+
         result = await self.handler.chat(_to_chat_request(request), source=f"{client_type}/{ua[:30]}")
         payload = _build_payload(result, request.model)
-        # 统一由 clientAdapter 出站转换器处理（按 client_type 输出为对应的 Dict 或 Streaming 生成器）
-        outbound_res = clientAdapter.outbound(openai_resp=payload,client_type=client_type,stream=request.stream,chunk_size=request.stream_delta_chunk_size)
+
+        outbound_res = clientAdapter.outbound(
+            openai_resp=payload,
+            client_type=client_type,
+            stream=request.stream,
+            chunk_size=request.stream_delta_chunk_size
+        )
 
         if request.stream:
             return StreamingResponse(outbound_res, media_type="text/event-stream")
@@ -150,7 +161,6 @@ class serverApi:
 
         @app.exception_handler(Exception)
         async def unhandled_error(raw_req: Request, exc: Exception) -> JSONResponse:
-            """兜底：打印完整堆栈，并以 Anthropic/OpenAI 通用的 error.message 结构返回，便于客户端直接看到原因。"""
             error("[请求异常]", raw_req.method, raw_req.url.path, f"{type(exc).__name__}: {exc}",
                   "\n" + "".join(traceback.format_exception(exc)))
             body = {"type": "error", "error": {"type": "api_error", "message": f"{type(exc).__name__}: {exc}"}}
@@ -177,6 +187,7 @@ class serverApi:
             info("[DBG] Claude转换后角色序列", [m.get("role") for m in openai_body["messages"]])
             request = openChatReq(**openai_body)
             return await self._chat(request, client_type="claude", ua=raw_req.headers.get("user-agent", ""))
+
         return app
 
     async def run(self) -> None:

@@ -1,11 +1,11 @@
 {
-  "_comment": "这是一个model模版文件,context默认kvcache占用4g显存,max_tokens上下文2g",
+  "_comment": "这是一个model模版文件,useVram默认kvcache占用4g显存,max_tokens上下文2g",
   "template": {
     "load": {
       "mtp": false,
       "lora": "",
       "draft": [],
-      "context": 4096,
+      "useVram": 4096,
       "batch_size": 512,
       "gpu_offload_layers": -1,
       "tensor_parallel": 1,
