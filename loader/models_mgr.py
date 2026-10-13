@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import atexit
+import atexit,gc
 import copy
 import time
 from pathlib import Path
@@ -8,17 +8,13 @@ from typing import Any
 
 from ..utils.hardware import check_gpu_memory, detect_gpu
 from ..utils.common import info as log_info, readFile, writeFile, info, error
-from .model_spec import clean_gpu_cache, load_model_specs, modelSpec
+from .model_spec import load_model_specs, modelSpec
 
 
 class modelsMgr:
     """模型注册表：读配置、按 id 取模型、跨模型的显存准入与 LRU 回收。单个模型的生命周期由 modelSpec 自己负责。"""
 
-    def __init__(
-        self,
-        config_path: str = "assets/models.json",
-        settings_path: str = "assets/modelSetting.json",
-    ) -> None:
+    def __init__(self, config_path: str = "assets/models.json", settings_path: str = "assets/modelSetting.json",) -> None:
         self.config_path = Path(config_path)
         self.settings_path = Path(settings_path)
 
@@ -46,9 +42,9 @@ class modelsMgr:
         return self.specs.get(model_id)
 
     def autolaunch(self) -> None:
-        """启动后按 models.json 的 launch=true 依次加载模型,单个失败不影响其余。"""
+        print("~~~~~~~autolaunch~~~~~~~~~",self.specs)
         for spec in (s for s in self.specs.values() if s.launch):
-            info("启动加载模型", spec.model_id)
+            print("启动加载模型", spec.model_id)
             try:
                 spec.ensure()
             except (RuntimeError, MemoryError) as exc:
@@ -106,7 +102,8 @@ class modelsMgr:
         if self._free_for(spec):
             return
         self._reclaim(spec)
-        clean_gpu_cache()
+        # clean_gpu_cache()
+        gc.collect()
         if self._free_for(spec):
             return
         raise MemoryError(f"模型 {spec.model_id} 显存不足")

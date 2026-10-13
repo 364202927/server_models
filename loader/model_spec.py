@@ -16,16 +16,16 @@ from ..utils.hardware import query_gpu_used_mb
 from .llmFramework.baseInference import GenerationResult, baseInference
 
 
-def clean_gpu_cache() -> None:
-    """回收主进程内的残留显存（推理引擎在子进程里，这里只处理本进程的 torch 缓存）。"""
-    gc.collect()
-    try:
-        import torch
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.ipc_collect()
-    except ImportError:
-        pass
+# def clean_gpu_cache() -> None:
+#     """回收主进程内的残留显存（推理引擎在子进程里，这里只处理本进程的 torch 缓存）。"""
+#     gc.collect()
+#     try:
+#         import torch
+#         if torch.cuda.is_available():
+#             torch.cuda.empty_cache()
+#             torch.cuda.ipc_collect()
+#     except ImportError:
+#         pass
 
 
 @dataclass(eq=False)
@@ -189,7 +189,8 @@ class modelSpec:
         self.state, self.sleep_location = "UNLOADED", None
         if loader is not None:
             loader.unload()
-        clean_gpu_cache()
+        gc.collect()
+        # clean_gpu_cache()
 
     def sleep(self, blocking: bool = True) -> bool:
         """休眠到内存；引擎不支持休眠则直接卸载以交还显存。忙碌/未运行/拿不到锁返回 False。"""
@@ -200,7 +201,8 @@ class modelSpec:
                 return False
             if self.loader.sleep_to_ram():
                 self.state, self.sleep_location = "SLEEPING_RAM", "ram"
-                clean_gpu_cache()
+                gc.collect()
+                # clean_gpu_cache()
             else:
                 self._drop()
             return True

@@ -38,7 +38,7 @@ async def _reaper() -> None:
 if __name__ == "__main__":
     async def _run() -> None:
         # 启动顺序:1.初始化并打印硬件 2.按 launch 加载模型
-        info("硬件信息\n" + hardware_summary())
+        print("硬件信息\n" + hardware_summary())
         await asyncio.to_thread(manager.autolaunch)
         tasks = [asyncio.create_task(_reaper(), name="reaper")]
         if sys.stdin.isatty():
