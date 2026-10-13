@@ -285,3 +285,17 @@ def vm2tokens(engine: str, path: str, useVram: float | int, dtype: str, tensor_p
       f"kv_heads={sorted(set(kv_heads))} k/v_dim={k_dim}/{v_dim} "
       f"B/token={bytes_per_token:.0f} fixed={fixed / 1024 / 1024:.1f}MB -> {tokens}")
     return max(align_step, tokens)
+
+# 缓存命中判定：复用比例 >= 80% 视为命中，< 5% 视为未命中，其间为部分命中
+CACHE_HIT_RATIO = 0.8
+CACHE_MISS_RATIO = 0.05
+def cache_verdict(cached: int, prompt: int) -> tuple[str, float]:
+    """返回 (命中/部分命中/未命中/未知, 复用比例)；引擎没给出 cached_tokens 时为未知。"""
+    if cached < 0 or prompt <= 0:
+        return "未知", 0.0
+    ratio = cached / prompt
+    if ratio >= CACHE_HIT_RATIO:
+        return "命中", ratio
+    if ratio < CACHE_MISS_RATIO:
+        return "未命中", ratio
+    return "部分命中", ratio

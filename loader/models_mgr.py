@@ -2,51 +2,17 @@ from __future__ import annotations
 
 import atexit
 import copy
-import gc
-import threading
 import time
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from ..utils.hardware import check_gpu_memory, detect_gpu, query_gpu_used_mb
-from ..utils.common import info as log_info, readFile, writeFile, require, info, error, vm2tokens
-from .llmFramework.baseInference import GenerationResult, baseInference
-from .model_spec import ModelSpec, load_model_specs
+from ..utils.hardware import check_gpu_memory, detect_gpu
+from ..utils.common import info as log_info, readFile, writeFile, info, error
+from .model_spec import clean_gpu_cache, load_model_specs, modelSpec
 
 
-@dataclass
-class RuntimeModel:
-    spec: ModelSpec
-    loader: baseInference | None = None
-    state: str = "UNLOADED"
-    last_used_at: float = field(default_factory=time.time)
-    active_requests: int = 0  # 支持 Server 模式下的并发请求计数
-    error: str | None = None
-    sleep_location: str | None = None
-    needs_remeasure: bool = False
-
-    @property
-    def active(self) -> bool:
-        return self.active_requests > 0
-
-    def public_dict(self) -> dict[str, Any]:
-        return {
-            "id": self.spec.model_id,
-            "state": self.state,
-            "path": self.spec.path,
-            "estimated_vram_mb": self.spec.estimated_vram_mb,
-            "data_compression": self.spec.data_compression,
-            "last_used_at": datetime.fromtimestamp(self.last_used_at, tz=timezone.utc).isoformat(),
-            "gpu_memory_mb": self.spec.estimated_vram_mb if self.state == "RUNNING" else 0,
-            "sleep_location": self.sleep_location,
-            "error": self.error,
-        }
-
-
-class ModelsMgr:
-    """模型实例管理器：双 JSON 闭包参数驱动 + Server 进程生命周期管理。"""
+class modelsMgr:
+    """模型注册表：读配置、按 id 取模型、跨模型的显存准入与 LRU 回收。单个模型的生命周期由 modelSpec 自己负责。"""
 
     def __init__(
         self,
@@ -61,9 +27,9 @@ class ModelsMgr:
 
         defaults = self._config.get("defaults", {})
         self.settings: dict[str, Any] = copy.deepcopy(defaults) if isinstance(defaults, dict) else {}
-        self.specs: dict[str, ModelSpec] = load_model_specs(self._config)
-        self.runtime: dict[str, RuntimeModel] = {}
-        self._meta_lock = threading.Lock()
+        self.specs: dict[str, modelSpec] = load_model_specs(self._config)
+        for spec in self.specs.values():
+            spec.settings, spec.admit, spec.persist = self._model_settings, self._admit, self._reconfigure
 
         self.ram_reserve_mb = 8192
         self.gpu_reserve_mb = 1024
@@ -75,16 +41,18 @@ class ModelsMgr:
         # 首次启动即补齐缺失的 launch 等字段并写回
         self._reconfigure()
 
+    def getModel(self, model_id: str) -> modelSpec | None:
+        """按 id 取模型（任意状态，无副作用）；不在 models.json 中返回 None。"""
+        return self.specs.get(model_id)
+
     def autolaunch(self) -> None:
         """启动后按 models.json 的 launch=true 依次加载模型,单个失败不影响其余。"""
-        for model_id, spec in self.specs.items():
-            if not spec.launch:
-                continue
-            info("启动加载模型", model_id)
+        for spec in (s for s in self.specs.values() if s.launch):
+            info("启动加载模型", spec.model_id)
             try:
-                self.ensure_loaded(model_id)
+                spec.ensure()
             except (RuntimeError, MemoryError) as exc:
-                error("启动加载失败", model_id, exc)
+                error("启动加载失败", spec.model_id, exc)
 
     def _reconfigure(self) -> None:
         template_load = self._model_settings.get("template", {}).get("load", {})
@@ -120,229 +88,50 @@ class ModelsMgr:
             writeFile(self._config, str(self.config_path))
             log_info("已自动补齐 models.json 中的 launch/load/data_compression 并完成持久化")
 
-    def get_full_load_config(self, model_id: str) -> dict[str, Any]:
-        spec = self.specs[model_id]
-        engine = spec.detect_engine() or "llama"
-
-        full_load = copy.deepcopy(self._model_settings.get("template", {}).get("load", {}))
-        full_load.update(self._model_settings.get(engine, {}).get("load", {}))
-        full_load.update(spec.load)
-        return full_load
-
-    def get_full_generation_config(self, model_id: str) -> dict[str, Any]:
-        spec = self.specs.get(model_id)
-        engine = (spec.detect_engine() if spec else None) or "llama"
-
-        full_gen = copy.deepcopy(self._model_settings.get("template", {}).get("generation", {}))
-        full_gen.update(self._model_settings.get(engine, {}).get("generation", {}))
-        if spec:
-            full_gen.update(spec.generation)
-        return full_gen
-
     def list_models(self) -> list[dict[str, Any]]:
-        with self._meta_lock:
-            return [(self.runtime.get(model_id) or RuntimeModel(spec)).public_dict()
-                    for model_id, spec in self.specs.items()]
+        return [spec.public_dict() for spec in self.specs.values()]
 
     def status(self) -> dict[str, Any]:
         return {"models": self.list_models(), "queue_length": 0}
 
-    def _get_runtime(self, model_id: str) -> RuntimeModel:
-        if model_id not in self.specs:
-            raise KeyError(f"models.json 中不存在模型: {model_id}")
-        with self._meta_lock:
-            return self.runtime.setdefault(model_id, RuntimeModel(self.specs[model_id]))
-
-    def _free_for(self, spec: ModelSpec) -> bool:
+    # ------------------------------------------------------------------ 跨模型的显存准入
+    def _free_for(self, spec: modelSpec) -> bool:
         required = spec.required_vram_mb()
         if required is None or not detect_gpu():
             return True
         return check_gpu_memory(required, self.gpu_reserve_mb).allowed
 
-    def _clean_gpu_cache(self) -> None:
-        gc.collect()
-        try:
-            import torch
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                torch.cuda.ipc_collect()
-        except ImportError:
-            pass
-
-    def _admit(self, spec: ModelSpec) -> None:
+    def _admit(self, spec: modelSpec) -> None:
+        """spec 启动/唤醒前调用：显存不够就按 LRU 把别的空闲模型休眠，仍不够抛 MemoryError。"""
         if self._free_for(spec):
             return
-        self._reclaim_to_ram(exclude=spec.model_id)
-        self._clean_gpu_cache()
+        self._reclaim(spec)
+        clean_gpu_cache()
         if self._free_for(spec):
             return
         raise MemoryError(f"模型 {spec.model_id} 显存不足")
 
-    def _reclaim_to_ram(self, exclude: str) -> None:
-        with self._meta_lock:
-            candidates = [
-                item for model_id, item in self.runtime.items()
-                if model_id != exclude and item.loader and item.state == "RUNNING"
-            ]
-        candidates.sort(key=lambda item: item.last_used_at)
-        for item in candidates:
-            self._release(item)
-            if self._free_for(self.specs[exclude]):
+    def _reclaim(self, target: modelSpec) -> None:
+        # 只挑空闲且在运行的模型；拿不到锁（正在加载/切换）的直接跳过，避免互相等待
+        candidates = [s for s in self.specs.values() if s is not target and s.isRunning and not s.active]
+        for spec in sorted(candidates, key=lambda s: s.last_used_at):
+            spec.sleep(blocking=False)
+            if self._free_for(target):
                 return
 
-    def _release(self, runtime: RuntimeModel) -> None:
-        """
-        Server 模式下的资源出让：
-        如果引擎支持显存释放（返回 True），则置为休眠；
-        否则（如无法真正交还显存的独立 Server），直接终止进程彻底释放显存。
-        """
-        model_id = runtime.spec.model_id
-        if runtime.loader is not None and runtime.loader.sleep_to_ram():
-            with self._meta_lock:
-                runtime.state, runtime.sleep_location = "SLEEPING_RAM", "ram"
-            return
-        self._unload_runtime(model_id)
-
-    def ensure_loaded(self, model_id: str, load_override: dict[str, Any] | None = None) -> RuntimeModel:
-        runtime = self._get_runtime(model_id)
-        if runtime.loader and runtime.state in {"RUNNING", "SLEEPING_RAM"}:
-            return self._resume(runtime)
-        return self._load(runtime, load_override or {})
-
-    def _resume(self, runtime: RuntimeModel) -> RuntimeModel:
-        if runtime.state == "RUNNING":
-            runtime.last_used_at = time.time()
-            return runtime
-        try:
-            self._admit(runtime.spec)
-            runtime.loader.wake()
-        except Exception:
-            self._unload_runtime(runtime.spec.model_id)
-            return self._load(runtime, {})
-        with self._meta_lock:
-            runtime.state, runtime.sleep_location = "RUNNING", None
-            runtime.last_used_at = time.time()
-        return runtime
-
-    def _load(self, runtime: RuntimeModel, load_override: dict[str, Any]) -> RuntimeModel:
-        spec = runtime.spec
-        model_id = spec.model_id
-        with self._meta_lock:
-            runtime.state = "LOADING"
-        try:
-            self._admit(spec)
-            engine = spec.detect_engine()
-            if not engine:
-                raise ValueError(f"未指定引擎: {model_id}")
-            cls = require(f"{__package__}.llmFramework.{engine}")
-            runtime.loader = cls()
-
-            full_load = self.get_full_load_config(model_id)
-            for k, v in load_override.items():
-                if k in full_load:
-                    full_load[k] = v
-
-            context_val = vm2tokens(
-                spec.engine,
-                spec.path,
-                float(full_load['useVram']),
-                full_load['dtype'],
-                int(full_load['tensor_parallel'])
-            )
-            full_load['useVram'] = context_val
-
-            used_before = query_gpu_used_mb()
-            # 启动子服务
-            runtime.loader.load(spec.path, full_load)
-            spec.update_estimated_vram(used_before, query_gpu_used_mb(), force=runtime.needs_remeasure)
-            runtime.needs_remeasure = False
-
-            self._reconfigure()
-            with self._meta_lock:
-                runtime.state, runtime.error = "RUNNING", None
-                runtime.last_used_at = time.time()
-            return runtime
-        except Exception as exc:
-            if runtime.loader:
-                try:
-                    runtime.loader.unload()
-                except Exception:
-                    pass
-            with self._meta_lock:
-                self.runtime.pop(model_id, None)
-            self._clean_gpu_cache()
-            raise RuntimeError(f"模型 {model_id} 加载失败: {exc}") from exc
-
-    def generate(
-        self,
-        model_id: str,
-        messages: list[dict[str, Any]],
-        gen_cfg: dict[str, Any] | None = None,
-    ) -> GenerationResult:
-        runtime = self.ensure_loaded(model_id)
-        if runtime.loader is None:
-            raise RuntimeError(f"模型 {model_id} 未就绪")
-
-        # 增加并发引用计数，支持多请求并发命中同一模型
-        with self._meta_lock:
-            runtime.active_requests += 1
-
-        try:
-            result = runtime.loader.generate(messages, gen_cfg)
-            runtime.last_used_at = time.time()
-            return result
-        finally:
-            with self._meta_lock:
-                runtime.active_requests = max(0, runtime.active_requests - 1)
-
-    def sleep(self, model_id: str) -> bool:
-        runtime = self._get_runtime(model_id)
-        if runtime.active or not runtime.loader or runtime.state != "RUNNING":
-            return False
-        self._release(runtime)
-        self._clean_gpu_cache()
-        return True
-
-    def _unload_runtime(self, model_id: str) -> None:
-        with self._meta_lock:
-            runtime = self.runtime.pop(model_id, None)
-        if not runtime or runtime.active:
-            return
-        if runtime.loader:
-            runtime.state, runtime.sleep_location = "UNLOADED", None
-            runtime.loader.unload()
-        self._clean_gpu_cache()
-
-    def unload(self, model_id: str) -> bool:
-        if model_id not in self.specs:
-            return False
-        runtime = self.runtime.get(model_id)
-        if not runtime or runtime.active:
-            return False
-        self._unload_runtime(model_id)
-        return True
-
+    # ------------------------------------------------------------------ 回收/清理
     def unload_all(self) -> None:
-        """安全关停并清理所有 runtime 的 Server 子进程。"""
-        with self._meta_lock:
-            active_ids = list(self.runtime.keys())
-        for model_id in active_ids:
+        """安全关停并清理所有模型的 Server 子进程（退出时强制，不管是否还有请求）。"""
+        for spec in self.specs.values():
             try:
-                self._unload_runtime(model_id)
-            except Exception as e:
-                error(f"卸载模型 {model_id} 异常: {e}")
+                spec.unload(force=True)
+            except Exception as exc:
+                error(f"卸载模型 {spec.model_id} 异常: {exc}")
 
     def reap_idle(self) -> list[str]:
         timeout = self.sleep_time
         if timeout <= 0:
             return []
         now = time.time()
-        changed: list[str] = []
-        with self._meta_lock:
-            candidates = list(self.runtime.items())
-        for model_id, runtime in candidates:
-            if runtime.state != "RUNNING" or runtime.active:
-                continue
-            if now - runtime.last_used_at >= timeout and self.sleep(model_id):
-                changed.append(model_id)
-        return changed
+        idle = [s for s in self.specs.values() if s.isRunning and not s.active and now - s.last_used_at >= timeout]
+        return [s.model_id for s in idle if s.sleep(blocking=False)]

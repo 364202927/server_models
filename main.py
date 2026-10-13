@@ -5,21 +5,21 @@ from pathlib import Path
 if __package__ in (None, ""):
     # 直接执行 ``python main.py`` 时把项目父目录加入导入路径。
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-    from server_models.loader import ModelsMgr
+    from server_models.loader import modelsMgr
     from server_models.utils import MODELS_FILE
     from server_models.utils.serverApi import serverApi
     from server_models.utils.console import Console
     from server_models.utils.common import kApi, info, save_logs
     from server_models.utils.hardware import hardware_summary
-    from server_models.msgHandler import MsgHandler
+    from server_models.msgHandler import msgHandler
 else:
-    from .loader import ModelsMgr
+    from .loader import modelsMgr
     from .utils import MODELS_FILE
     from .utils.serverApi import serverApi
     from .utils.console import Console
     from .utils.common import kApi, info, save_logs
     from .utils.hardware import hardware_summary
-    from .msgHandler import MsgHandler
+    from .msgHandler import msgHandler
 
 
 REAP_INTERVAL_SEC = 30
@@ -60,8 +60,8 @@ if __name__ == "__main__":
                 if exc and not isinstance(exc, (KeyboardInterrupt, asyncio.CancelledError)):
                     raise exc
     #
-    manager = ModelsMgr(str(MODELS_FILE))
-    handler = MsgHandler(manager)
+    manager = modelsMgr(str(MODELS_FILE))
+    handler = msgHandler(manager)
     server = serverApi(manager, handler)
     console = Console(command_handler=lambda message_id, args: handler.handle(message_id, args, source="console"))
     app = server.app

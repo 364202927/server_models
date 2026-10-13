@@ -83,6 +83,11 @@ class chatDataFilter:
             restored += 1
         return out, restored, missed
 
+    @classmethod
+    def assistant_keys(cls, messages: list[dict[str, Any]]) -> set[str]:
+        """历史中所有 assistant 消息的指纹；未命中缓存清理记忆库时，只保留仍在这些历史里的条目。"""
+        return {cls.memo_key(messages[i - 1] if i else None, m) for i, m in enumerate(messages) if m.get("role") == "assistant"}
+
     @staticmethod
     def clean_think_history(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """content 内联的 <think>…</think> 拆到 reasoning_content（Qwen 模板只认该字段）；

@@ -7,6 +7,7 @@
       "draft": [],
       "useVram": 4096,
       "batch_size": 512,
+      "parallel_slots": 1,
       "gpu_offload_layers": -1,
       "tensor_parallel": 1,
       "dtype": "bfloat16"

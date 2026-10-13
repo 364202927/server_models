@@ -13,8 +13,8 @@ from starlette.responses import JSONResponse, StreamingResponse
 
 from .clientAdapter import clientAdapter
 from .common import error, info
-from ..loader.models_mgr import ModelsMgr
-from ..msgHandler import AdminRequest, ChatRequest, MsgHandler
+from ..loader.models_mgr import modelsMgr
+from ..msgHandler import AdminRequest, ChatRequest, msgHandler
 
 
 # 聊天结构
@@ -80,9 +80,9 @@ async def _lifespan(app: FastAPI) -> AsyncGenerator[None]:
 class serverApi:
     """FastAPI 服务。"""
 
-    def __init__(self, manager: ModelsMgr, handler: MsgHandler | None = None) -> None:
+    def __init__(self, manager: modelsMgr, handler: msgHandler | None = None) -> None:
         self.manager = manager
-        self.handler = handler or MsgHandler(manager)
+        self.handler = handler or msgHandler(manager)
         self.app = self._create_app()
         self.app.state.manager = self.manager
         self._server: Any = None
@@ -123,7 +123,11 @@ class serverApi:
         if not request.model or not request.messages:
             raise HTTPException(status_code=400, detail="model 和 messages 不能为空")
 
-        result = await self.handler.chat(_to_chat_request(request), source=f"{client_type}/{ua[:30]}")
+        result = await self.handler.chat(
+            _to_chat_request(request), source=f"{client_type}/{ua[:60]}", client=clientAdapter.detectClient(ua)
+        )
+        if result.get("status") == "error":
+            raise HTTPException(status_code=int(result.get("code", 500)), detail=result.get("response", "未知错误"))
         payload = _build_payload(result, request.model)
 
         outbound_res = clientAdapter.outbound(

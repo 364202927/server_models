@@ -8,8 +8,12 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
+import httpx
+
 from . import adim_ID
-from .loader.models_mgr import ModelsMgr
+from .loader.model_spec import modelSpec
+from .loader.models_mgr import modelsMgr
+from .loader.sessionHandle import pipeline
 from .utils.common import error, info, warn
 from .utils.hardware import detect_hardware
 
@@ -29,51 +33,30 @@ class AdminRequest:
     args: Any = None
 
 
-@dataclass
-class _TaskItem:
-    task_id: str
+@dataclass(eq=False)  # 要放进 set，必须按身份哈希
+class _taskItem:
     message_id: int
     model: str
     messages: list[dict[str, Any]]
     deploy: dict[str, Any]
-    timeout: float | None
-    source: str
-    future: asyncio.Future = field(default_factory=asyncio.Future)
+    timeout: float | None = 180.0
+    source: str = "unknown"
+    client: str = "other"      # 消息来源归类：claude_code / codex / … / other
+    task_id: str = field(default_factory=lambda: f"task_{uuid.uuid4().hex[:8]}")
+    future: asyncio.Future | None = None
 
 
-class MsgHandler:
-    def __init__(self, manager: ModelsMgr, max_concurrency: int = 32) -> None:
+class msgHandler:
+    def __init__(self, manager: modelsMgr, max_concurrency: int = 32) -> None:
         self.manager = manager
-        self._queue: asyncio.Queue[_TaskItem] | None = None
+        self._queue: asyncio.Queue[_taskItem] | None = None
         self._worker_task: asyncio.Task | None = None
-        self._running_tasks: set[_TaskItem] = set()
-        self._prev_req: dict[str, Any] = {}
+        self._running_tasks: set[_taskItem] = set()
         # 允许并发将请求转发至已拉起的模型服务
         self._semaphore = asyncio.Semaphore(max_concurrency)
-
-    def _cache_summary(self, task: _TaskItem, tools: list, result: Any, diag: dict[str, Any]) -> None:
-        tools_hash = hashlib.md5(json.dumps(tools, ensure_ascii=False, sort_keys=True).encode()).hexdigest()[:6]
-        msgs = task.messages
-        last = msgs[-1] if msgs else {}
-        text = last.get("content")
-        if isinstance(text, list):
-            text = "".join(p.get("text", "") for p in text if isinstance(p, dict))
-        prev, self._prev_req = self._prev_req, {"tools": tools_hash, "n": len(msgs), "source": task.source}
-
-        verdict = diag.get("verdict", "未知")
-        hint = ""
-        if verdict == "分叉":
-            if prev and prev["tools"] != tools_hash:
-                hint = "工具集与上次不同→疑似旁路请求/换会话覆盖KV"
-            elif prev and len(msgs) <= prev["n"]:
-                hint = "消息数未增加→新会话/重试/回溯"
-            else:
-                hint = "同会话历史被改写→对比 debug/prompt diff"
-        kv = {"延长": "严格延长", "首轮": "首轮", "分叉": f"分叉@{diag.get('idx')}(回退{diag.get('rollback')})"}.get(verdict, verdict)
-        cached = result.cached_tokens
-        info("[缓存摘要]", f"来源={task.source}", f"消息={len(msgs)}", f"末条={last.get('role')}",
-             f"工具={len(tools)}#{tools_hash}", f"复用={cached}/{result.prompt_tokens}", f"KV={kv}",
-             f"文件={diag.get('file', '-')}", f"提示={hint or '-'}", "| 末条开头:", repr((text or "")[:50]))
+        # 会话分级 + 排队调度；模型由本类创建后通过 addModel 登记，pipeline 不持有 manager
+        self.pipeline = pipeline()
+        self._create_lock = asyncio.Lock()   # 创建/切换模型串行化，避免并发请求重复加载或互相替换
 
     def _ensure_worker(self) -> None:
         try:
@@ -94,6 +77,7 @@ class MsgHandler:
             "pending_count": self.pending,
             "running_count": len(self._running_tasks),
             "running_task_ids": [t.task_id for t in self._running_tasks],
+            "lanes": self.pipeline.stats(),
         }
 
     async def _worker_loop(self) -> None:
@@ -106,7 +90,7 @@ class MsgHandler:
             # 使用任务池并发分发，不再单任务串行阻塞
             asyncio.create_task(self._execute_task(task))
 
-    async def _execute_task(self, task: _TaskItem) -> None:
+    async def _execute_task(self, task: _taskItem) -> None:
         self._running_tasks.add(task)
         async with self._semaphore:
             try:
@@ -115,6 +99,7 @@ class MsgHandler:
                 wait_s = task.timeout if task.timeout and task.timeout > 0 else None
                 done, _ = await asyncio.wait({job}, timeout=wait_s)
                 if not done:
+                    job.cancel()  # 让仍在排队的任务退出通道，不再占着名额
                     if not task.future.cancelled():
                         task.future.set_exception(TimeoutError(f"任务超时 ({task.timeout}s)"))
                     warn("任务执行超时", task.task_id)
@@ -140,15 +125,16 @@ class MsgHandler:
             "response": payload,
         }
 
-    async def chat(self, request: ChatRequest, *, source: str = "unknown") -> dict[str, Any]:
-        return await self._enqueue_task(
-            message_id=0,
-            model=request.model,
-            messages=request.messages,
-            deploy=request.deploy,
-            timeout=request.timeout,
-            source=source,
-        )
+    async def chat(self, request: ChatRequest, *, source: str = "unknown", client: str = "other") -> dict[str, Any]:
+        spec = self.manager.getModel(request.model)
+        # 消息入口：来源归类不是已知 agent 时用 warn，方便核对 UA 关键词表
+        (warn if client == "other" else info)(
+            "[入口]", f"model={request.model}", f"来源={source}", f"归类={client}",
+            f"models.json={'命中' if spec else '未命中'}", self.pipeline.describe())
+        return await self._enqueue(_taskItem(
+            message_id=0, model=request.model, messages=request.messages, deploy=request.deploy,
+            timeout=request.timeout, source=source, client=client,
+        ))
 
     async def admin(self, request: AdminRequest, *, source: str = "unknown") -> dict[str, Any]:
         admin_ids = {e.value for e in adim_ID}
@@ -162,14 +148,10 @@ class MsgHandler:
         if request.message_id == adim_ID.eModelsList.value:
             return self._response(request.model, adim_ID.eModelsList.value, "ok", {"models": list(self.manager.specs)})
 
-        return await self._enqueue_task(
-            message_id=request.message_id,
-            model=request.model,
-            messages=[],
-            deploy=request.args if isinstance(request.args, dict) else {},
-            timeout=180.0,
-            source=source,
-        )
+        return await self._enqueue(_taskItem(
+            message_id=request.message_id, model=request.model, messages=[],
+            deploy=request.args if isinstance(request.args, dict) else {}, timeout=180.0, source=source,
+        ))
 
     async def handle(self, message_id: int, data: Any = None, *, source: str = "console") -> dict[str, Any]:
         """Console 入口适配:按 message_id 分发到 admin()/chat(),业务异常转为统一 error 响应。"""
@@ -189,92 +171,87 @@ class MsgHandler:
             warn("消息处理失败:", exc)
             return self._response(model, message_id, "error", str(exc))
 
-    async def _enqueue_task(
-        self,
-        message_id: int,
-        model: str,
-        messages: list[dict[str, Any]],
-        deploy: dict[str, Any],
-        timeout: float | None,
-        source: str,
-    ) -> dict[str, Any]:
+    async def _enqueue(self, task: _taskItem) -> dict[str, Any]:
         self._ensure_worker()
-        loop = asyncio.get_running_loop()
-        future = loop.create_future()
-        task = _TaskItem(
-            task_id=f"task_{uuid.uuid4().hex[:8]}",
-            message_id=message_id,
-            model=model,
-            messages=messages,
-            deploy=deploy,
-            timeout=timeout,
-            source=source,
-            future=future,
-        )
+        task.future = asyncio.get_running_loop().create_future()
         await self._queue.put(task)
-        return await future
+        return await task.future
 
-    async def _dispatch(self, task: _TaskItem) -> dict[str, Any]:
+    # ------------------------------------------------------------------ 按 id 调用模型的统一入口
+    def _spec(self, model_id: str) -> modelSpec:
+        spec = self.manager.getModel(model_id)
+        if spec is None:
+            raise KeyError(f"models.json 中不存在模型: {model_id}")
+        return spec
+
+    async def _createModel(self, ids: list[str], args: dict[str, Any], isMain: bool) -> str:
+        """加载 ids 并登记到 pipeline（整体替换对应池）。chat 与管理指令共用；成功返回空串，失败返回原因。"""
+        async with self._create_lock:
+            specs = [self.manager.getModel(model_id) for model_id in ids]
+            if None in specs:
+                return f"模型不存在: {[i for i, s in zip(ids, specs) if s is None]}"
+            register = not all(self.pipeline.has(spec) for spec in specs)
+            if register and self.pipeline.busy():
+                return f"pipeline 仍有任务在执行，暂不能切换{'主' if isMain else '副'}模型到 {ids}"
+            try:
+                for spec in specs:
+                    await asyncio.to_thread(spec.ensure, args)
+            except (RuntimeError, MemoryError) as exc:
+                return str(exc)
+            if register and not self.pipeline.addModel(isMain, specs):
+                return "加载期间 pipeline 被占用，请稍后重试"
+            return ""
+
+    def _fail(self, task: _taskItem, code: int, reason: str) -> dict[str, Any]:
+        error("[请求失败]", task.source, task.task_id, f"model={task.model}", f"code={code}", reason)
+        return self._response(task.model, task.message_id, "error", reason) | {"code": code}
+
+    async def _dispatch(self, task: _taskItem) -> dict[str, Any]:
         model = task.model
         msg_id = task.message_id
 
         if msg_id in {adim_ID.eSleep.value, adim_ID.eUnload.value}:
-            ok = self.manager.sleep(model) if msg_id == adim_ID.eSleep.value else self.manager.unload(model)
+            spec = self._spec(model)
+            ok = await asyncio.to_thread(spec.sleep if msg_id == adim_ID.eSleep.value else spec.unload)
             return self._response(model, msg_id, "ok" if ok else "error", "操作成功" if ok else "操作失败")
         if msg_id == adim_ID.eEnsureLoaded.value:
-            await asyncio.to_thread(self.manager.ensure_loaded, model, task.deploy)
+            reason = await self._createModel([model], task.deploy, not self.pipeline.hasMain())
+            if reason:
+                return self._fail(task, 503, reason)
             return self._response(model, msg_id, "ok", "操作成功")
 
         return await self._generate_chat(task)
 
-    async def _generate_chat(self, task: _TaskItem) -> dict[str, Any]:
-        model = task.model
-        incoming_args = dict(task.deploy)
+    async def _generate_chat(self, task: _taskItem) -> dict[str, Any]:
+        """models.json 里没有的 id：非 agent 来源或没有主模型直接报错，agent 来源且已有主模型则当作客户端别名直接分级调度；
+        有的 id：已在池里就直接调度，否则先创建并登记（没有主模型或本次是主会话时登记为主池，否则登记为副池）。"""
+        args = dict(task.deploy)
+        spec = self.manager.getModel(task.model)
+        if spec is None and (task.client == "other" or not self.pipeline.hasMain()):
+            return self._fail(task, 404, f"模型不存在: {task.model}（来源归类={task.client}）")
 
-        # 1. 确保模型服务就绪
-        await asyncio.to_thread(self.manager.ensure_loaded, model, incoming_args)
-
-        # 2. 参数合并
-        full_gen = self.manager.get_full_generation_config(model)
-        for k, v in incoming_args.items():
-            if k in full_gen and v is not None:
-                full_gen[k] = v
-
-        if "tools" in incoming_args:
-            full_gen["tools"] = incoming_args["tools"]
-        if "tool_choice" in incoming_args:
-            full_gen["tool_choice"] = incoming_args["tool_choice"]
+        category = self.pipeline.classify(task.messages, args.get("tools"), args.get("max_tokens"), task.model)
+        if spec is not None and not (self.pipeline.has(spec) and self.pipeline.hasMain()):
+            reason = await self._createModel([task.model], args, category.is_main or not self.pipeline.hasMain())
+            if reason:
+                return self._fail(task, 503, reason)
 
         first = task.messages[0] if task.messages else {}
-        info("[DBG] 送入引擎", model, f"共{len(task.messages)}条", "system[:120]=", repr(first)[:120],
+        tools = args.get("tools") or []
+        info("[DBG] 送入引擎", task.model, f"共{len(task.messages)}条", "system[:120]=", repr(first)[:120],
              "hash(首条)=", hashlib.md5(json.dumps(first, ensure_ascii=False, sort_keys=True).encode()).hexdigest()[:8],
              "hash(去掉末条)=", hashlib.md5(json.dumps(task.messages[:-1], ensure_ascii=False, sort_keys=True).encode()).hexdigest()[:8])
-
-        tools = full_gen.get("tools") or []
-        info("[DBG] 请求参数", model, f"tools数={len(tools)}",
+        info("[DBG] 请求参数", task.model, f"tools数={len(tools)}",
              "tools_hash=", hashlib.md5(json.dumps(tools, ensure_ascii=False, sort_keys=True).encode()).hexdigest()[:8],
-             "角色序列=", [m.get("role") for m in task.messages], "tool_choice=", full_gen.get("tool_choice"),
-             "max_tokens=", full_gen.get("max_tokens"), "system_prompt长度=", len(str(full_gen.get("system_prompt") or "")))
+             "角色序列=", [m.get("role") for m in task.messages], "tool_choice=", args.get("tool_choice"),
+             "max_tokens=", args.get("max_tokens"))
 
-        # 3. 调度生成（底层通过 HTTP 转发给对应 Server 实例）
-        result = await asyncio.to_thread(self.manager.generate, model, task.messages, full_gen)
+        try:
+            result = await self.pipeline.run(category, task.messages, args)
+        except (RuntimeError, MemoryError, httpx.HTTPError) as exc:   # 模型/引擎失败：不回落，直接报给客户端
+            return self._fail(task, 502, f"{type(exc).__name__}: {exc}")
 
-        # 4. 指标统计
-        loader = self.manager.runtime[model].loader
-        remaining_kv = loader.remaining_kvCache(result.prompt_tokens + result.tokens_generated)
-        cached = result.cached_tokens
-        cache_info = (f"缓存复用 {cached}/{result.prompt_tokens} tokens "
-                      f"({cached / max(1, result.prompt_tokens) * 100:.1f}%), 本轮重算 {result.prompt_tokens - cached} tokens"
-                      if cached >= 0 else "缓存复用: 引擎未提供")
-        info(f"[{model}] 生成完成 -> {cache_info} | "
-             f"速率: {result.tokens_per_second:.2f} token/s, "
-             f"生成: {result.tokens_generated} tokens, "
-             f"耗时: {result.time_seconds:.2f}s, "
-             f"剩余 KV Cache: {remaining_kv} tokens")
-
-        self._cache_summary(task, tools, result, getattr(loader, "last_diag", {}))
-
-        return self._response(model, 0, "ok", result.text) | {
+        return self._response(task.model, 0, "ok", result.text) | {
             "tool_calls": result.tool_calls,
             "finish_reason": result.finish_reason,
             "usage": {
@@ -283,6 +260,6 @@ class MsgHandler:
                 "cached_tokens": result.cached_tokens,
                 "time_seconds": result.time_seconds,
                 "tokens_per_second": round(result.tokens_per_second, 2),
-                "kv_cache_remaining": remaining_kv,
+                "kv_cache_remaining": result.kv_remaining,
             },
         }

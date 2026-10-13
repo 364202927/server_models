@@ -133,8 +133,21 @@ def _claude_message_to_openai(msg: dict[str, Any]) -> list[dict[str, Any]]:
     return tool_msgs + ([{"role": role, "content": text}] if texts else [])
 
 
+# 已知 agent 客户端的 User-Agent 关键词（小写匹配）；新增客户端只需加一行，未命中一律归为 other
+_AGENT_UA: dict[str, tuple[str, ...]] = {
+    "claude_code": ("claude-cli", "claude-code"),
+    "codex": ("codex",),
+}
+
+
 class clientAdapter:
     """网关双向转换器：在客户端特有格式与内部标准 OpenAI 协议之间进行适配。"""
+
+    @staticmethod
+    def detectClient(user_agent: str) -> str:
+        """消息来源归类：返回 _AGENT_UA 里的客户端名，认不出来返回 "other"。"""
+        ua = (user_agent or "").lower()
+        return next((name for name, keys in _AGENT_UA.items() if any(k in ua for k in keys)), "other")
 
     # ------------------------------------------------------------------ 入站
     @staticmethod

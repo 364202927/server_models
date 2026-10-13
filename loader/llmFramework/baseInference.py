@@ -14,7 +14,7 @@ from typing import Any
 import httpx
 import psutil
 
-from ...utils.common import info as log_info, error as log_error
+from ...utils.common import cache_verdict, info as log_info, error as log_error
 from ..chatDataFilter import chatDataFilter
 
 
@@ -28,6 +28,10 @@ class GenerationResult:
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
     finish_reason: str = "stop"
     cached_tokens: int = -1
+    memo_restored: int = 0     # 本次从记忆库补回 reasoning 的 assistant 条数
+    memo_missed: int = 0       # 未能补回的条数（会导致渲染出的历史与 KV 分叉）
+    memo_pruned: int = 0       # 未命中缓存后清理掉的陈旧指纹条数
+    kv_remaining: int = 0      # 本轮结束后上下文还剩多少 token
 
 
 @dataclass
@@ -64,7 +68,6 @@ class baseInference(ABC):
         self._sleeping = False
         self._sleep_capable = False
         self._raw_memo: OrderedDict[str, dict[str, str]] = OrderedDict()
-        self.last_diag: dict[str, Any] = {}
 
     @property
     def base_url(self) -> str:
@@ -187,7 +190,9 @@ class baseInference(ABC):
         self,
         messages: list[dict[str, Any]],
         gen_cfg: dict[str, Any] | None = None,
+        prune_on_miss: bool = False,
     ) -> GenerationResult:
+        """prune_on_miss=True 时，若本次未命中缓存，则只保留仍在本次历史里的 reasoning 记忆（旧会话的指纹不再累积）。"""
         if not self.is_loaded:
             raise RuntimeError("Model not loaded / Server not running. Call load() first.")
 
@@ -200,6 +205,7 @@ class baseInference(ABC):
             system_instruction=system_instruction,
         )
 
+        live_keys = chatDataFilter.assistant_keys(cleaned_messages)
         cleaned_messages, restored, missed = chatDataFilter.restore_raw_assistant(cleaned_messages, self._raw_memo)
 
         start = time.perf_counter()
@@ -219,6 +225,13 @@ class baseInference(ABC):
         while len(self._raw_memo) > self._RAW_MEMO_MAX:
             self._raw_memo.popitem(last=False)
 
+        pruned = 0
+        if prune_on_miss and cache_verdict(raw.cached_tokens, raw.prompt_tokens)[0] == "未命中":
+            stale = [k for k in list(self._raw_memo) if k not in live_keys and k != key]
+            for k in stale:
+                self._raw_memo.pop(k, None)
+            pruned = len(stale)
+
         return GenerationResult(
             text=final_text,
             tokens_generated=raw.tokens,
@@ -228,6 +241,10 @@ class baseInference(ABC):
             tool_calls=final_calls,
             finish_reason=final_reason,
             cached_tokens=raw.cached_tokens,
+            memo_restored=restored,
+            memo_missed=missed,
+            memo_pruned=pruned,
+            kv_remaining=self.remaining_kvCache(raw.prompt_tokens + raw.tokens),
         )
 
     @abstractmethod

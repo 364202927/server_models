@@ -42,6 +42,7 @@ class llama(baseInference):
         calculated_n_ctx = max(int(load_cfg.get("useVram", 0)), self._FALLBACK_N_CTX)
         gpu_layers = int(load_cfg.get("gpu_offload_layers", -1))
         batch_size = int(load_cfg.get("batch_size", 512))
+        slots = max(1, int(load_cfg.get("parallel_slots", 1)))
 
         # 定位 llama-server 可执行文件，未找到则回退到 python -m llama_cpp.server
         llama_bin = shutil.which("llama-server")
@@ -56,6 +57,9 @@ class llama(baseInference):
                 "--port", str(self._port),
                 "--alias", "default",
             ]
+            if slots > 1:
+                # 多槽位共享同一块 KV 池（统一 KV），否则 -c 会被均分给各槽位
+                cmd += ["-np", str(slots), "--kv-unified"]
         else:
             cmd = [
                 "python3", "-m", "llama_cpp.server",
@@ -86,6 +90,7 @@ class llama(baseInference):
             "context_length": calculated_n_ctx,
             "gpu_offload_layers": gpu_layers,
             "batch_size": batch_size,
+            "parallel_slots": slots,
         }
         self._sleep_capable = True
         return self
@@ -104,7 +109,10 @@ class llama(baseInference):
             "messages": messages,
             "stream": False,
             "max_tokens": cfg.pop("max_tokens", 512),
+            "cache_prompt": True,
         }
+        if cfg.get("id_slot") is not None:
+            payload["id_slot"] = int(cfg["id_slot"])   # 固定槽位：主会话 KV 不被支路请求挤掉
         if "temperature" in cfg:
             payload["temperature"] = cfg["temperature"]
         if "top_p" in cfg:
@@ -125,7 +133,10 @@ class llama(baseInference):
         calls = message.get("tool_calls") or []
         prompt_tokens = usage.get("prompt_tokens", 0)
         completion_tokens = usage.get("completion_tokens", 0)
-        cached_tokens = usage.get("prompt_tokens_details", {}).get("cached_tokens", -1)
+        # 新版 usage 带 cached_tokens；旧版只在 timings.cache_n 里给出复用的 token 数
+        cached_tokens = usage.get("prompt_tokens_details", {}).get("cached_tokens")
+        if cached_tokens is None:
+            cached_tokens = data.get("timings", {}).get("cache_n", -1)
 
         return RawOutput(
             text=str(message.get("content") or ""),
