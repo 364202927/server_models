@@ -43,8 +43,6 @@ class llama(baseInference):
         gpu_layers = int(load_cfg.get("gpu_offload_layers", -1))
         batch_size = int(load_cfg.get("batch_size", 512))
         slots = max(1, int(load_cfg.get("parallel_slots", 1)))
-
-        # 定位 llama-server 可执行文件，未找到则回退到 python -m llama_cpp.server
         llama_bin = shutil.which("llama-server")
         if llama_bin:
             cmd = [
@@ -61,14 +59,8 @@ class llama(baseInference):
                 # 多槽位共享同一块 KV 池（统一 KV），否则 -c 会被均分给各槽位
                 cmd += ["-np", str(slots), "--kv-unified"]
         else:
-            cmd = [
-                "python3", "-m", "llama_cpp.server",
-                "--model", str(source),
-                "--n_ctx", str(calculated_n_ctx),
-                "--n_gpu_layers", str(gpu_layers),
-                "--host", self._host,
-                "--port", str(self._port),
-            ]
+            print('创建失败')
+            return
 
         info(f"[llama-server] 正在拉起服务: {' '.join(cmd)}")
         self._server_process = subprocess.Popen(
