@@ -13,7 +13,7 @@ from starlette.responses import JSONResponse, StreamingResponse
 
 from .clientAdapter import clientAdapter
 from .common import error, info
-from ..loader.models_mgr import modelsMgr
+from ..loader.models_mgr import models_mgr
 from ..msgHandler import AdminRequest, ChatRequest, msgHandler
 
 
@@ -67,28 +67,23 @@ def _build_payload(result: dict[str, Any], model_id: str) -> dict[str, Any]:
     }
 
 
-@asynccontextmanager
-async def _lifespan(app: FastAPI) -> AsyncGenerator[None]:
-    yield
-    # FastAPI 服务退出时，安全卸载所有后端常驻模型进程
-    mgr = getattr(app.state, "manager", None)
-    if mgr and hasattr(mgr, "unload_all"):
-        info("FastAPI 停机中，正在销毁所有常驻推理引擎 Server 进程...")
-        mgr.unload_all()
-
-
-class serverApi:
+class serverApi:  #todo改名字为 Gateway
     """FastAPI 服务。"""
 
-    def __init__(self, manager: modelsMgr, handler: msgHandler | None = None) -> None:
-        self.manager = manager
-        self.handler = handler or msgHandler(manager)
+    def __init__(self, handler: msgHandler | None = None) -> None:
+        self.handler = handler or msgHandler()
         self.app = self._create_app()
-        self.app.state.manager = self.manager
         self._server: Any = None
 
+    @asynccontextmanager
+    async def _lifespan(self, app: FastAPI) -> AsyncGenerator[None]:
+        yield
+        # FastAPI 服务退出时，安全卸载所有后端常驻模型进程
+        info("FastAPI 停机中，正在销毁所有常驻推理引擎 Server 进程...")
+        models_mgr.unload_all()
+
     def _server_settings(self) -> dict[str, Any]:
-        return self.manager.settings.get("server", {})
+        return models_mgr.settings.get("server", {})
 
     def _port(self) -> int:
         return int(self._server_settings().get("api_port", 8666))
@@ -118,7 +113,7 @@ class serverApi:
                 args=request.args,
             )
             return await self.handler.admin(admin_req, source=client_type)
-        info("[DBG] 入站请求", f"client={client_type}", f"stream={request.stream}", f"消息数={len(request.messages)}",
+        info("[DBG] 入站请求", f"client={client_type}", f" stream={request.stream}", f" 消息数={len(request.messages)}",
              f"tools数={len(request.tools or [])}", "额外字段=", sorted((request.model_extra or {}).keys()))
         if not request.model or not request.messages:
             raise HTTPException(status_code=400, detail="model 和 messages 不能为空")
@@ -142,7 +137,7 @@ class serverApi:
         return outbound_res
 
     def _create_app(self) -> FastAPI:
-        app = FastAPI(title="AI Multi-Model Service", lifespan=_lifespan)
+        app = FastAPI(title="AI Multi-Model Service", lifespan=self._lifespan)
         app.add_middleware(
             CORSMiddleware,
             allow_origins=["*"],
@@ -154,12 +149,12 @@ class serverApi:
         @app.get("/v1/models")
         async def models(raw_req: Request, _: bool = Depends(self._require_api_key)) -> dict[str, Any]:
             now = int(time.time())
-            info("[DBG] 模型列表请求", f"ua={raw_req.headers.get('user-agent', '')[:30]}", "返回=", list(self.manager.specs))
+            info("[DBG] 模型列表请求", f"ua={raw_req.headers.get('user-agent', '')[:30]}", "返回=", list(models_mgr.specs))
             return {
                 "object": "list",
                 "data": [
                     {"id": m, "object": "model", "created": now, "owned_by": "local"}
-                    for m in self.manager.specs
+                    for m in models_mgr.specs
                 ],
             }
 

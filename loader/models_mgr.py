@@ -4,19 +4,35 @@ import atexit,gc
 import copy
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
+from ..utils import MODELS_FILE
 from ..utils.hardware import check_gpu_memory, detect_gpu
 from ..utils.common import info as log_info, readFile, writeFile, info, error
 from .model_spec import load_model_specs, modelSpec
 
 
 class modelsMgr:
-    """模型注册表：读配置、按 id 取模型、跨模型的显存准入与 LRU 回收。单个模型的生命周期由 modelSpec 自己负责。"""
+    """模型注册表（进程内单例）：读配置、按 id 取模型、跨模型的显存准入与 LRU 回收。单个模型的生命周期由 modelSpec 自己负责。"""
 
-    def __init__(self, config_path: str = "assets/models.json", settings_path: str = "assets/modelSetting.json",) -> None:
-        self.config_path = Path(config_path)
-        self.settings_path = Path(settings_path)
+    _instance: ClassVar[modelsMgr | None] = None
+    _DEFAULT_CONFIG: ClassVar[Path] = MODELS_FILE
+    _DEFAULT_SETTINGS: ClassVar[Path] = MODELS_FILE.parent / "modelSetting.json"
+
+    def __new__(cls, *_args: Any, **_kwargs: Any) -> modelsMgr:
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    @classmethod
+    def instance(cls) -> modelsMgr:
+        return cls._instance if cls._instance is not None else cls()
+
+    def __init__(self, config_path: str | Path | None = None, settings_path: str | Path | None = None) -> None:
+        if getattr(self, "_ready", False):   # 单例已初始化，重复构造不得覆盖运行时状态
+            return
+        self.config_path = Path(config_path) if config_path else self._DEFAULT_CONFIG
+        self.settings_path = Path(settings_path) if settings_path else self._DEFAULT_SETTINGS
 
         self._config: dict[str, Any] = readFile(str(self.config_path)) or {}
         self._model_settings: dict[str, Any] = readFile(str(self.settings_path)) or {}
@@ -36,15 +52,14 @@ class modelsMgr:
 
         # 首次启动即补齐缺失的 launch 等字段并写回
         self._reconfigure()
+        self._ready = True
 
     def getModel(self, model_id: str) -> modelSpec | None:
-        """按 id 取模型（任意状态，无副作用）；不在 models.json 中返回 None。"""
         return self.specs.get(model_id)
 
     def autolaunch(self) -> None:
-        print("~~~~~~~autolaunch~~~~~~~~~",self.specs)
         for spec in (s for s in self.specs.values() if s.launch):
-            print("启动加载模型", spec.model_id)
+            print("自动加载模型", spec.model_id)
             try:
                 spec.ensure()
             except (RuntimeError, MemoryError) as exc:
@@ -116,9 +131,8 @@ class modelsMgr:
             if self._free_for(target):
                 return
 
-    # ------------------------------------------------------------------ 回收/清理
+    # "强制关停所有模型的 Server 子进程
     def unload_all(self) -> None:
-        """强制关停所有模型的 Server 子进程。不拿 spec 锁：正在加载的线程持锁，等锁会让退出死等、子进程成孤儿占着显存。"""
         for spec in self.specs.values():
             loader = spec.loader
             if loader is None:
@@ -135,3 +149,7 @@ class modelsMgr:
         now = time.time()
         idle = [s for s in self.specs.values() if s.isRunning and not s.active and now - s.last_used_at >= timeout]
         return [s.model_id for s in idle if s.sleep(blocking=False)]
+
+models_mgr: modelsMgr = modelsMgr.instance()
+
+# __all__ = ["modelsMgr", "models_mgr"]

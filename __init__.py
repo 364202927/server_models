@@ -2,7 +2,7 @@ __version__ = "0.1.0"
 from .utils.hardware import detect_hardware, print_hardware_info, HardwareInfo
 from .loader import (
     MemoryUsage, baseInference,
-    load_model_specs, modelSpec, modelsMgr, normalize_model_path,
+    load_model_specs, modelSpec, models_mgr, normalize_model_path,
 )
 
 from enum import Enum
@@ -26,7 +26,7 @@ __all__ = [
     "baseInference",
     "MemoryUsage",
     "modelSpec",
-    "modelsMgr",
+    "models_mgr",
     "load_model_specs",
     "normalize_model_path",
 ]

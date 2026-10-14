@@ -12,7 +12,7 @@ import httpx
 
 from . import adim_ID
 from .loader.model_spec import modelSpec
-from .loader.models_mgr import modelsMgr
+from .loader.models_mgr import models_mgr
 from .loader.sessionHandle import pipeline
 from .utils.common import error, info, warn
 from .utils.hardware import detect_hardware
@@ -47,8 +47,7 @@ class _taskItem:
 
 
 class msgHandler:
-    def __init__(self, manager: modelsMgr, max_concurrency: int = 32) -> None:
-        self.manager = manager
+    def __init__(self, max_concurrency: int = 32) -> None:
         self._queue: asyncio.Queue[_taskItem] | None = None
         self._worker_task: asyncio.Task | None = None
         self._running_tasks: set[_taskItem] = set()
@@ -126,7 +125,7 @@ class msgHandler:
         }
 
     async def chat(self, request: ChatRequest, *, source: str = "unknown", client: str = "other") -> dict[str, Any]:
-        spec = self.manager.getModel(request.model)
+        spec = models_mgr.getModel(request.model)
         # 消息入口：来源归类不是已知 agent 时用 warn，方便核对 UA 关键词表
         (warn if client == "other" else info)(
             "[入口]", f"model={request.model}", f"来源={source}", f"归类={client}",
@@ -142,11 +141,11 @@ class msgHandler:
             raise ValueError(f"不支持的管理指令: {request.message_id}")
 
         if request.message_id == adim_ID.eStatus.value:
-            return self._response(request.model, adim_ID.eStatus.value, "ok", self.manager.status() | {"queue_length": self.pending})
+            return self._response(request.model, adim_ID.eStatus.value, "ok", models_mgr.status() | {"queue_length": self.pending})
         if request.message_id == adim_ID.eHardwareInfo.value:
             return self._response(request.model, adim_ID.eHardwareInfo.value, "ok", detect_hardware().to_dict())
         if request.message_id == adim_ID.eModelsList.value:
-            return self._response(request.model, adim_ID.eModelsList.value, "ok", {"models": list(self.manager.specs)})
+            return self._response(request.model, adim_ID.eModelsList.value, "ok", {"models": list(models_mgr.specs)})
 
         return await self._enqueue(_taskItem(
             message_id=request.message_id, model=request.model, messages=[],
@@ -179,7 +178,7 @@ class msgHandler:
 
     # ------------------------------------------------------------------ 按 id 调用模型的统一入口
     def _spec(self, model_id: str) -> modelSpec:
-        spec = self.manager.getModel(model_id)
+        spec = models_mgr.getModel(model_id)
         if spec is None:
             raise KeyError(f"models.json 中不存在模型: {model_id}")
         return spec
@@ -187,7 +186,7 @@ class msgHandler:
     async def _createModel(self, ids: list[str], args: dict[str, Any], isMain: bool) -> str:
         """加载 ids 并登记到 pipeline（整体替换对应池）。chat 与管理指令共用；成功返回空串，失败返回原因。"""
         async with self._create_lock:
-            specs = [self.manager.getModel(model_id) for model_id in ids]
+            specs = [models_mgr.getModel(model_id) for model_id in ids]
             if None in specs:
                 return f"模型不存在: {[i for i, s in zip(ids, specs) if s is None]}"
             register = not all(self.pipeline.has(spec) for spec in specs)
@@ -226,7 +225,7 @@ class msgHandler:
         """models.json 里没有的 id：非 agent 来源或没有主模型直接报错，agent 来源且已有主模型则当作客户端别名直接分级调度；
         有的 id：已在池里就直接调度，否则先创建并登记（没有主模型或本次是主会话时登记为主池，否则登记为副池）。"""
         args = dict(task.deploy)
-        spec = self.manager.getModel(task.model)
+        spec = models_mgr.getModel(task.model)
         if spec is None and (task.client == "other" or not self.pipeline.hasMain()):
             return self._fail(task, 404, f"模型不存在: {task.model}（来源归类={task.client}）")
 

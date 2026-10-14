@@ -127,7 +127,6 @@ def detect_hardware() -> HardwareInfo:
 
 
 def hardware_summary() -> str:
-    """启动时的硬件摘要:显卡名称/总显存/剩余显存 + 内存剩余/总量。"""
     lines = [
         f"GPU{gpu.index} {gpu.name}: 显存 {gpu.memory_total_mb}MB, 剩余 {gpu.memory_free_mb}MB"
         for gpu in detect_gpu()
