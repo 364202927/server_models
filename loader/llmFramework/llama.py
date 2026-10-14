@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import os
 import shutil
-import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -59,20 +57,14 @@ class llama(baseInference):
                 # 多槽位共享同一块 KV 池（统一 KV），否则 -c 会被均分给各槽位
                 cmd += ["-np", str(slots), "--kv-unified"]
         else:
-            print('创建失败')
-            return
+            raise FileNotFoundError("未找到 llama-server，请先在当前环境编译安装并加入 PATH")
 
         info(f"[llama-server] 正在拉起服务: {' '.join(cmd)}")
-        self._server_process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            preexec_fn=os.setsid,
-        )
+        self._spawn(cmd)
 
         health_url = f"{self.base_url}/health"
         if not self._wait_for_server_ready(health_url, timeout=90.0):
-            err_msg = self._server_process.stderr.read().decode() if self._server_process.stderr else ""
+            err_msg = self._startup_error()
             self._unload_engine()
             raise RuntimeError(f"llama-server 启动失败: {err_msg}")
 

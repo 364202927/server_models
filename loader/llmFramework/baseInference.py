@@ -7,7 +7,8 @@ import socket
 import subprocess
 import time
 from abc import ABC, abstractmethod
-from collections import OrderedDict
+import threading
+from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -68,6 +69,7 @@ class baseInference(ABC):
         self._sleeping = False
         self._sleep_capable = False
         self._raw_memo: OrderedDict[str, dict[str, str]] = OrderedDict()
+        self._stderr_tail: deque[str] = deque(maxlen=60)
 
     @property
     def base_url(self) -> str:
@@ -93,11 +95,26 @@ class baseInference(ABC):
             s.bind(("", 0))
             return s.getsockname()[1]
 
+    def _spawn(self, cmd: list[str]) -> None:
+        """拉起 Server 子进程。stderr 由后台线程持续读走并只留末尾几行：
+        管道无人读取时写满 64KB 子进程会阻塞，健康检查超时后再 read() 也会死等。"""
+        self._stderr_tail.clear()
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            text=True, errors="replace", preexec_fn=os.setsid,
+        )
+        self._server_process = proc
+        threading.Thread(target=lambda: self._stderr_tail.extend(proc.stderr), daemon=True).start()
+
+    def _startup_error(self) -> str:
+        return "".join(self._stderr_tail)
+
     def _wait_for_server_ready(self, health_url: str, timeout: float = 120.0) -> bool:
         start_time = time.time()
+        proc = self._server_process
         while time.time() - start_time < timeout:
-            if self._server_process and self._server_process.poll() is not None:
-                log_error(f"Server 进程意外退出，退出码: {self._server_process.returncode}")
+            if proc is None or proc.poll() is not None:  # 进程已退出或被别处（如退出清理）卸载
+                log_error(f"Server 进程已退出，退出码: {proc.returncode if proc else '已卸载'}")
                 return False
             try:
                 resp = httpx.get(health_url, timeout=2.0)

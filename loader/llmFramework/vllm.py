@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import os
-import subprocess
 from typing import Any
 
 import httpx
@@ -42,16 +40,11 @@ class vllm(baseInference):
             cmd.extend(["--enable-lora", "--lora-modules", f"configured-lora={lora}"])
 
         info(f"[vLLM-server] 正在拉起服务: {' '.join(cmd)}")
-        self._server_process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            preexec_fn=os.setsid,
-        )
+        self._spawn(cmd)
 
         health_url = f"{self.base_url}/health"
         if not self._wait_for_server_ready(health_url, timeout=180.0):
-            err_msg = self._server_process.stderr.read().decode() if self._server_process.stderr else ""
+            err_msg = self._startup_error()
             self._unload_engine()
             raise RuntimeError(f"vLLM server 启动失败: {err_msg}")
 

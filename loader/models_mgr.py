@@ -118,10 +118,13 @@ class modelsMgr:
 
     # ------------------------------------------------------------------ 回收/清理
     def unload_all(self) -> None:
-        """安全关停并清理所有模型的 Server 子进程（退出时强制，不管是否还有请求）。"""
+        """强制关停所有模型的 Server 子进程。不拿 spec 锁：正在加载的线程持锁，等锁会让退出死等、子进程成孤儿占着显存。"""
         for spec in self.specs.values():
+            loader = spec.loader
+            if loader is None:
+                continue
             try:
-                spec.unload(force=True)
+                loader.unload()
             except Exception as exc:
                 error(f"卸载模型 {spec.model_id} 异常: {exc}")
 

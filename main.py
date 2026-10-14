@@ -39,7 +39,6 @@ if __name__ == "__main__":
     async def _run() -> None:
         # 启动顺序:1.初始化并打印硬件 2.按 launch 加载模型
         print("硬件信息\n" + hardware_summary())
-        await asyncio.to_thread(manager.autolaunch)
         tasks = [asyncio.create_task(_reaper(), name="reaper")]
         if sys.stdin.isatty():
             tasks.append(asyncio.create_task(console.run(), name="console"))
@@ -49,10 +48,17 @@ if __name__ == "__main__":
             tasks[0].cancel()
             return
 
-        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-        for task in pending:
-            task.cancel()
-        await asyncio.gather(*pending, return_exceptions=True)
+        # 加载模型耗时且可能卡住：放后台线程，不能挡住 console/fastapi 启动，也不进 wait 集合
+        launch = asyncio.create_task(asyncio.to_thread(manager.autolaunch), name="autolaunch")
+        try:
+            done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+        finally:
+            # 先杀引擎子进程：加载线程的健康检查随之返回，线程池才能正常收尾；否则退出会死等、显存不释放
+            await asyncio.shield(asyncio.to_thread(manager.unload_all))
+            await asyncio.gather(launch, return_exceptions=True)
 
         for task in done:
             if not task.cancelled():
