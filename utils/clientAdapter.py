@@ -223,6 +223,11 @@ class clientAdapter:
         def chunk(delta: dict[str, Any], finish: str | None = None) -> dict[str, Any]:
             return {**base, "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
 
+        # 0. 思考增量（think_output 为 field/both 时 message 带 reasoning_content）
+        reasoning = ((openai_resp.get("choices") or [{}])[0].get("message") or {}).get("reasoning_content") or ""
+        for piece in _split(reasoning, chunk_size):
+            yield chunk({"role": "assistant", "reasoning_content": piece})
+
         # 1. 文本增量
         for piece in _split(content, chunk_size):
             yield chunk({"role": "assistant", "content": piece})

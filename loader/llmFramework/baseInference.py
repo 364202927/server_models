@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import gc
+import hashlib
+import json
 import os
 import signal
 import socket
@@ -28,7 +30,8 @@ class GenerationResult:
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
     finish_reason: str = "stop"
     cached_tokens: int = -1
-    reasoning: str = ""  # 本次生成剥离出的思考正文（引擎 reasoning_content 或 <think> 段）
+    reasoning: str = ""  # 本次生成剥离出的思考正文（引擎 reasoning_content 或 <think> 段）；text 永远不含 think
+    warnings: list[str] = field(default_factory=list)  # 调度层告警（如支线被迫占用主会话槽位），由网关带给客户端
     memo_restored: int = 0  # 本次从记忆库补回 reasoning 的 assistant 条数
     memo_missed: int = 0  # 未能补回的条数（会导致渲染出的历史与 KV 分叉）
     memo_pruned: int = 0  # 未命中缓存后清理掉的陈旧指纹条数
@@ -60,6 +63,8 @@ class baseInference(ABC):
     """推理框架抽象基类：Server 模式基类"""
 
     _RAW_MEMO_MAX = 256
+    _STARTUP_TIMEOUT = 180.0  # 引擎启动健康检查上限（秒）；大权重从 /mnt 盘冷读较慢，子类可覆盖
+    _CACHE_LOG_KEYS = ("selected slot", "purging slot", "forcing full", "checkpoint", "prompt cache", "similarity", "cache_ram", "n_past")  # 缓存排查用，定位完可删
 
     def __init__(self) -> None:
         self._server_process: subprocess.Popen | None = None
@@ -71,6 +76,7 @@ class baseInference(ABC):
         self._sleep_capable = False
         self._raw_memo: OrderedDict[str, dict[str, str]] = OrderedDict()
         self._stderr_tail: deque[str] = deque(maxlen=60)
+        self._slot_last: dict[int, dict[str, Any]] = {}  # 槽位号 -> 上次请求的 tools / 逐条消息指纹，仅用于缓存排查日志
 
     @property
     def base_url(self) -> str:
@@ -109,12 +115,20 @@ class baseInference(ABC):
             preexec_fn=os.setsid,
         )
         self._server_process = proc
-        threading.Thread(target=lambda: self._stderr_tail.extend(proc.stderr), daemon=True).start()
+
+        def pump() -> None:
+            for line in proc.stderr:
+                self._stderr_tail.append(line)
+                if any(key in line for key in self._CACHE_LOG_KEYS):  # 缓存排查：只转发选槽/整段重算/检查点相关行
+                    log_info("[llama-server]", line.strip()[:240])
+
+        threading.Thread(target=pump, daemon=True).start()
 
     def _startup_error(self) -> str:
         return "".join(self._stderr_tail)
 
-    def _wait_for_server_ready(self, health_url: str, timeout: float = 120.0) -> bool:
+    def _wait_for_server_ready(self, health_url: str, timeout: float | None = None) -> bool:
+        timeout = timeout or self._STARTUP_TIMEOUT
         start_time = time.time()
         proc = self._server_process
         while time.time() - start_time < timeout:
@@ -231,6 +245,8 @@ class baseInference(ABC):
         live_keys = chatDataFilter.assistant_keys(cleaned_messages)
         cleaned_messages, restored, missed = chatDataFilter.restore_raw_assistant(cleaned_messages, self._raw_memo)
 
+        self._log_slot_diff(cleaned_messages, cfg)
+
         start = time.perf_counter()
         raw = self._response(messages=cleaned_messages, gen_cfg=cfg)
         elapsed = time.perf_counter() - start
@@ -242,7 +258,7 @@ class baseInference(ABC):
             cleaned_messages[-1] if cleaned_messages else None,
             {"role": "assistant", "content": final_text, "tool_calls": final_calls},
         )
-        self._raw_memo[key] = chatDataFilter.split_raw(raw.text)
+        self._raw_memo[key] = {"reasoning": final_reasoning, "content": final_text}  # 引擎已拆出 reasoning 时 split_raw(raw.text) 为空，须存真实值
         self._raw_memo.move_to_end(key)
         while len(self._raw_memo) > self._RAW_MEMO_MAX:
             self._raw_memo.popitem(last=False)
@@ -269,6 +285,29 @@ class baseInference(ABC):
             memo_missed=missed,
             memo_pruned=pruned,
             kv_remaining=self.remaining_kvCache(raw.prompt_tokens + raw.tokens),
+        )
+
+    def _log_slot_diff(self, messages: list[dict[str, Any]], cfg: dict[str, Any]) -> None:
+        """缓存排查用：对比本次请求与同一槽位上次请求（发给引擎的最终内容），打印首个分歧位置。
+        槽位为空（未指定 id_slot）时统一记在 -1 号。"""
+        slot = cfg.get("id_slot")
+        slot = -1 if slot is None else int(slot)
+        digest = lambda obj: hashlib.md5(json.dumps(obj, ensure_ascii=False, sort_keys=True, default=str).encode()).hexdigest()[:6]
+        now = {"tools": digest(cfg.get("tools") or []), "msgs": [digest(m) for m in messages]}
+        last = self._slot_last.get(slot)
+        self._slot_last[slot] = now
+        if last is None:
+            log_info("[槽位差异]", f"槽={slot}", "该槽首次请求", f"消息={len(messages)}", f"tools#{now['tools']}")
+            return
+
+        common = next((i for i, (a, b) in enumerate(zip(last["msgs"], now["msgs"])) if a != b), min(len(last["msgs"]), len(now["msgs"])))
+        where = f"首个分歧=第{common}条({messages[common].get('role')})" if common < len(messages) else "本次是上次的前缀/等长"
+        log_info(
+            "[槽位差异]",
+            f"槽={slot}",
+            f"上次{len(last['msgs'])}条 本次{len(messages)}条 共同前缀{common}条",
+            where,
+            f"tools#{last['tools']}->#{now['tools']}" + ("(变了，整段前缀失效)" if last["tools"] != now["tools"] else "(不变)"),
         )
 
     @abstractmethod

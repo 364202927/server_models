@@ -21,15 +21,17 @@ class _lane:
     spec: modelSpec
     slots: int = 1
     running: int = 0
-    last_sid: str = ""  # 上一个在此模型上跑的会话，用于判断 KV 是否被其他会话覆盖
+    used: set[int] = field(default_factory=set)  # 已被占用的槽位号：主会话占 0，支路占 1（或副模型上任一空槽）
+    last_sid: dict[int, str] = field(default_factory=dict)  # 槽位号 -> 上一个在该槽位上跑的会话，用于判断 KV 是否被其他会话覆盖
 
 
 @dataclass(eq=False)
 class _ticket:
     category: sessionCategory
+    want: int | None  # 要占的槽位号；None = 任一空槽
     seq: int
     enq_at: float
-    granted: asyncio.Future  # 放行后结果为分到的 _lane
+    granted: asyncio.Future  # 放行后结果为 (分到的 _lane, 槽位号)
 
 
 @dataclass(eq=False)
@@ -37,15 +39,10 @@ class _pool:
     isMain: bool
     lanes: list[_lane] = field(default_factory=list)
     waiting: list[_ticket] = field(default_factory=list)
-    side_running: int = 0  # 池内正在跑的支路任务数（用于给主会话预留槽位）
 
     @property
     def alive(self) -> list[_lane]:
         return [lane for lane in self.lanes if lane.spec.isAlive]
-
-    @property
-    def total_slots(self) -> int:
-        return sum(lane.slots for lane in self.alive)
 
 
 @dataclass
@@ -54,9 +51,10 @@ class lease:
     isMain: bool  # 是否来自主池
     waited: float = 0.0  # 排队等待秒数
     ahead: int = 0  # 入队时池里已有的任务数
-    prev_sid: str = ""  # 该模型上一个会话
+    prev_sid: str = ""  # 该槽位上一个会话
     prev_bound: str = ""  # 入队前会话绑定的模型
-    slot: int | None = None  # KV 槽位提示：主会话固定 0，支路 1；None 交给引擎自选
+    slot: int | None = None  # 传给引擎的 id_slot：仅主池多槽位时给；None 交给引擎自选
+    warnings: list[str] = field(default_factory=list)  # 路由告警，随响应带给客户端
     job: asyncio.Future | None = None  # 正在跑的生成线程；调用方被取消时，名额等它结束才归还
     cancel: threading.Event = field(default_factory=threading.Event)  # 调用方离开（超时/断连）时置位，通知引擎中止
 
@@ -65,18 +63,18 @@ class pipeline:
     """
     会话调度器：只拿 modelSpec 的 generate，不管模型怎么生、怎么睡。
     - 主池/副池结构相同，都可放多个模型；addModel 整体替换，池里还有任务时拒绝切换（避免打断正在跑的会话）。
-    - 路由只看分级：主会话与 Lv4 走主池；Lv1~3 走副池，副池没有可用模型时回落主池。
+    - 路由只分主/支：主会话占主模型 slot 0；支路（不分级）走副模型，没有副模型则占主模型 slot 1；
+      两者都没有（主模型 parallel_slots<2）时告警，并被迫占 slot 0（排在主会话之后）。
     - 主会话按指纹绑定模型：绑定的模型即使忙也排队等它，别的模型空闲也不接；没有绑定才按空闲度挑。
-    - 排队：主会话最先，Lv4 支路不插队，支路按等级排且等得越久越靠前（防饥饿），运行中的任务不抢占。
+    - 排队：主会话最先，支路按到达顺序，运行中的任务不抢占。
     - 切换：ensure 负责"加载 + 登记"，整体串行（_switch_lock）；池里有任务时拒绝替换。调用方不需要自己加锁。
       加载期间关闸（_idle）：新请求先 settled() 等切换结束，再按最新的池状态决策。
     - 线程不可强杀：超时/断连时先置位 cancel 事件通知引擎中止；无论引擎是否响应，槽位、切换锁都等线程真正结束才归还。
     """
 
-    _AGING_SEC = 30.0  # 支路每多等这么久，优先级提升一档
-
     def __init__(self) -> None:
         self._classifier = classifier()
+        self._warned: set[str] = set()  # 已在服务端告警过的支路会话，同一会话只报一次，避免子代理刷屏
         self._seq = itertools.count()
         self._main = _pool(True)
         self._sub = _pool(False)
@@ -85,8 +83,8 @@ class pipeline:
         self._idle.set()
 
     # ------------------------------------------------------------------ 登记与查询
-    def classify(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None, max_tokens: int | None = None, model_hint: str = "") -> sessionCategory:
-        return self._classifier.classify(messages, tools, max_tokens, model_hint)
+    def classify(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None) -> sessionCategory:
+        return self._classifier.classify(messages, tools)
 
     @property
     def running(self) -> int:
@@ -193,57 +191,62 @@ class pipeline:
         }
 
     # ------------------------------------------------------------------ 路由与排队
-    def _route(self, category: sessionCategory) -> _pool:
-        if category.target_model_tier == "light" and self._sub.alive:
-            return self._sub
-        if self._main.alive:
-            return self._main
-        raise RuntimeError("没有可用的主模型")
-
-    def _rank(self, ticket: _ticket, now: float) -> tuple[int, float, int]:
-        category = ticket.category
+    def _route(self, category: sessionCategory) -> tuple[_pool, int | None, str]:
+        """返回 (池, 要占的槽位号, 告警)。主会话占主模型 slot 0；支路优先副模型，其次主模型 slot 1，都没有则告警并退到 slot 0。"""
+        if not self._main.alive:
+            raise RuntimeError("没有可用的主模型")
         if category.is_main:
-            return 0, 0.0, ticket.seq
-        return (1, category.priority * self._AGING_SEC - (now - ticket.enq_at), ticket.seq)
+            return self._main, 0, ""
+        if self._sub.alive:
+            return self._sub, None, ""
+        if any(lane.slots >= 2 for lane in self._main.alive):
+            return self._main, 1, ""
+        return self._main, 0, "没有副模型且主模型无 slot 1（parallel_slots<2），支路会话被迫占用主会话槽位 0，会打断主会话缓存"
 
     @staticmethod
-    def _pick(pool: _pool, category: sessionCategory) -> _lane | None:
-        """挑一个有空槽的模型：主会话优先它绑定的模型（忙就等，不换别的）；否则取负载最低的。"""
+    def _rank(ticket: _ticket) -> tuple[int, int]:
+        return (0 if ticket.category.is_main else 1), ticket.seq
+
+    @staticmethod
+    def _pick(pool: _pool, ticket: _ticket) -> tuple[_lane, int] | None:
+        """挑 (模型, 槽位)：主会话优先它绑定的模型（忙就等，不换别的）；want 为 None 时取任一空槽，多个模型取负载最低的。"""
+        category, want = ticket.category, ticket.want
         lanes = pool.alive
         bound = [lane for lane in lanes if category.is_main and lane.spec.model_id == category.model_id]
-        free = [lane for lane in (bound or lanes) if lane.running < lane.slots]
-        # 主池总槽位 >= 2 时，给主会话预留 1 个槽位，支路占不满
-        reserve = 1 if pool.isMain and pool.total_slots >= 2 else 0
-        if not category.is_main and pool.side_running >= pool.total_slots - reserve:
-            return None
-        return min(free, key=lambda lane: lane.running / lane.slots, default=None)
+        free: list[tuple[_lane, int]] = []
+        for lane in bound or lanes:
+            slot = want if want is not None else next((i for i in range(lane.slots) if i not in lane.used), None)
+            if slot is not None and slot < lane.slots and slot not in lane.used:
+                free.append((lane, slot))
+        return min(free, key=lambda item: item[0].running / item[0].slots, default=None)
 
     def _pump(self, pool: _pool) -> None:
-        """按优先级放行等待者；某张票要的模型没空槽时跳过它，不挡住去别的模型的票。"""
-        now = time.monotonic()
-        for ticket in sorted(pool.waiting, key=lambda t: self._rank(t, now)):
+        """按优先级放行等待者；某张票要的槽位被占时跳过它，不挡住后面能放行的票。"""
+        for ticket in sorted(pool.waiting, key=self._rank):
             if ticket.granted.done():  # 等待方已被取消
                 pool.waiting.remove(ticket)
                 continue
-            lane = self._pick(pool, ticket.category)
-            if lane is None:
+            picked = self._pick(pool, ticket)
+            if picked is None:
                 continue
+            lane, slot = picked
             pool.waiting.remove(ticket)
             lane.running += 1
-            pool.side_running += 0 if ticket.category.is_main else 1
-            ticket.granted.set_result(lane)
+            lane.used.add(slot)
+            ticket.granted.set_result(picked)
 
-    def _release(self, pool: _pool, lane: _lane, category: sessionCategory) -> None:
+    def _release(self, pool: _pool, lane: _lane, slot: int) -> None:
         lane.running -= 1
-        pool.side_running -= 0 if category.is_main else 1
+        lane.used.discard(slot)
         self._pump(pool)
 
     @asynccontextmanager
-    async def _acquire(self, pool: _pool, category: sessionCategory) -> AsyncIterator[lease]:
+    async def _acquire(self, pool: _pool, category: sessionCategory, want: int | None, warning: str = "") -> AsyncIterator[lease]:
         """申请执行许可。退出（含取消/超时/异常）时退出队列或归还名额并唤醒后续任务；
         生成线程还没结束（被超时取消）时，名额推迟到线程结束再归还，避免实际并发超过模型槽位数。"""
         ticket = _ticket(
             category,
+            want,
             next(self._seq),
             time.monotonic(),
             asyncio.get_running_loop().create_future(),
@@ -253,15 +256,12 @@ class pipeline:
         self._pump(pool)
         grant: lease | None = None
         try:
-            lane = await ticket.granted
-            prev_bound, prev_sid, lane.last_sid = (
+            lane, slot = await ticket.granted
+            prev_bound, prev_sid, lane.last_sid[slot] = (
                 category.model_id,
-                lane.last_sid,
+                lane.last_sid.get(slot, ""),
                 category.session_id,
             )
-            slot = None
-            if pool.isMain and lane.slots >= 2:  # 主池多槽位时主会话固定槽 0；仅 2 槽时支路固定槽 1
-                slot = 0 if category.is_main else (1 if lane.slots == 2 else None)
             self._classifier.bind(category, lane.spec.model_id)
             grant = lease(
                 lane,
@@ -270,7 +270,8 @@ class pipeline:
                 ahead,
                 prev_sid,
                 prev_bound,
-                slot,
+                slot if pool.isMain and lane.slots >= 2 else None,  # 副模型不固定槽位，交给引擎自选
+                [warning] if warning else [],
             )
             yield grant
         finally:
@@ -278,17 +279,20 @@ class pipeline:
                 pool.waiting.remove(ticket)
                 self._pump(pool)
             elif not ticket.granted.cancelled():  # 已放行（含放行后、恢复前被取消）：归还名额
-                granted = ticket.granted.result()
+                granted_lane, granted_slot = ticket.granted.result()
                 job = grant.job if grant else None
                 if job is not None and not job.done():
                     grant.cancel.set()  # 调用方先走了：通知引擎中止，名额等线程结束再还
-                self._after(job, lambda: self._release(pool, granted, category))
+                self._after(job, lambda: self._release(pool, granted_lane, granted_slot))
 
     # ------------------------------------------------------------------ 执行
     async def run(self, category: sessionCategory, messages: list[dict[str, Any]], overrides: dict[str, Any]) -> GenerationResult:
         """排队 -> 在分到的模型上生成。失败（含副模型）原样上抛，由调用方报给客户端。"""
-        pool = self._route(category)
-        async with self._acquire(pool, category) as grant:
+        pool, want, warning = self._route(category)
+        if warning and category.session_id not in self._warned:
+            self._warned.add(category.session_id)
+            warn("[调度]", self._who(category), warning)
+        async with self._acquire(pool, category, want, warning) as grant:
             cfg = dict(overrides)
             if grant.slot is not None:
                 cfg["id_slot"] = grant.slot
@@ -303,13 +307,14 @@ class pipeline:
                 )
             )
             result = await asyncio.shield(grant.job)  # 调用方被取消时 job 继续跑，名额由 _acquire 延后归还
+        result.warnings = grant.warnings
         self._log_result(category, grant, messages, overrides, result)
         return result
 
     # ------------------------------------------------------------------ 日志
     @staticmethod
     def _who(category: sessionCategory) -> str:
-        kind = "主会话" if category.is_main else f"支路Lv{category.importance_lv}"
+        kind = "主会话" if category.is_main else "支路"
         return f"{kind}#{category.session_id or '-'}·{'延长' if category.extended else '新会话'}"
 
     def _log_dispatch(self, category: sessionCategory, grant: lease) -> None:
@@ -325,9 +330,13 @@ class pipeline:
             self._who(category),
             f"-> {'主池' if grant.isMain else '副池'}:{model}",
             how,
+            f"id_slot={grant.slot}",
+            f"各槽占用={sorted(grant.lane.used)}/{grant.lane.slots}",
+            f"本槽上次会话=#{grant.prev_sid or '-'}",
+            f"各槽最近会话={dict(sorted(grant.lane.last_sid.items()))}",
             f"排队{grant.waited:.1f}s(前方{grant.ahead})",
             f"原因={category.reason}",
-            ("注意: 支路占用主池模型，会打断主会话" if grant.isMain and not category.is_main else ""),
+            f"注意: {'；'.join(grant.warnings)}" if grant.warnings else "",
         )
 
     def _log_result(self, category: sessionCategory, grant: lease, messages: list[dict[str, Any]], overrides: dict[str, Any], result: GenerationResult) -> None:

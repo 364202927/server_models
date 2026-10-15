@@ -182,7 +182,7 @@ class msgHandler:
         if spec is None and (task.client == "other" or not pipe.hasMain()):
             return self._fail(task, 404, f"模型不存在: {task.model}（来源归类={task.client}）")
 
-        category = pipe.classify(task.messages, args.get("tools"), args.get("max_tokens"), task.model)
+        category = pipe.classify(task.messages, args.get("tools"))
 
         # 模型不在池里 / 没有主模型 / 处于休眠：都在计时开始前加载或唤醒好，冷启动再久也不会撞上超时
         if spec is not None and not (pipe.has(spec) and pipe.hasMain() and spec.isRunning):
@@ -197,6 +197,7 @@ class msgHandler:
             "tool_calls": result.tool_calls,
             "finish_reason": result.finish_reason,
             "reasoning": result.reasoning,
+            "warnings": result.warnings,
             "usage": {
                 "prompt_tokens": result.prompt_tokens,
                 "completion_tokens": result.tokens_generated,
@@ -211,8 +212,7 @@ class msgHandler:
     def _log_request(task: _taskItem, args: dict[str, Any]) -> None:
         """缓存命中排查用的请求指纹日志；排查完可整体删除。"""
         tools = args.get("tools") or []
-        info("[DBG] 请求", task.model, f"{len(task.messages)}条", [m.get("role") for m in task.messages], f"tools={len(tools)}#{_digest(tools)}",
-             "首条#", _digest(task.messages[0] if task.messages else {}), "去末条#", _digest(task.messages[:-1]), "字段=", sorted(args))
+        info("[DBG] 请求", task.model, f"{len(task.messages)}条", [m.get("role") for m in task.messages], f"tools={len(tools)}#{_digest(tools)}", "首条#", _digest(task.messages[0] if task.messages else {}), "去末条#", _digest(task.messages[:-1]), "字段=", sorted(args))
 
     # ------------------------------------------------------------------ 响应
     @staticmethod

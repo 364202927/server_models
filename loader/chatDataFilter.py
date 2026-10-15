@@ -54,8 +54,9 @@ class chatDataFilter:
     def split_raw(raw_text: str) -> dict[str, str]:
         """引擎原文拆成模板所需的两段：think 正文（reasoning_content）与 </think> 之后的文字（去掉工具调用块）。"""
         head, sep, tail = raw_text.partition("</think>")
-        if not sep:
-            return {"reasoning": "", "content": ""}
+        if not sep:  # 没有闭合：以 <think> 开头说明被截断，整段都是思考
+            stripped = raw_text.lstrip()
+            return {"reasoning": stripped.removeprefix("<think>").strip() if stripped.startswith("<think>") else "", "content": ""}
         reasoning = head.strip().removeprefix("<think>").strip()
         tail = re.sub(r"<tool_call>.*?(?:</tool_call>|$)", "", tail, flags=re.DOTALL)
         tail = re.sub(r"<function=.*?(?:</function>|$)", "", tail, flags=re.DOTALL)
@@ -184,8 +185,11 @@ class chatDataFilter:
         tool_calls = list(detected_calls or [])
         clean_text = raw_text
 
-        if "</think>" in clean_text and not clean_text.lstrip().startswith("<think>"):
-            clean_text = "<think>\n" + clean_text
+        # 约定：返回文本永远不含 think（思考由 split_raw 单独取出）；先剥再解析，避免误解析 think 里的工具标记
+        if "</think>" in clean_text:
+            clean_text = clean_text.split("</think>", 1)[1]
+        elif clean_text.lstrip().startswith("<think>"):
+            clean_text = ""
 
         if not tool_calls:
             # Hermes 格式匹配
@@ -226,9 +230,5 @@ class chatDataFilter:
 
         if tool_calls:
             finish_reason = "tool_calls"
-            if "</think>" in clean_text:
-                clean_text = clean_text.split("</think>", 1)[1].strip()
-            elif clean_text.startswith("<think>"):
-                clean_text = ""
 
         return clean_text.strip(), tool_calls, finish_reason

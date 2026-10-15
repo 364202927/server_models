@@ -29,7 +29,7 @@ class sglang(baseInference):
         self._spawn(cmd)
 
         health_url = f"{self.base_url}/health"
-        if not self._wait_for_server_ready(health_url, timeout=120.0):
+        if not self._wait_for_server_ready(health_url):
             err_msg = self._startup_error()
             self._unload_engine()
             raise RuntimeError(f"SGLang server 启动失败: {err_msg}")

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import shutil
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +32,15 @@ class llama(baseInference):
             raise ValueError(f"不是有效的 GGUF 文件: {model_path}")
         return source
 
+    @staticmethod
+    def _supports_flag(llama_bin: str, flag: str) -> bool:
+        """旧版 llama-server 不认识的参数会直接启动失败，先从 --help 里确认再传。"""
+        try:
+            out = subprocess.run([llama_bin, "--help"], capture_output=True, text=True, errors="replace", timeout=30)
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        return flag in (out.stdout + out.stderr)
+
     def _create(self, model_path: str, load_cfg: dict[str, Any]) -> "llama":
         self._unload_engine()
         source = self._resolve_gguf_file(model_path)
@@ -60,9 +70,10 @@ class llama(baseInference):
                 "--alias",
                 "default",
             ]
-            if slots > 1:
-                # 多槽位共享同一块 KV 池（统一 KV），否则 -c 会被均分给各槽位
+            if slots > 1:  # 多槽位共享同一块 KV 池（统一 KV）
                 cmd += ["-np", str(slots), "--kv-unified"]
+                if self._supports_flag(llama_bin, "--no-cache-idle-slots"):  # 使用静态隔离,缺点是上下文对半分
+                    cmd.append("--no-cache-idle-slots")
         else:
             raise FileNotFoundError("未找到 llama-server，请先在当前环境编译安装并加入 PATH")
 
@@ -70,7 +81,7 @@ class llama(baseInference):
         self._spawn(cmd)
 
         health_url = f"{self.base_url}/health"
-        if not self._wait_for_server_ready(health_url, timeout=90.0):
+        if not self._wait_for_server_ready(health_url):
             err_msg = self._startup_error()
             self._unload_engine()
             raise RuntimeError(f"llama-server 启动失败: {err_msg}")

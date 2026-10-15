@@ -5,6 +5,7 @@ import traceback
 import uuid
 from contextlib import asynccontextmanager
 from typing import Any, AsyncGenerator
+from urllib.parse import quote
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -49,13 +50,17 @@ def _to_chat_request(request: openChatReq) -> chatReq:
     )
 
 
-def _build_payload(result: dict[str, Any], model_id: str) -> dict[str, Any]:
+def _build_payload(result: dict[str, Any], model_id: str, think_output: str = "inline") -> dict[str, Any]:
+    """think_output: inline = <think>…</think> 拼进 content；field = 单独的 reasoning_content 字段；both = 两者都给。"""
     tool_calls = result.get("tool_calls") or []
     usage = result.get("usage", {})
     finish_reason = "tool_calls" if tool_calls else result.get("finish_reason", "stop")
-    message: dict[str, Any] = {"role": "assistant", "content": None if tool_calls else result.get("response", "")}
-    if result.get("reasoning"):
-        message["reasoning"] = result["reasoning"]
+    reasoning, content = result.get("reasoning") or "", result.get("response", "")
+    if reasoning and think_output in {"inline", "both"}:
+        content = f"<think>\n{reasoning}\n</think>\n\n{content}".rstrip()
+    message: dict[str, Any] = {"role": "assistant", "content": (content or None) if tool_calls else content}
+    if reasoning and think_output in {"field", "both"}:
+        message["reasoning_content"] = reasoning
     if tool_calls:
         message["tool_calls"] = tool_calls
 
@@ -123,7 +128,7 @@ class gateway:
         )
         if result.get("status") == "error":
             raise HTTPException(status_code=int(result.get("code", 500)), detail=result.get("response", "未知错误"))
-        payload = _build_payload(result, request.model)
+        payload = _build_payload(result, request.model, str(self._server_settings().get("think_output", "inline")))
 
         outbound_res = clientAdapter.outbound(
             openai_resp=payload,
@@ -132,9 +137,12 @@ class gateway:
             chunk_size=request.stream_delta_chunk_size
         )
 
+        # 调度告警走响应头：不进正文，不改变客户端回传的历史前缀（HTTP 头只能是 latin-1，中文告警用 URL 编码）
+        warnings = result.get("warnings") or []
+        headers = {"X-Gateway-Warning": quote("; ".join(warnings))} if warnings else None
         if request.stream:
-            return StreamingResponse(outbound_res, media_type="text/event-stream")
-        return outbound_res
+            return StreamingResponse(outbound_res, media_type="text/event-stream", headers=headers)
+        return JSONResponse(content=outbound_res, headers=headers) if headers else outbound_res
 
     def _create_app(self) -> FastAPI:
         app = FastAPI(title="AI Multi-Model Service", lifespan=self._lifespan)
