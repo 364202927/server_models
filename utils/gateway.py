@@ -14,7 +14,7 @@ from starlette.responses import JSONResponse, StreamingResponse
 from .clientAdapter import clientAdapter
 from .common import error, info
 from ..loader.models_mgr import models_mgr
-from ..msgHandler import AdminRequest, ChatRequest, msgHandler
+from ..msgHandler import adminReq, chatReq, msgHandler
 
 
 # 聊天结构
@@ -34,7 +34,7 @@ class openChatReq(BaseModel):
     tool_choice: Any = None
 
 
-def _to_chat_request(request: openChatReq) -> ChatRequest:
+def _to_chat_request(request: openChatReq) -> chatReq:
     raw_dict = request.model_dump(exclude_unset=True)
     model = raw_dict.pop("model", "")
     messages = raw_dict.pop("messages", [])
@@ -42,7 +42,7 @@ def _to_chat_request(request: openChatReq) -> ChatRequest:
     raw_dict.pop("stream", None)
     raw_dict.pop("stream_delta_chunk_size", None)
 
-    return ChatRequest(
+    return chatReq(
         model=model,
         messages=messages,
         deploy=raw_dict,
@@ -67,8 +67,8 @@ def _build_payload(result: dict[str, Any], model_id: str) -> dict[str, Any]:
     }
 
 
-class serverApi:  #todo改名字为 Gateway
-    """FastAPI 服务。"""
+class gateway:
+    """FastAPI 网关服务。"""
 
     def __init__(self, handler: msgHandler | None = None) -> None:
         self.handler = handler or msgHandler()
@@ -107,7 +107,7 @@ class serverApi:  #todo改名字为 Gateway
     # 聊天指令路由
     async def _chat(self, request: openChatReq, client_type: str = "openai", ua: str = "") -> Any:
         if request.message_id != 0:
-            admin_req = AdminRequest(
+            admin_req = adminReq(
                 message_id=request.message_id,
                 model=request.model,
                 args=request.args,
