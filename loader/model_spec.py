@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import gc
+import inspect
 import os
 import sys
 import threading
@@ -14,18 +15,6 @@ from typing import Any, Callable
 from ..utils.common import aContainB, info, require, vm2tokens
 from ..utils.hardware import query_gpu_used_mb
 from .llmFramework.baseInference import GenerationResult, baseInference
-
-
-# def clean_gpu_cache() -> None:
-#     """回收主进程内的残留显存（推理引擎在子进程里，这里只处理本进程的 torch 缓存）。"""
-#     gc.collect()
-#     try:
-#         import torch
-#         if torch.cuda.is_available():
-#             torch.cuda.empty_cache()
-#             torch.cuda.ipc_collect()
-#     except ImportError:
-#         pass
 
 
 @dataclass(eq=False)
@@ -45,17 +34,18 @@ class modelSpec:
 
     # ---- 运行状态
     loader: baseInference | None = field(default=None, repr=False)
-    state: str = "UNLOADED"          # UNLOADED / LOADING / RUNNING / SLEEPING_RAM
+    state: str = "UNLOADED"  # UNLOADED / LOADING / RUNNING / SLEEPING_RAM
     last_used_at: float = field(default_factory=time.time)
     active_requests: int = 0
     error: str | None = None
     sleep_location: str | None = None
     needs_remeasure: bool = False
+    cancellable: bool = False  # 当前 loader.generate 是否接受 cancel 事件（加载时探测）
 
     # ---- 由 modelsMgr 注入，spec 不依赖 mgr
-    settings: dict[str, Any] = field(default_factory=dict, repr=False)               # modelSetting.json 全量
+    settings: dict[str, Any] = field(default_factory=dict, repr=False)  # modelSetting.json 全量
     admit: Callable[[modelSpec], None] = field(default=lambda spec: None, repr=False)  # 腾显存，不足抛 MemoryError
-    persist: Callable[[], None] = field(default=lambda: None, repr=False)              # 写回 models.json
+    persist: Callable[[], None] = field(default=lambda: None, repr=False)  # 写回 models.json
     _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
 
     # ------------------------------------------------------------------ 状态查询
@@ -123,65 +113,78 @@ class modelSpec:
 
     def size_on_disk_mb(self) -> int | None:
         path = self.path_obj
-        try:
-            if path.is_file():
-                total = path.stat().st_size
-            elif path.is_dir():
-                total = sum(item.stat().st_size for item in path.glob("*") if item.is_file())
-            else:
-                return None
-        except OSError:
+        if path.is_file():
+            total = path.stat().st_size
+        elif path.is_dir():
+            total = sum(item.stat().st_size for item in path.glob("*") if item.is_file())
+        else:
             return None
-        return int(total / (1024 ** 2) * 1.25) if total > 0 else None
+        return int(total / (1024**2) * 1.25) if total > 0 else None
 
     # ------------------------------------------------------------------ 状态机
     def ensure(self, load_override: dict[str, Any] | None = None) -> modelSpec:
-        """保证可用：运行中直接返回；休眠则唤醒；未加载则冷启动。同一模型的并发调用在锁上串行。"""
+        """保证可用：运行中直接返回；休眠则唤醒；未加载则冷启动。同一模型的并发调用在锁上串行。
+        冷启动的失败在这里统一处理（清理残留子进程 -> 记录 error -> 转成 RuntimeError），内部步骤不再各写 try。"""
         with self._lock:
             if self.state == "RUNNING":
                 self.last_used_at = time.time()
                 return self
             if self.state == "SLEEPING_RAM" and self._wake():
                 return self
-            self._start(load_override or {})
+
+            self.state = "LOADING"
+            try:
+                self.admit(self)
+                engine = self.detect_engine()
+                if not engine:
+                    raise ValueError(f"未指定引擎: {self.model_id}")
+                self.loader = require(f"{__package__}.llmFramework.{engine}")()
+                self.cancellable = "cancel" in inspect.signature(self.loader.generate).parameters
+
+                full_load = self.full_load()
+                full_load.update({k: v for k, v in (load_override or {}).items() if k in full_load})
+                full_load["useVram"] = vm2tokens(
+                    engine,
+                    self.path,
+                    float(full_load["useVram"]),
+                    full_load["dtype"],
+                    int(full_load["tensor_parallel"]),
+                )
+
+                used_before = query_gpu_used_mb()
+                self.loader.load(self.path, full_load)
+                used_after = query_gpu_used_mb()
+            except Exception as exc:
+                self._drop()
+                self.error = str(exc)
+                raise RuntimeError(f"模型 {self.model_id} 加载失败: {exc}") from exc
+
+            # 加载已成功：显存估算与落盘属于附带动作，不再放进失败清理的范围，也只在估算值真的变了才写盘
+            measured = self.update_estimated_vram(used_before, used_after, force=self.needs_remeasure)
+            self.state, self.error, self.last_used_at, self.needs_remeasure = (
+                "RUNNING",
+                None,
+                time.time(),
+                False,
+            )
+            if measured:
+                self.persist()
             return self
 
     def _wake(self) -> bool:
-        """唤醒休眠的引擎；失败则物理卸载，交由调用方冷启动。"""
+        """唤醒休眠的引擎；失败则物理卸载并返回 False，交由 ensure 冷启动（这是真正的降级路径，所以保留 try）。"""
         try:
             self.admit(self)
             self.loader.wake()
         except (RuntimeError, MemoryError, OSError):
             self._drop()
             return False
-        self.state, self.sleep_location, self.last_used_at = "RUNNING", None, time.time()
+        self.state, self.sleep_location, self.last_used_at = (
+            "RUNNING",
+            None,
+            time.time(),
+        )
         return True
-
-    def _start(self, load_override: dict[str, Any]) -> None:
-        self.state = "LOADING"
-        try:
-            self.admit(self)
-            engine = self.detect_engine()
-            if not engine:
-                raise ValueError(f"未指定引擎: {self.model_id}")
-            self.loader = require(f"{__package__}.llmFramework.{engine}")()
-
-            full_load = self.full_load()
-            full_load.update({k: v for k, v in load_override.items() if k in full_load})
-            full_load["useVram"] = vm2tokens(
-                self.engine, self.path, float(full_load["useVram"]), full_load["dtype"], int(full_load["tensor_parallel"])
-            )
-
-            used_before = query_gpu_used_mb()
-            self.loader.load(self.path, full_load)
-            self.update_estimated_vram(used_before, query_gpu_used_mb(), force=self.needs_remeasure)
-            self.needs_remeasure = False
-            self.persist()
-        except Exception as exc:  # 清理后原样上抛，保证失败不残留子进程
-            self._drop()
-            self.error = str(exc)
-            raise RuntimeError(f"模型 {self.model_id} 加载失败: {exc}") from exc
-        self.state, self.error, self.last_used_at = "RUNNING", None, time.time()
 
     def _drop(self) -> None:
         """终止引擎子进程并回到未加载态（调用方已持锁）。"""
@@ -190,19 +193,17 @@ class modelSpec:
         if loader is not None:
             loader.unload()
         gc.collect()
-        # clean_gpu_cache()
 
     def sleep(self, blocking: bool = True) -> bool:
         """休眠到内存；引擎不支持休眠则直接卸载以交还显存。忙碌/未运行/拿不到锁返回 False。"""
         if not self._lock.acquire(blocking=blocking):
             return False
         try:
-            if self.active or self.loader is None or self.state != "RUNNING":
+            if self.active or self.state != "RUNNING":
                 return False
             if self.loader.sleep_to_ram():
                 self.state, self.sleep_location = "SLEEPING_RAM", "ram"
                 gc.collect()
-                # clean_gpu_cache()
             else:
                 self._drop()
             return True
@@ -217,18 +218,25 @@ class modelSpec:
             return True
 
     # ------------------------------------------------------------------ 生成
-    def generate(self, messages: list[dict[str, Any]], overrides: dict[str, Any] | None = None,
-                 prune_on_miss: bool = False) -> GenerationResult:
-        """ensure + 参数合并 + 引擎生成。ensure 与计数同锁，避免被并发的 sleep 抢在中间。"""
+    def generate(self, messages: list[dict[str, Any]], overrides: dict[str, Any] | None = None, prune_on_miss: bool = False, cancel: threading.Event | None = None) -> GenerationResult:
+        """ensure + 参数合并 + 引擎生成。ensure 与计数同锁，避免被并发的 sleep 抢在中间。
+        cancel 被置位（调用方超时/断连）：还没进引擎就直接放弃，不再为已离开的请求冷启动或占用引擎；
+        已在引擎里则交给支持 cancel 的 loader 中止（loader.generate 需接受 cancel 参数，否则只能等它自然结束）。"""
         overrides = overrides or {}
+        cancelled = cancel.is_set if cancel is not None else (lambda: False)
+        if cancelled():
+            raise RuntimeError(f"生成已取消: {self.model_id}")
         with self._lock:
             self.ensure()
             self.active_requests += 1
         try:
+            if cancelled():  # ensure 可能阻塞很久（等锁/冷启动），醒来时请求可能已经超时
+                raise RuntimeError(f"生成已取消: {self.model_id}")
             cfg = self.full_generation()
             cfg.update({k: v for k, v in overrides.items() if k in cfg and v is not None})
             cfg.update({k: overrides[k] for k in ("tools", "tool_choice", "id_slot") if k in overrides})
-            result = self.loader.generate(messages, cfg, prune_on_miss)
+            extra = {"cancel": cancel} if cancel is not None and self.cancellable else {}
+            result = self.loader.generate(messages, cfg, prune_on_miss, **extra)
             self.last_used_at = time.time()
             return result
         finally:

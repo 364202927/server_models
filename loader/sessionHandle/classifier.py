@@ -10,13 +10,13 @@ from typing import Any
 
 @dataclass
 class sessionCategory:
-    is_main: bool              # True: 主会话; False: 支路会话
-    importance_lv: int         # 1~4 级（主会话与 4 级必须由主力模型处理）
-    target_model_tier: str     # "heavy" (主力大模型) 或 "light" (轻量小模型)
-    reason: str                # 判定原因摘要
-    session_id: str = ""       # 会话短标识（首条消息指纹），用于日志与指纹清理
-    extended: bool = False     # True: 前缀延长命中已知会话; False: 新会话/历史被改写
-    model_id: str = ""         # 主会话绑定的模型（KV 在它身上）；空表示尚未绑定
+    is_main: bool  # True: 主会话; False: 支路会话
+    importance_lv: int  # 1~4 级（主会话与 4 级必须由主力模型处理）
+    target_model_tier: str  # "heavy" (主力大模型) 或 "light" (轻量小模型)
+    reason: str  # 判定原因摘要
+    session_id: str = ""  # 会话短标识（首条消息指纹），用于日志与指纹清理
+    extended: bool = False  # True: 前缀延长命中已知会话; False: 新会话/历史被改写
+    model_id: str = ""  # 主会话绑定的模型（KV 在它身上）；空表示尚未绑定
 
     @property
     def priority(self) -> int:
@@ -38,8 +38,7 @@ class classifier:
     """
 
     # 写/执行类工具（按分词匹配，如 NotebookEdit -> notebook,edit）
-    _WRITE_TOKENS = frozenset({"edit", "write", "patch", "bash", "shell", "exec", "execute",
-                               "terminal", "run", "cmd", "delete", "remove", "move", "apply"})
+    _WRITE_TOKENS = frozenset({"edit", "write", "patch", "bash", "shell", "exec", "execute", "terminal", "run", "cmd", "delete", "remove", "move", "apply"})
     # 只读类工具
     _READ_TOKENS = frozenset({"read", "grep", "glob", "search", "list", "ls", "view", "find", "fetch", "get", "cat", "tree"})
     # 不影响判级的规划类工具（名字里带 write 但不改文件）
@@ -50,14 +49,14 @@ class classifier:
     _HEAVY_INTENT = re.compile(r"(refactor|architect|implement|debug|root\s*cause|重构|编写|实现|排查原因)", re.IGNORECASE)
     _LIGHT_INTENT = re.compile(r"(summari[sz]e|extract|\btitle\b|find\s*symbol|总结|概括|标题|查找|提取)", re.IGNORECASE)
 
-    _TRACK_TTL = 7200.0        # 会话指纹存活秒数
-    _TRACK_MAX = 256           # 指纹条数上限，超出淘汰最久未见的
-    _ACTIVE_SEC = 120.0        # forget() 保留此窗口内仍活跃的会话
+    _TRACK_TTL = 7200.0  # 会话指纹存活秒数
+    _TRACK_MAX = 256  # 指纹条数上限，超出淘汰最久未见的
+    _ACTIVE_SEC = 120.0  # forget() 保留此窗口内仍活跃的会话
 
     def __init__(self) -> None:
         # 键: 该会话上次请求的整段历史链式指纹（下一轮请求的前缀）
         self._tracks: dict[str, _track] = {}
-        self._main_tools: set[str] = set()   # 已确认主会话的工具集指纹，用于 /clear 后重开识别
+        self._main_tools: set[str] = set()  # 已确认主会话的工具集指纹，用于 /clear 后重开识别
 
     # ------------------------------------------------------------------ 工具函数
     @staticmethod
@@ -78,18 +77,14 @@ class classifier:
         chain: list[str] = []
         acc = ""
         for msg in messages:
-            body = json.dumps([msg.get("role"), msg.get("content"), msg.get("tool_calls"), msg.get("tool_call_id")],
-                              ensure_ascii=False, sort_keys=True, default=str)
+            body = json.dumps([msg.get("role"), msg.get("content"), msg.get("tool_calls"), msg.get("tool_call_id")], ensure_ascii=False, sort_keys=True, default=str)
             acc = hashlib.md5((acc + body).encode("utf-8")).hexdigest()
             chain.append(acc)
         return chain
 
     @staticmethod
     def _tool_names(tools: list[dict[str, Any]] | None) -> set[str]:
-        names = (
-            (t.get("function") or {}).get("name") or t.get("name")
-            for t in (tools or []) if isinstance(t, dict)
-        )
+        names = ((t.get("function") or {}).get("name") or t.get("name") for t in (tools or []) if isinstance(t, dict))
         return {str(n) for n in names if n}
 
     # ------------------------------------------------------------------ 指纹追踪
@@ -109,7 +104,7 @@ class classifier:
         for fp in expired:
             del self._tracks[fp]
         overflow = len(self._tracks) - self._TRACK_MAX
-        for fp in sorted(self._tracks, key=lambda k: self._tracks[k].seen_at)[:max(0, overflow)]:
+        for fp in sorted(self._tracks, key=lambda k: self._tracks[k].seen_at)[: max(0, overflow)]:
             del self._tracks[fp]
 
     @staticmethod
@@ -128,20 +123,13 @@ class classifier:
     def forget(self, model_id: str, keep_sid: str) -> int:
         """某模型上的主会话未命中缓存时，清理绑定在该模型上的陈旧指纹（不碰其它模型的会话），返回清理条数。"""
         cutoff = time.time() - self._ACTIVE_SEC
-        stale = [fp for fp, t in self._tracks.items()
-                 if t.category.model_id == model_id and t.category.session_id != keep_sid and t.seen_at < cutoff]
+        stale = [fp for fp, t in self._tracks.items() if t.category.model_id == model_id and t.category.session_id != keep_sid and t.seen_at < cutoff]
         for fp in stale:
             del self._tracks[fp]
         return len(stale)
 
     # ------------------------------------------------------------------ 判定入口
-    def classify(
-        self,
-        messages: list[dict[str, Any]],
-        tools: list[dict[str, Any]] | None = None,
-        max_tokens: int | None = None,
-        model_hint: str = "",
-    ) -> sessionCategory:
+    def classify(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None, max_tokens: int | None = None, model_hint: str = "") -> sessionCategory:
         if not messages:
             return sessionCategory(False, 3, "light", "空消息")
         chain = self._chain(messages)
@@ -153,18 +141,11 @@ class classifier:
 
         first_user = next((i for i, m in enumerate(messages) if m.get("role") == "user"), 0)
         category = self._judge(messages, self._tool_names(tools), max_tokens, model_hint, chain[first_user][:6])
-        if category.is_main:   # 只有主会话保存指纹；支路每轮按工具与任务意图重判，结果是确定的
+        if category.is_main:  # 只有主会话保存指纹；支路每轮按工具与任务意图重判，结果是确定的
             self._remember(category, chain)
         return category
 
-    def _judge(
-        self,
-        messages: list[dict[str, Any]],
-        names: set[str],
-        max_tokens: int | None,
-        model_hint: str,
-        sid: str,
-    ) -> sessionCategory:
+    def _judge(self, messages: list[dict[str, Any]], names: set[str], max_tokens: int | None, model_hint: str, sid: str) -> sessionCategory:
         """新会话（无前缀血缘）的首次判定；后续轮次靠前缀延长继承，不再重判。"""
         msg_count = len(messages)
         lowered = {n.lower() for n in names}
@@ -191,7 +172,7 @@ class classifier:
         intent = self._text(first_user.get("content"))[:2000]
         heavy_intent = bool(self._HEAVY_INTENT.search(intent))
         light_intent = bool(self._LIGHT_INTENT.search(intent))
-        small_hint = "haiku" in model_hint.lower()   # 客户端自己把请求标成小模型（标题/话题判断等）
+        small_hint = "haiku" in model_hint.lower()  # 客户端自己把请求标成小模型（标题/话题判断等）
 
         if has_write or (heavy_intent and not pure_read):
             return sessionCategory(False, 4, "heavy", "支路任务带修改/执行权限或核心推理意图，分配给主力模型", sid)

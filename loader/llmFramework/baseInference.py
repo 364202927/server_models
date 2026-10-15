@@ -29,10 +29,10 @@ class GenerationResult:
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
     finish_reason: str = "stop"
     cached_tokens: int = -1
-    memo_restored: int = 0     # 本次从记忆库补回 reasoning 的 assistant 条数
-    memo_missed: int = 0       # 未能补回的条数（会导致渲染出的历史与 KV 分叉）
-    memo_pruned: int = 0       # 未命中缓存后清理掉的陈旧指纹条数
-    kv_remaining: int = 0      # 本轮结束后上下文还剩多少 token
+    memo_restored: int = 0  # 本次从记忆库补回 reasoning 的 assistant 条数
+    memo_missed: int = 0  # 未能补回的条数（会导致渲染出的历史与 KV 分叉）
+    memo_pruned: int = 0  # 未命中缓存后清理掉的陈旧指纹条数
+    kv_remaining: int = 0  # 本轮结束后上下文还剩多少 token
 
 
 @dataclass
@@ -100,8 +100,12 @@ class baseInference(ABC):
         管道无人读取时写满 64KB 子进程会阻塞，健康检查超时后再 read() 也会死等。"""
         self._stderr_tail.clear()
         proc = subprocess.Popen(
-            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-            text=True, errors="replace", preexec_fn=os.setsid,
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            errors="replace",
+            preexec_fn=os.setsid,
         )
         self._server_process = proc
         threading.Thread(target=lambda: self._stderr_tail.extend(proc.stderr), daemon=True).start()
@@ -199,16 +203,11 @@ class baseInference(ABC):
 
     def memory_usage(self) -> MemoryUsage:
         usage = MemoryUsage()
-        usage.process_rss_mb = round(psutil.Process(os.getpid()).memory_info().rss / (1024 ** 2), 1)
-        usage.system_available_mb = round(psutil.virtual_memory().available / (1024 ** 2), 1)
+        usage.process_rss_mb = round(psutil.Process(os.getpid()).memory_info().rss / (1024**2), 1)
+        usage.system_available_mb = round(psutil.virtual_memory().available / (1024**2), 1)
         return usage
 
-    def generate(
-        self,
-        messages: list[dict[str, Any]],
-        gen_cfg: dict[str, Any] | None = None,
-        prune_on_miss: bool = False,
-    ) -> GenerationResult:
+    def generate(self, messages: list[dict[str, Any]], gen_cfg: dict[str, Any] | None = None, prune_on_miss: bool = False) -> GenerationResult:
         """prune_on_miss=True 时，若本次未命中缓存，则只保留仍在本次历史里的 reasoning 记忆（旧会话的指纹不再累积）。"""
         if not self.is_loaded:
             raise RuntimeError("Model not loaded / Server not running. Call load() first.")
@@ -229,9 +228,7 @@ class baseInference(ABC):
         raw = self._response(messages=cleaned_messages, gen_cfg=cfg)
         elapsed = time.perf_counter() - start
 
-        final_text, final_calls, final_reason = chatDataFilter.postprocess_result(
-            raw.text, raw.calls, raw.finish_reason
-        )
+        final_text, final_calls, final_reason = chatDataFilter.postprocess_result(raw.text, raw.calls, raw.finish_reason)
 
         key = chatDataFilter.memo_key(
             cleaned_messages[-1] if cleaned_messages else None,

@@ -6,14 +6,14 @@ if __package__ in (None, ""):
     # 直接执行 ``python main.py`` 时把项目父目录加入导入路径。
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     from server_models.loader import models_mgr
-    from server_models.utils.serverApi import serverApi
+    from server_models.utils.gateway import gateway
     from server_models.utils.console import Console
     from server_models.utils.common import kApi, info, save_logs
     from server_models.utils.hardware import hardware_summary
     from server_models.msgHandler import msgHandler
 else:
     from .loader import models_mgr
-    from .utils.serverApi import serverApi
+    from .utils.gateway import gateway
     from .utils.console import Console
     from .utils.common import kApi, info, save_logs
     from .utils.hardware import hardware_summary
@@ -65,7 +65,7 @@ if __name__ == "__main__":
                     raise exc
     #
     handler = msgHandler()
-    server = serverApi(handler)
+    server = gateway(handler)
     console = Console(command_handler=lambda message_id, args: handler.handle(message_id, args, source="console"))
     app = server.app
     try:
