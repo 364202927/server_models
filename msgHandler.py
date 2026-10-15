@@ -28,7 +28,7 @@ class chatReq:
     model: str
     messages: list[dict[str, Any]]
     deploy: dict[str, Any] = field(default_factory=dict)
-    timeout: float | None = 180.0
+    timeout: float | None = 240.0
 
 
 @dataclass
@@ -47,7 +47,7 @@ class _taskItem:
     spec: modelSpec | None  # models.json 里的定义；None = 未登记（agent 别名或不存在）
     messages: list[dict[str, Any]] = field(default_factory=list)
     deploy: dict[str, Any] = field(default_factory=dict)
-    timeout: float | None = 180.0
+    timeout: float | None = 180.0  # 仅 chat 的「进入通道后」使用：排队 + 生成，不含模型加载/唤醒
     source: str = "unknown"
     client: str = "other"  # 消息来源归类：claude_code / codex / … / other
     task_id: str = field(default_factory=lambda: f"task_{uuid.uuid4().hex[:8]}")
@@ -67,7 +67,7 @@ class msgHandler:
     调用链（每层只做一件事）：
         handle()  控制台适配（只解析 data）
           └─ chat() / admin()   解析请求 -> _taskItem
-               └─ _run()        超时 + 唯一的异常边界
+               └─ _run()        唯一的异常边界
                     └─ _chat() / _model_ops[id]()   具体业务
     """
 
@@ -102,14 +102,7 @@ class msgHandler:
     async def chat(self, request: chatReq, *, source: str = "unknown", client: str = "other") -> dict[str, Any]:
         spec = models_mgr.getModel(request.model)
         # 来源归类不是已知 agent 时用 warn，方便核对 UA 关键词表
-        (warn if client == "other" else info)(
-            "[入口]",
-            f"model={request.model}",
-            f"来源={source}",
-            f"归类={client}",
-            f"models.json={'命中' if spec else '未命中'}",
-            self.pipeline.describe(),
-        )
+        (warn if client == "other" else info)("[入口]", f"model={request.model}", f"来源={source}", f"归类={client}", f"models.json={'命中' if spec else '未命中'}", self.pipeline.describe())
         return await self._run(
             _taskItem(
                 message_id=0,
@@ -129,13 +122,7 @@ class msgHandler:
         if mid in self._info_ops:
             return self._response(model, mid, "ok", self._info_ops[mid]())
 
-        task = _taskItem(
-            message_id=mid,
-            model=model,
-            spec=models_mgr.getModel(model),
-            source=source,
-            deploy=request.args if isinstance(request.args, dict) else {},
-        )
+        task = _taskItem(message_id=mid, model=model, spec=models_mgr.getModel(model), source=source, deploy=request.args if isinstance(request.args, dict) else {})
         if mid not in self._model_ops:
             return self._fail(task, 400, f"不支持的管理指令: {mid}")
         if task.spec is None:
@@ -143,6 +130,7 @@ class msgHandler:
         return await self._run(task, self._model_ops[mid])
 
     async def handle(self, message_id: int, data: Any = None, *, source: str = "console") -> dict[str, Any]:
+        """Console 入口适配：只负责把 data 解析成 admin()/chat() 的请求；失败由它们返回统一 error 响应。"""
         payload = data if isinstance(data, dict) else {}
         seq = data if isinstance(data, (list, tuple)) else []
         model = str(payload.get("model") or (seq[0] if seq else (data if isinstance(data, str) else "")))
@@ -161,14 +149,14 @@ class msgHandler:
 
     # ------------------------------------------------------------------ 执行壳
     async def _run(self, task: _taskItem, op: _opFn) -> dict[str, Any]:
-        """统一执行壳，也是唯一的异常边界。超时计入排队与加载时间 -> 504；模型加载/引擎失败 -> task.fail_code，
-        不回落，直接报给客户端。其余异常属于 bug，原样上抛，由框架打印堆栈。"""
-        wait_s = task.timeout if task.timeout and task.timeout > 0 else None
+        """统一执行壳，也是唯一的异常边界：生成超时 -> 504；模型加载/引擎失败 -> task.fail_code，
+        不回落，直接报给客户端。其余异常属于 bug，原样上抛，由框架打印堆栈。
+        这里不计时：计时只围住 _chat 里「进入 pipeline 之后」的那一段，模型加载/唤醒不受超时影响。"""
         info("任务开始执行", task.source, task.task_id, "model=", task.model)
         try:
-            return await asyncio.wait_for(op(task), wait_s)
+            return await op(task)
         except asyncio.TimeoutError:
-            return self._fail(task, 504, f"任务超时 ({task.timeout}s)")
+            return self._fail(task, 504, f"生成超时 ({task.timeout}s，从进入 pipeline 起算，不含模型加载)")
         except (RuntimeError, MemoryError, httpx.HTTPError) as exc:
             return self._fail(task, task.fail_code, f"{type(exc).__name__}: {exc}")
 
@@ -176,12 +164,7 @@ class msgHandler:
     async def _sleep_or_unload(self, task: _taskItem) -> dict[str, Any]:
         action = task.spec.sleep if task.message_id == adim_ID.eSleep.value else task.spec.unload
         ok = await asyncio.to_thread(action)
-        return self._response(
-            task.model,
-            task.message_id,
-            "ok" if ok else "error",
-            "操作成功" if ok else "操作失败",
-        )
+        return self._response(task.model, task.message_id, "ok" if ok else "error", "操作成功" if ok else "操作失败")
 
     async def _ensure_loaded(self, task: _taskItem) -> dict[str, Any]:
         await self.pipeline.ensure([task.spec], not self.pipeline.hasMain(), task.deploy)
@@ -189,6 +172,10 @@ class msgHandler:
 
     # ------------------------------------------------------------------ chat
     async def _chat(self, task: _taskItem) -> dict[str, Any]:
+        """① 校验模型 ② 分级 ③ 确保模型就绪（无超时） ④ 进入 pipeline 后开始计时：排队 + 生成 ⑤ 组装响应。
+
+        models.json 里没有的 id：非 agent 来源或没有主模型直接报错；agent 来源且已有主模型则当作客户端别名直接调度。
+        有的 id：已在池里就直接调度，否则先创建并登记（没有主模型或本次是主会话时登记为主池，否则登记为副池）。"""
         pipe, spec, args = self.pipeline, task.spec, dict(task.deploy)
 
         await pipe.settled()  # 模型正在加载/切换时先等它结束，再按最新的池状态判断
@@ -197,16 +184,19 @@ class msgHandler:
 
         category = pipe.classify(task.messages, args.get("tools"), args.get("max_tokens"), task.model)
 
-        if spec is not None and not (pipe.has(spec) and pipe.hasMain()):
+        # 模型不在池里 / 没有主模型 / 处于休眠：都在计时开始前加载或唤醒好，冷启动再久也不会撞上超时
+        if spec is not None and not (pipe.has(spec) and pipe.hasMain() and spec.isRunning):
             await pipe.ensure([spec], category.is_main or not pipe.hasMain(), args)
 
         self._log_request(task, args)
         task.fail_code = 502  # 模型已就绪，之后的失败属于引擎
-        result = await pipe.run(category, task.messages, args)
+        wait_s = task.timeout if task.timeout and task.timeout > 0 else None
+        result = await asyncio.wait_for(pipe.run(category, task.messages, args), wait_s)  # 从这里起才计时
 
         return self._response(task.model, 0, "ok", result.text) | {
             "tool_calls": result.tool_calls,
             "finish_reason": result.finish_reason,
+            "reasoning": result.reasoning,
             "usage": {
                 "prompt_tokens": result.prompt_tokens,
                 "completion_tokens": result.tokens_generated,
@@ -220,32 +210,9 @@ class msgHandler:
     @staticmethod
     def _log_request(task: _taskItem, args: dict[str, Any]) -> None:
         """缓存命中排查用的请求指纹日志；排查完可整体删除。"""
-        first = task.messages[0] if task.messages else {}
         tools = args.get("tools") or []
-        info(
-            "[DBG] 送入引擎",
-            task.model,
-            f"共{len(task.messages)}条",
-            "system[:120]=",
-            repr(first)[:120],
-            "hash(首条)=",
-            _digest(first),
-            "hash(去掉末条)=",
-            _digest(task.messages[:-1]),
-        )
-        info(
-            "[DBG] 请求参数",
-            task.model,
-            f"tools数={len(tools)}",
-            "tools_hash=",
-            _digest(tools),
-            "角色序列=",
-            [m.get("role") for m in task.messages],
-            "tool_choice=",
-            args.get("tool_choice"),
-            "max_tokens=",
-            args.get("max_tokens"),
-        )
+        info("[DBG] 请求", task.model, f"{len(task.messages)}条", [m.get("role") for m in task.messages], f"tools={len(tools)}#{_digest(tools)}",
+             "首条#", _digest(task.messages[0] if task.messages else {}), "去末条#", _digest(task.messages[:-1]), "字段=", sorted(args))
 
     # ------------------------------------------------------------------ 响应
     @staticmethod
@@ -260,12 +227,5 @@ class msgHandler:
         }
 
     def _fail(self, task: _taskItem, code: int, reason: str) -> dict[str, Any]:
-        error(
-            "[请求失败]",
-            task.source,
-            task.task_id,
-            f"model={task.model}",
-            f"code={code}",
-            reason,
-        )
+        error("[请求失败]", task.source, task.task_id, f"model={task.model}", f"code={code}", reason)
         return self._response(task.model, task.message_id, "error", reason) | {"code": code}

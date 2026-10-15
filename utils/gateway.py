@@ -54,6 +54,8 @@ def _build_payload(result: dict[str, Any], model_id: str) -> dict[str, Any]:
     usage = result.get("usage", {})
     finish_reason = "tool_calls" if tool_calls else result.get("finish_reason", "stop")
     message: dict[str, Any] = {"role": "assistant", "content": None if tool_calls else result.get("response", "")}
+    if result.get("reasoning"):
+        message["reasoning"] = result["reasoning"]
     if tool_calls:
         message["tool_calls"] = tool_calls
 
@@ -113,8 +115,6 @@ class gateway:
                 args=request.args,
             )
             return await self.handler.admin(admin_req, source=client_type)
-        info("[DBG] 入站请求", f"client={client_type}", f" stream={request.stream}", f" 消息数={len(request.messages)}",
-             f"tools数={len(request.tools or [])}", "额外字段=", sorted((request.model_extra or {}).keys()))
         if not request.model or not request.messages:
             raise HTTPException(status_code=400, detail="model 和 messages 不能为空")
 
@@ -147,9 +147,8 @@ class gateway:
         )
 
         @app.get("/v1/models")
-        async def models(raw_req: Request, _: bool = Depends(self._require_api_key)) -> dict[str, Any]:
+        async def models(_: bool = Depends(self._require_api_key)) -> dict[str, Any]:
             now = int(time.time())
-            info("[DBG] 模型列表请求", f"ua={raw_req.headers.get('user-agent', '')[:30]}", "返回=", list(models_mgr.specs))
             return {
                 "object": "list",
                 "data": [
@@ -177,14 +176,8 @@ class gateway:
                 body = await raw_req.json()
             except Exception:
                 raise HTTPException(status_code=400, detail="无效的 JSON 请求体")
-            info("[DBG] Claude原始system[:120]", repr(body.get("system"))[:120])
-            info("[DBG] Claude入站", f"model={body.get('model')}", f"stream={body.get('stream')}",
-                 f"原始角色序列={[m.get('role') for m in body.get('messages', [])]}", f"tools数={len(body.get('tools') or [])}",
-                 f"字段={sorted(body)}", f"thinking={body.get('thinking')}", f"output_config={body.get('output_config')}")
-            openai_body = clientAdapter.inbound_to_openai(body, client_type="claude")
-            info("[DBG] Claude转换后system[:120]", repr(openai_body["messages"][0])[:120])
-            info("[DBG] Claude转换后角色序列", [m.get("role") for m in openai_body["messages"]])
-            request = openChatReq(**openai_body)
+            info("[DBG] Claude入站", f"stream={body.get('stream')}", f"字段={sorted(body)}", f"thinking={body.get('thinking')}", f"output_config={body.get('output_config')}")
+            request = openChatReq(**clientAdapter.inbound_to_openai(body, client_type="claude"))
             return await self._chat(request, client_type="claude", ua=raw_req.headers.get("user-agent", ""))
 
         return app

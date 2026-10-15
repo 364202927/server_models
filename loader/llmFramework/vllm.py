@@ -11,7 +11,7 @@ from .baseInference import RawOutput, baseInference
 class vllm(baseInference):
     """vLLM Server 推理转发引擎"""
 
-    def load(self, model_path: str, load_cfg: dict[str, Any]) -> "vllm":
+    def _create(self, model_path: str, load_cfg: dict[str, Any]) -> "vllm":
         self._unload_engine()
         self._port = self._find_free_port()
 
@@ -20,14 +20,23 @@ class vllm(baseInference):
         gpu_mem = load_cfg.get("gpu_memory_utilization", 0.9)
 
         cmd = [
-            "python3", "-m", "vllm.entrypoints.openai.api_server",
-            "--model", model_path,
-            "--host", self._host,
-            "--port", str(self._port),
-            "--tensor-parallel-size", str(tp_size),
-            "--dtype", str(dtype),
-            "--gpu-memory-utilization", str(gpu_mem),
-            "--served-model-name", "default",
+            "python3",
+            "-m",
+            "vllm.entrypoints.openai.api_server",
+            "--model",
+            model_path,
+            "--host",
+            self._host,
+            "--port",
+            str(self._port),
+            "--tensor-parallel-size",
+            str(tp_size),
+            "--dtype",
+            str(dtype),
+            "--gpu-memory-utilization",
+            str(gpu_mem),
+            "--served-model-name",
+            "default",
             "--trust-remote-code",
         ]
 

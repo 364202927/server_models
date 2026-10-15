@@ -11,7 +11,7 @@ from .baseInference import RawOutput, baseInference
 class sglang(baseInference):
     """SGLang Server 推理转发引擎"""
 
-    def load(self, model_path: str, load_cfg: dict[str, Any]) -> "sglang":
+    def _create(self, model_path: str, load_cfg: dict[str, Any]) -> "sglang":
         self._unload_engine()
         self._port = self._find_free_port()
 
@@ -19,15 +19,7 @@ class sglang(baseInference):
         dtype = load_cfg.get("dtype", "bfloat16")
         mem_fraction = load_cfg.get("gpu_memory_utilization", 0.9)
 
-        cmd = [
-            "python3", "-m", "sglang.launch_server",
-            "--model-path", model_path,
-            "--host", self._host,
-            "--port", str(self._port),
-            "--tp-size", str(tp_size),
-            "--dtype", str(dtype),
-            "--mem-fraction-static", str(mem_fraction),
-        ]
+        cmd = ["python3", "-m", "sglang.launch_server", "--model-path", model_path, "--host", self._host, "--port", str(self._port), "--tp-size", str(tp_size), "--dtype", str(dtype), "--mem-fraction-static", str(mem_fraction)]
 
         context_val = load_cfg.get("useVram", 0)
         if context_val and context_val > 0:

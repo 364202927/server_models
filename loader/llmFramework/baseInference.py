@@ -12,8 +12,7 @@ from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 from typing import Any
 
-import httpx
-import psutil
+import httpx, psutil
 
 from ...utils.common import cache_verdict, info as log_info, error as log_error
 from ..chatDataFilter import chatDataFilter
@@ -29,6 +28,7 @@ class GenerationResult:
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
     finish_reason: str = "stop"
     cached_tokens: int = -1
+    reasoning: str = ""  # 本次生成剥离出的思考正文（引擎 reasoning_content 或 <think> 段）
     memo_restored: int = 0  # 本次从记忆库补回 reasoning 的 assistant 条数
     memo_missed: int = 0  # 未能补回的条数（会导致渲染出的历史与 KV 分叉）
     memo_pruned: int = 0  # 未命中缓存后清理掉的陈旧指纹条数
@@ -43,6 +43,7 @@ class RawOutput:
     calls: list[dict[str, Any]] = field(default_factory=list)
     finish_reason: str = "stop"
     cached_tokens: int = -1
+    reasoning: str = ""  # 引擎单独给出的思考正文（reasoning_content），为空说明 think 内联在 text 里
 
 
 @dataclass
@@ -130,8 +131,13 @@ class baseInference(ABC):
         return False
 
     @abstractmethod
-    def load(self, model_path: str, load_cfg: dict[str, Any]) -> "baseInference":
+    def _create(self, model_path: str, load_cfg: dict[str, Any]) -> "baseInference":
         pass
+
+    def load(self, model_path: str, load_cfg: dict[str, Any]) -> "baseInference":
+        self._create(model_path, load_cfg)
+        log_info("加载完成:", model_path)
+        return self
 
     def _unload_engine(self) -> None:
         if self._http_client:
@@ -221,6 +227,7 @@ class baseInference(ABC):
             system_instruction=system_instruction,
         )
 
+        # 临时注释：先确认引擎能否正确缓存，再做清理逻辑
         live_keys = chatDataFilter.assistant_keys(cleaned_messages)
         cleaned_messages, restored, missed = chatDataFilter.restore_raw_assistant(cleaned_messages, self._raw_memo)
 
@@ -229,6 +236,7 @@ class baseInference(ABC):
         elapsed = time.perf_counter() - start
 
         final_text, final_calls, final_reason = chatDataFilter.postprocess_result(raw.text, raw.calls, raw.finish_reason)
+        final_reasoning = (raw.reasoning or chatDataFilter.split_raw(raw.text)["reasoning"]).strip()
 
         key = chatDataFilter.memo_key(
             cleaned_messages[-1] if cleaned_messages else None,
@@ -240,11 +248,12 @@ class baseInference(ABC):
             self._raw_memo.popitem(last=False)
 
         pruned = 0
-        if prune_on_miss and cache_verdict(raw.cached_tokens, raw.prompt_tokens)[0] == "未命中":
-            stale = [k for k in list(self._raw_memo) if k not in live_keys and k != key]
-            for k in stale:
-                self._raw_memo.pop(k, None)
-            pruned = len(stale)
+        # 临时注释：先确认引擎能否正确缓存，再做清理逻辑
+        # if prune_on_miss and cache_verdict(raw.cached_tokens, raw.prompt_tokens)[0] == "未命中":
+        #     stale = [k for k in list(self._raw_memo) if k not in live_keys and k != key]
+        #     for k in stale:
+        #         self._raw_memo.pop(k, None)
+        #     pruned = len(stale)
 
         return GenerationResult(
             text=final_text,
@@ -254,6 +263,7 @@ class baseInference(ABC):
             prompt_tokens=raw.prompt_tokens,
             tool_calls=final_calls,
             finish_reason=final_reason,
+            reasoning=final_reasoning,
             cached_tokens=raw.cached_tokens,
             memo_restored=restored,
             memo_missed=missed,

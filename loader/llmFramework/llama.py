@@ -31,7 +31,7 @@ class llama(baseInference):
             raise ValueError(f"不是有效的 GGUF 文件: {model_path}")
         return source
 
-    def load(self, model_path: str, load_cfg: dict[str, Any]) -> "llama":
+    def _create(self, model_path: str, load_cfg: dict[str, Any]) -> "llama":
         self._unload_engine()
         source = self._resolve_gguf_file(model_path)
         self._model_path = str(source)
@@ -45,13 +45,20 @@ class llama(baseInference):
         if llama_bin:
             cmd = [
                 llama_bin,
-                "-m", str(source),
-                "-c", str(calculated_n_ctx),
-                "-ngl", str(gpu_layers),
-                "-b", str(batch_size),
-                "--host", self._host,
-                "--port", str(self._port),
-                "--alias", "default",
+                "-m",
+                str(source),
+                "-c",
+                str(calculated_n_ctx),
+                "-ngl",
+                str(gpu_layers),
+                "-b",
+                str(batch_size),
+                "--host",
+                self._host,
+                "--port",
+                str(self._port),
+                "--alias",
+                "default",
             ]
             if slots > 1:
                 # 多槽位共享同一块 KV 池（统一 KV），否则 -c 会被均分给各槽位
@@ -69,6 +76,11 @@ class llama(baseInference):
             raise RuntimeError(f"llama-server 启动失败: {err_msg}")
 
         self._http_client = httpx.Client(base_url=self.base_url, timeout=120.0)
+        try:  # 新版 llama-server 未传 -np 时槽位数由引擎自定，打印实际值以核对 id_slot / 缓存隔离假设
+            total_slots = self._http_client.get("/props").json().get("total_slots")
+        except httpx.HTTPError:
+            total_slots = None
+        info("[llama-server] 实际槽位数", total_slots, f"(配置 parallel_slots={slots})")
         self._effective_load = {
             "engine": "llama",
             "context_length": calculated_n_ctx,
@@ -96,7 +108,7 @@ class llama(baseInference):
             "cache_prompt": True,
         }
         if cfg.get("id_slot") is not None:
-            payload["id_slot"] = int(cfg["id_slot"])   # 固定槽位：主会话 KV 不被支路请求挤掉
+            payload["id_slot"] = int(cfg["id_slot"])  # 固定槽位：主会话 KV 不被支路请求挤掉
         if "temperature" in cfg:
             payload["temperature"] = cfg["temperature"]
         if "top_p" in cfg:
@@ -115,6 +127,7 @@ class llama(baseInference):
         usage = data.get("usage", {})
 
         calls = message.get("tool_calls") or []
+        reasoning = str(message.get("reasoning_content") or "")
         prompt_tokens = usage.get("prompt_tokens", 0)
         completion_tokens = usage.get("completion_tokens", 0)
         # 新版 usage 带 cached_tokens；旧版只在 timings.cache_n 里给出复用的 token 数
@@ -129,4 +142,5 @@ class llama(baseInference):
             calls=calls,
             finish_reason=str(choice.get("finish_reason") or "stop"),
             cached_tokens=cached_tokens,
+            reasoning=reasoning,
         )

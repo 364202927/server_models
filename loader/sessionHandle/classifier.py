@@ -7,6 +7,8 @@ import time
 from dataclasses import dataclass, replace
 from typing import Any
 
+from ...utils.common import info
+
 
 @dataclass
 class sessionCategory:
@@ -57,6 +59,7 @@ class classifier:
         # 键: 该会话上次请求的整段历史链式指纹（下一轮请求的前缀）
         self._tracks: dict[str, _track] = {}
         self._main_tools: set[str] = set()  # 已确认主会话的工具集指纹，用于 /clear 后重开识别
+        self._seen_tools: set[str] = set()  # 已打印过的工具集指纹（每个工具集只打印一次）
 
     # ------------------------------------------------------------------ 工具函数
     @staticmethod
@@ -150,6 +153,9 @@ class classifier:
         msg_count = len(messages)
         lowered = {n.lower() for n in names}
         tool_fp = hashlib.md5(",".join(sorted(lowered)).encode()).hexdigest()[:8] if names else ""
+        if tool_fp and tool_fp not in self._seen_tools:  # 新工具集打印一次，用于核对派生子代理/写类词表
+            self._seen_tools.add(tool_fp)
+            info("[分级] 新工具集", tool_fp, f"共{len(names)}个:", ",".join(sorted(names)))
 
         # 1. 主会话：能派生子代理 / 工具集与已知主会话一致
         main_reason = ""
@@ -175,7 +181,8 @@ class classifier:
         small_hint = "haiku" in model_hint.lower()  # 客户端自己把请求标成小模型（标题/话题判断等）
 
         if has_write or (heavy_intent and not pure_read):
-            return sessionCategory(False, 4, "heavy", "支路任务带修改/执行权限或核心推理意图，分配给主力模型", sid)
+            why = f"写/执行类工具 {sorted(n for n, t in toks.items() if t & self._WRITE_TOKENS)[:5]}" if has_write else "首条任务含核心推理意图"
+            return sessionCategory(False, 4, "heavy", f"支路任务带{why}，分配给主力模型", sid)
         if (max_tokens and max_tokens <= 64) or (not real and msg_count <= 3 and (light_intent or small_hint)):
             return sessionCategory(False, 1, "light", "极短生成或无工具的标题/摘要类元任务", sid)
         if pure_read:

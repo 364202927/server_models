@@ -333,10 +333,11 @@ class pipeline:
     def _log_result(self, category: sessionCategory, grant: lease, messages: list[dict[str, Any]], overrides: dict[str, Any], result: GenerationResult) -> None:
         """每次请求完成后打印生成指标与缓存结果；未命中/部分命中用 warn 突出，并给出可能原因。"""
         model = grant.lane.spec.model_id
-        info(f"[生成] {model} 速率: {result.tokens_per_second:.2f} token/s, 生成: {result.tokens_generated} tokens, " f"耗时: {result.time_seconds:.2f}s, 剩余 KV Cache: {result.kv_remaining} tokens")
+        info(f"[生成] {model} 速率: {result.tokens_per_second:.2f} token/s, 生成: {result.tokens_generated} tokens(思考 {len(result.reasoning)} 字, 工具调用 {len(result.tool_calls)} 个), " f"耗时: {result.time_seconds:.2f}s, 剩余 KV Cache: {result.kv_remaining} tokens")
 
         verdict, ratio = cache_verdict(result.cached_tokens, result.prompt_tokens)
-        dropped = self._classifier.forget(model, category.session_id) if category.is_main and verdict == "未命中" else 0
+        dropped = 0  # 临时注释：先确认引擎能否正确缓存，再做清理逻辑
+        # dropped = self._classifier.forget(model, category.session_id) if category.is_main and verdict == "未命中" else 0
         restored_all = result.memo_restored + result.memo_missed
         parts = [
             f"[缓存] {verdict} {ratio:.1%}",
