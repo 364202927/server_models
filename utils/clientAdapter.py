@@ -188,13 +188,14 @@ class clientAdapter:
         client_type: str = "openai",
         stream: bool = False,
         chunk_size: int | None = None,
+        include_usage: bool = False,
     ) -> Any:
         """统一出站格式转换。非流式/流式均以 OpenAI 协议为基础中间层。"""
         is_claude = client_type == "claude"
         if not stream:
             return cls._claude_response(openai_resp) if is_claude else openai_resp
 
-        chunks = cls._iter_openai_chunks(openai_resp, chunk_size)
+        chunks = cls._iter_openai_chunks(openai_resp, chunk_size, include_usage=include_usage)
         if is_claude:
             return cls._claude_stream(openai_resp, chunks)
 
@@ -210,6 +211,7 @@ class clientAdapter:
     async def _iter_openai_chunks(
         openai_resp: dict[str, Any],
         chunk_size: int | None = None,
+        include_usage: bool = False,
     ) -> AsyncGenerator[dict[str, Any], None]:
         """将完整响应标准化切分为 OpenAI chat.completion.chunk 字典流。"""
         content, tool_calls, finish_reason = _parse_response(openai_resp)
@@ -249,6 +251,12 @@ class clientAdapter:
 
         # 3. 终结块
         yield chunk({}, finish_reason)
+
+        # 4. 用量块：OpenAI 约定 choices 为空、usage 单独一帧。
+        # 仅当客户端传 stream_options.include_usage=true（DSH/pi-ai）时发送，避免打断按 choices[0] 取增量的旧客户端。
+        usage = openai_resp.get("usage")
+        if include_usage and usage:
+            yield {**base, "choices": [], "usage": usage}
 
     # ----------------------------------------------------- Claude 协议（出站）
     @staticmethod

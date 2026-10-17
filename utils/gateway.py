@@ -30,6 +30,7 @@ class openChatReq(BaseModel):
     # 输出与控制
     stream: bool = False
     stream_delta_chunk_size: int | None = None
+    stream_options: dict[str, Any] | None = None
     tools: list[dict[str, Any]] | None = None
     tool_choice: Any = None
 
@@ -41,6 +42,7 @@ def _2chatReq(request: openChatReq) -> chatReq:
     raw_dict.pop("message_id", None)
     raw_dict.pop("stream", None)
     raw_dict.pop("stream_delta_chunk_size", None)
+    raw_dict.pop("stream_options", None)
 
     return chatReq(
         model=model,
@@ -102,7 +104,14 @@ class gateway:
         if result.get("status") == "error":
             raise HTTPException(status_code=int(result.get("code", 500)), detail=result.get("response", "未知错误"))
         warnings = result.pop("warnings", None) or []
-        outbound_res = clientAdapter.outbound(openai_resp=result, client_type=client_type, stream=request.stream, chunk_size=request.stream_delta_chunk_size)
+        include_usage = bool((request.stream_options or {}).get("include_usage"))
+        outbound_res = clientAdapter.outbound(
+            openai_resp=result,
+            client_type=client_type,
+            stream=request.stream,
+            chunk_size=request.stream_delta_chunk_size,
+            include_usage=include_usage,
+        )
         # 调度告警走响应头：不进正文，不改变客户端回传的历史前缀（HTTP 头只能是 latin-1，中文告警用 URL 编码）
         headers = {"X-Gateway-Warning": quote("; ".join(warnings))} if warnings else None
         if request.stream:

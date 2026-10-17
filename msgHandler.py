@@ -11,6 +11,7 @@ from typing import Any, Awaitable, Callable
 import httpx
 
 from . import adim_ID
+from .loader.llmFramework.baseInference import GenerationResult
 from .loader.model_spec import modelSpec
 from .loader.models_mgr import models_mgr
 from .loader.sessionHandle import pipeline
@@ -104,25 +105,23 @@ class msgHandler:
         spec = models_mgr.getModel(request.model)
         # 来源归类不是已知 agent 时用 warn，方便核对 UA 关键词表
         (warn if client == "other" else info)("[入口]", f"model={request.model}", f"来源={source}", f"归类={client}", f"models.json={'命中' if spec else '未命中'}", self.pipeline.describe())
-        return await self._run(
-            _taskItem(
-                message_id=0,
-                model=request.model,
-                spec=spec,
-                messages=request.messages,
-                deploy=request.deploy,
-                timeout=request.timeout,
-                source=source,
-                client=client,
-            ),
-            self._process,
-        )
+        return await self._run(_taskItem(
+                                    message_id=0,
+                                    model=request.model,
+                                    spec=spec,
+                                    messages=request.messages,
+                                    deploy=request.deploy,
+                                    timeout=request.timeout,
+                                    source=source,
+                                    client=client,
+                                ),
+                                self._process,
+                            )
 
     async def admin(self, request: adminReq, *, source: str = "unknown") -> dict[str, Any]:
         mid, model = request.message_id, request.model
         if mid in self._info_ops:
             return self._response(model, mid, "ok", self._info_ops[mid]())
-
         task = _taskItem(message_id=mid, model=model, spec=models_mgr.getModel(model), source=source, deploy=request.args if isinstance(request.args, dict) else {})
         if mid not in self._model_ops:
             return self._fail(task, 400, f"不支持的管理指令: {mid}")
@@ -131,7 +130,6 @@ class msgHandler:
         return await self._run(task, self._model_ops[mid])
 
     async def handle(self, message_id: int, data: Any = None, *, source: str = "console") -> dict[str, Any]:
-        """Console 入口适配：只负责把 data 解析成 admin()/chat() 的请求；失败由它们返回统一 error 响应。"""
         payload = data if isinstance(data, dict) else {}
         seq = data if isinstance(data, (list, tuple)) else []
         model = str(payload.get("model") or (seq[0] if seq else (data if isinstance(data, str) else "")))
@@ -171,7 +169,7 @@ class msgHandler:
         await self.pipeline.ensure([task.spec], not self.pipeline.hasMain(), task.deploy)
         return self._response(task.model, task.message_id, "ok", "操作成功")
 
-    # ------------------------------------------------------------------ chat
+    # ------------------------------------------------------------------ chat处理
     async def _process(self, task: _taskItem) -> dict[str, Any]:
         """① 校验模型 ② 分级 ③ 确保模型就绪（无超时） ④ 进入 pipeline 后开始计时：排队 + 生成 ⑤ 组装响应。
 
@@ -210,15 +208,7 @@ class msgHandler:
             "model": task.model,
             "choices": [{"index": 0, "message": message, "finish_reason": "tool_calls" if tool_calls else result.finish_reason}],
             "warnings": result.warnings,
-            "usage": {
-                "prompt_tokens": result.prompt_tokens,
-                "completion_tokens": result.tokens_generated,
-                "total_tokens": result.prompt_tokens + result.tokens_generated,
-                "cached_tokens": result.cached_tokens,
-                "time_seconds": result.time_seconds,
-                "tokens_per_second": round(result.tokens_per_second, 2),
-                "kv_cache_remaining": result.kv_remaining,
-            },
+            "usage": self._usage(result),
         }
 
     @staticmethod
@@ -228,6 +218,24 @@ class msgHandler:
         info("[DBG] 请求", task.model, f"{len(task.messages)}条", [m.get("role") for m in task.messages], f"tools={len(tools)}#{_digest(tools)}", "首条#", _digest(task.messages[0] if task.messages else {}), "去末条#", _digest(task.messages[:-1]), "字段=", sorted(args))
 
     # ------------------------------------------------------------------ 响应
+    @staticmethod
+    def _usage(result: GenerationResult) -> dict[str, Any]:
+        prompt = max(0, int(result.prompt_tokens or 0))
+        output = max(0, int(result.tokens_generated or 0))
+        cached = min(max(int(result.cached_tokens or 0), 0), prompt)
+        return {
+            "prompt_tokens": prompt,
+            "completion_tokens": output,
+            "total_tokens": prompt + output,
+            "cached_tokens": cached,
+            "uncached_input_tokens": prompt - cached,
+            # pi-ai / DSH 优先读标准嵌套字段；顶层 cached_tokens 兼容旧客户端
+            "prompt_tokens_details": {"cached_tokens": cached},
+            "time_seconds": round(result.time_seconds, 3),
+            "tokens_per_second": round(result.tokens_per_second, 2),
+            "kv_cache_remaining": result.kv_remaining,
+        }
+
     @staticmethod
     def _response(model: str, message_id: int, status: str, value: Any) -> dict[str, Any]:
         payload = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
