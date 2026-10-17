@@ -1,11 +1,11 @@
 {
   "_comment": "这是一个model模版文件,team是同时加载一组模型,useVram默认kvcache占用4g显存,max_tokens上下文2g,",
   "template": {
-    "team": { "mian": [], "sub": [] },
+    "team": { "mian": [ ], "sub": [ ] },
     "load": {
       "mtp": false,
       "lora": "",
-      "draft": [],
+      "draft": [ ],
       "useVram": 4096,
       "batch_size": 512,
       "parallel_slots": 1,
@@ -19,7 +19,7 @@
       "top_k": 50,
       "repetition_penalty": 1.05,
       "max_tokens": 2048,
-      "stop": [],
+      "stop": [ ],
       "system_prompt": ""
     }
   },
@@ -54,5 +54,23 @@
       "presence_penalty": 0.0,
       "frequency_penalty": 0.0
     }
+  },
+  "ninfer": {
+    "load": {
+      "kv_dtype": "fp8",
+      "kv_capacity": 240000,
+      "draft_tokens": 3,
+      "lm_head_draft": true,
+      "host_state_slots": 8,
+      "host_kv_mib": 8192,
+      "preserve_thinking": true,
+      "vision": false
+    },
+    "generation": {
+      "min_p": 0.05,
+      "presence_penalty": 0.0,
+      "frequency_penalty": 0.0
+    }
   }
+
 }
