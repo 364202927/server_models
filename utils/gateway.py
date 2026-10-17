@@ -123,19 +123,12 @@ class gateway:
         if not request.model or not request.messages:
             raise HTTPException(status_code=400, detail="model 和 messages 不能为空")
 
-        result = await self.handler.chat(
-            _to_chat_request(request), source=f"{client_type}/{ua[:60]}", client=clientAdapter.detectClient(ua)
-        )
+        result = await self.handler.chat(_to_chat_request(request), source=f"{client_type}/{ua[:60]}", client=clientAdapter.detectClient(ua))
         if result.get("status") == "error":
             raise HTTPException(status_code=int(result.get("code", 500)), detail=result.get("response", "未知错误"))
-        payload = _build_payload(result, request.model, str(self._server_settings().get("think_output", "inline")))
+        payload = _build_payload(result, request.model, str(self._server_settings().get("think_output", "field")))
 
-        outbound_res = clientAdapter.outbound(
-            openai_resp=payload,
-            client_type=client_type,
-            stream=request.stream,
-            chunk_size=request.stream_delta_chunk_size
-        )
+        outbound_res = clientAdapter.outbound(openai_resp=payload, client_type=client_type, stream=request.stream, chunk_size=request.stream_delta_chunk_size)
 
         # 调度告警走响应头：不进正文，不改变客户端回传的历史前缀（HTTP 头只能是 latin-1，中文告警用 URL 编码）
         warnings = result.get("warnings") or []
@@ -159,16 +152,12 @@ class gateway:
             now = int(time.time())
             return {
                 "object": "list",
-                "data": [
-                    {"id": m, "object": "model", "created": now, "owned_by": "local"}
-                    for m in models_mgr.specs
-                ],
+                "data": [{"id": m, "object": "model", "created": now, "owned_by": "local"} for m in models_mgr.specs],
             }
 
         @app.exception_handler(Exception)
         async def unhandled_error(raw_req: Request, exc: Exception) -> JSONResponse:
-            error("[请求异常]", raw_req.method, raw_req.url.path, f"{type(exc).__name__}: {exc}",
-                  "\n" + "".join(traceback.format_exception(exc)))
+            error("[请求异常]", raw_req.method, raw_req.url.path, f"{type(exc).__name__}: {exc}", "\n" + "".join(traceback.format_exception(exc)))
             body = {"type": "error", "error": {"type": "api_error", "message": f"{type(exc).__name__}: {exc}"}}
             return JSONResponse(status_code=500, content=body)
 
@@ -192,6 +181,7 @@ class gateway:
 
     async def run(self) -> None:
         import uvicorn
+
         settings = self._server_settings()
         config = uvicorn.Config(
             self.app,
