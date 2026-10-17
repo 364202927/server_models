@@ -51,6 +51,7 @@ class llama(baseInference):
         gpu_layers = int(load_cfg.get("gpu_offload_layers", -1))
         batch_size = int(load_cfg.get("batch_size", 512))
         slots = max(1, int(load_cfg.get("parallel_slots", 1)))
+        slot_ctx = calculated_n_ctx if slots == 1 else calculated_n_ctx // slots // 256 * 256  # 单槽配额
         llama_bin = shutil.which("llama-server")
         if llama_bin:
             cmd = [
@@ -70,10 +71,14 @@ class llama(baseInference):
                 "--alias",
                 "default",
             ]
-            if slots > 1:  # 多槽位共享同一块 KV 池（统一 KV）
-                cmd += ["-np", str(slots), "--kv-unified"]
-                if self._supports_flag(llama_bin, "--no-cache-idle-slots"):  # 使用静态隔离,缺点是上下文对半分
-                    cmd.append("--no-cache-idle-slots")
+            if slots > 1:  # 多槽位：给每槽封顶 pool/np，任一槽占满都挤不掉其他槽的 KV
+                cmd += ["-np", str(slots)]
+                if self._supports_flag(llama_bin, "--kv-unified-per-slot"):
+                    cmd += ["--kv-unified", "--kv-unified-per-slot", str(slot_ctx)]
+                else:  # 旧版没有单槽封顶，退回非统一 KV，按 np 硬等分
+                    cmd.append("--no-kv-unified")
+                if self._supports_flag(llama_bin, "--no-cache-idle-slots"):
+                    cmd.append("--no-cache-idle-slots")  # 空闲槽 KV 留驻显存，配额已保证不会被清
         else:
             raise FileNotFoundError("未找到 llama-server，请先在当前环境编译安装并加入 PATH")
 
@@ -98,6 +103,7 @@ class llama(baseInference):
             "gpu_offload_layers": gpu_layers,
             "batch_size": batch_size,
             "parallel_slots": slots,
+            "slot_context_length": slot_ctx,
         }
         self._sleep_capable = True
         return self
@@ -155,3 +161,9 @@ class llama(baseInference):
             cached_tokens=cached_tokens,
             reasoning=reasoning,
         )
+
+    def remaining_kvCache(self, used_tokens: int, slot: int | None = None) -> int:
+        """只算主会话（slot 0）的剩余：按单槽配额扣，而不是整个 KV 池；其他槽位不适用，返回 0。"""
+        if self._effective_load.get("parallel_slots", 1) > 1 and slot != 0:
+            return 0
+        return max(0, self._effective_load.get("slot_context_length", 0) - used_tokens)

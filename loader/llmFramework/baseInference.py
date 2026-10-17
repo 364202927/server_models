@@ -35,7 +35,7 @@ class GenerationResult:
     memo_restored: int = 0  # 本次从记忆库补回 reasoning 的 assistant 条数
     memo_missed: int = 0  # 未能补回的条数（会导致渲染出的历史与 KV 分叉）
     memo_pruned: int = 0  # 未命中缓存后清理掉的陈旧指纹条数
-    kv_remaining: int = 0  # 本轮结束后上下文还剩多少 token
+    kv_remaining: int = 0  # 本轮结束后主会话(slot 0)上下文还剩多少 token；非主会话不适用为 0
 
 
 @dataclass
@@ -284,7 +284,7 @@ class baseInference(ABC):
             memo_restored=restored,
             memo_missed=missed,
             memo_pruned=pruned,
-            kv_remaining=self.remaining_kvCache(raw.prompt_tokens + raw.tokens),
+            kv_remaining=self.remaining_kvCache(raw.prompt_tokens + raw.tokens, cfg.get("id_slot")),
         )
 
     def _log_slot_diff(self, messages: list[dict[str, Any]], cfg: dict[str, Any]) -> None:
@@ -321,5 +321,5 @@ class baseInference(ABC):
     def context_limit(self) -> int:
         return int(self._effective_load.get("context_length", 0)) if self.is_loaded else 0
 
-    def remaining_kvCache(self, used_tokens: int) -> int:
+    def remaining_kvCache(self, used_tokens: int, slot: int | None = None) -> int:
         return max(0, self.context_limit() - used_tokens)
