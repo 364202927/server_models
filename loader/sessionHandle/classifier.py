@@ -16,34 +16,33 @@ class sessionCategory:
     session_id: str = ""  # 会话短标识（首条消息指纹），用于日志与指纹清理
     extended: bool = False  # True: 前缀延长命中已知会话; False: 新会话/历史被改写
     model_id: str = ""  # 主会话绑定的模型（KV 在它身上）；空表示尚未绑定
+    rewound: bool = False  # True: 客户端发生了回退/二次编辑重发（非严格追加）
 
 
 @dataclass
 class _track:
     category: sessionCategory
     seen_at: float
+    depth: int = 0  # 记录该指纹对应的消息条数，用于判断新请求是正常延长还是 ESC 回退
 
 
 class classifier:
     """
     只区分主会话与支路会话，支路不再分级。
     主会话 = 挂载了派生子代理工具的编排者（或工具集与已知主会话一致）。
-    只有主会话保存指纹，靠“前缀延长”追踪：本次请求的历史前缀 == 上次请求的整段历史，即同一会话的下一轮，
-    继承其属性与绑定的模型。支路会话不保存任何记录，每轮按工具集重判（输入不变，结果就不变）。
+    只有主会话保存指纹，靠“前缀延长”追踪：支持正常追加，也支持客户端按 ESC 撤回/重新编辑最后一条消息。
     """
 
-    # 只有编排者（主会话）才会挂载的派生子代理工具（Hermes 的叶子子代理拿不到 delegate_task）
     _SPAWN_TOOLS = frozenset({"task", "agent", "dispatch_agent", "spawn_agent", "subagent", "delegate_task"})
 
-    _TRACK_TTL = 7200.0  # 会话指纹存活秒数
-    _TRACK_MAX = 256  # 指纹条数上限，超出淘汰最久未见的
-    _ACTIVE_SEC = 120.0  # forget() 保留此窗口内仍活跃的会话
+    _TRACK_TTL = 7200.0
+    _TRACK_MAX = 256
+    _ACTIVE_SEC = 120.0
 
     def __init__(self) -> None:
-        # 键: 该会话上次请求的整段历史链式指纹（下一轮请求的前缀）
         self._tracks: dict[str, _track] = {}
-        self._main_tools: set[str] = set()  # 已确认主会话的工具集指纹，用于 /clear 后重开识别
-        self._seen_tools: set[str] = set()  # 已打印过的工具集指纹（每个工具集只打印一次）
+        self._main_tools: set[str] = set()
+        self._seen_tools: set[str] = set()
 
     # ------------------------------------------------------------------ 工具函数
     @staticmethod
@@ -63,18 +62,25 @@ class classifier:
         return {str(n) for n in names if n}
 
     # ------------------------------------------------------------------ 指纹追踪
-    def _match(self, chain: list[str]) -> tuple[str, _track] | None:
-        """从最长前缀向短找，命中即同一会话的下一轮（含完全相同的重试）。"""
-        for fp in reversed(chain):
+    def _match(self, chain: list[str]) -> tuple[str, _track, int] | None:
+        """从最长前缀向短找，命中即同一会话（返回 命中的指纹, track记录, 命中位置索引）。"""
+        for idx in range(len(chain) - 1, -1, -1):
+            fp = chain[idx]
             track = self._tracks.get(fp)
             if track:
-                return fp, track
+                return fp, track, idx + 1
         return None
 
-    def _remember(self, category: sessionCategory, chain: list[str], old_fp: str | None = None) -> None:
+    def _remember(self, category: sessionCategory, chain: list[str], matched_fp: str | None = None) -> None:
+        """保留 matched_fp 不删除，作为客户端按 ESC 重新编辑时的回退锚点；同时登记最新末端与倒数第二条锚点。"""
         now = time.time()
-        self._tracks.pop(old_fp or "", None)
-        self._tracks[chain[-1]] = _track(category, now)
+        depth = len(chain)
+        if matched_fp and matched_fp in self._tracks:
+            self._tracks[matched_fp].seen_at = now
+        if len(chain) >= 2:
+            self._tracks[chain[-2]] = _track(category, now, depth - 1)
+        self._tracks[chain[-1]] = _track(category, now, depth)
+
         expired = [fp for fp, t in self._tracks.items() if now - t.seen_at > self._TRACK_TTL]
         for fp in expired:
             del self._tracks[fp]
@@ -84,19 +90,16 @@ class classifier:
 
     @staticmethod
     def bind(category: sessionCategory, model_id: str) -> None:
-        """记录主会话落在哪个模型上。category 就是指纹表里存的那个对象，改它即改指纹；支路会话不绑定。"""
         if category.is_main:
             category.model_id = model_id
 
     def unbind(self, model_ids: set[str]) -> int:
-        """模型被换出池后，清掉绑定在它们身上的会话归属（会话下次按空闲度重新挑）。"""
         bound = [t.category for t in self._tracks.values() if t.category.model_id in model_ids]
         for category in bound:
             category.model_id = ""
         return len(bound)
 
     def forget(self, model_id: str, keep_sid: str) -> int:
-        """某模型上的主会话未命中缓存时，清理绑定在该模型上的陈旧指纹（不碰其它模型的会话），返回清理条数。"""
         cutoff = time.time() - self._ACTIVE_SEC
         stale = [fp for fp, t in self._tracks.items() if t.category.model_id == model_id and t.category.session_id != keep_sid and t.seen_at < cutoff]
         for fp in stale:
@@ -111,22 +114,26 @@ class classifier:
         names = self._tool_names(tools)
         matched = self._match(chain)
         if matched:
-            category = replace(matched[1].category, extended=True)
-            self._remember(category, chain, matched[0])
+            matched_fp, track, matched_depth = matched
+            # 如果当前总长度 <= 上次记录的深度，说明用户按了 ESC 撤回重发或重试
+            is_rewound = len(chain) <= track.depth and matched_fp != chain[-1]
+            category = replace(track.category, extended=not is_rewound, rewound=is_rewound)
+            self._remember(category, chain, matched_fp)
         else:
             first_user = next((i for i, m in enumerate(messages) if m.get("role") == "user"), 0)
             category = self._judge(names, chain[first_user][:6])
-            if category.is_main:  # 只有主会话保存指纹；支路每轮按工具集重判，结果是确定的
+            if category.is_main:
                 self._remember(category, chain)
 
+        state_str = "回退重发" if category.rewound else ("前缀延长命中" if matched else "无前缀血缘")
         info(
             "[分级] 判定",
             "主会话" if category.is_main else "支路",
             f"#{category.session_id or '-'}",
-            "前缀延长命中" if matched else "无前缀血缘",
+            state_str,
             f"消息={len(messages)}",
             f"工具={len(names)}#{self._tool_fp(names) or '-'}",
-            f"在册主会话={len(self._tracks)}",
+            f"在册锚点={len(self._tracks)}",
         )
         return category
 
@@ -135,10 +142,9 @@ class classifier:
         return hashlib.md5(",".join(sorted(n.lower() for n in names)).encode()).hexdigest()[:8] if names else ""
 
     def _judge(self, names: set[str], sid: str) -> sessionCategory:
-        """新会话（无前缀血缘）的首次判定；后续轮次靠前缀延长继承，不再重判。"""
         lowered = {n.lower() for n in names}
         tool_fp = self._tool_fp(names)
-        if tool_fp and tool_fp not in self._seen_tools:  # 新工具集打印一次，用于核对派生子代理词表
+        if tool_fp and tool_fp not in self._seen_tools:
             self._seen_tools.add(tool_fp)
             info("[分级] 新工具集", tool_fp, f"共{len(names)}个:", ",".join(sorted(names)))
 

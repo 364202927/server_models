@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import time
 import traceback
-import uuid
 from contextlib import asynccontextmanager
 from typing import Any, AsyncGenerator
 from urllib.parse import quote
@@ -35,7 +34,7 @@ class openChatReq(BaseModel):
     tool_choice: Any = None
 
 
-def _to_chat_request(request: openChatReq) -> chatReq:
+def _2chatReq(request: openChatReq) -> chatReq:
     raw_dict = request.model_dump(exclude_unset=True)
     model = raw_dict.pop("model", "")
     messages = raw_dict.pop("messages", [])
@@ -48,30 +47,6 @@ def _to_chat_request(request: openChatReq) -> chatReq:
         messages=messages,
         deploy=raw_dict,
     )
-
-
-def _build_payload(result: dict[str, Any], model_id: str, think_output: str = "inline") -> dict[str, Any]:
-    """think_output: inline = <think>…</think> 拼进 content；field = 单独的 reasoning_content 字段；both = 两者都给。"""
-    tool_calls = result.get("tool_calls") or []
-    usage = result.get("usage", {})
-    finish_reason = "tool_calls" if tool_calls else result.get("finish_reason", "stop")
-    reasoning, content = result.get("reasoning") or "", result.get("response", "")
-    if reasoning and think_output in {"inline", "both"}:
-        content = f"<think>\n{reasoning}\n</think>\n\n{content}".rstrip()
-    message: dict[str, Any] = {"role": "assistant", "content": (content or None) if tool_calls else content}
-    if reasoning and think_output in {"field", "both"}:
-        message["reasoning_content"] = reasoning
-    if tool_calls:
-        message["tool_calls"] = tool_calls
-
-    return {
-        "id": f"chatcmpl-{uuid.uuid4().hex}",
-        "object": "chat.completion",
-        "created": int(time.time()),
-        "model": result.get("model") or model_id,
-        "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
-        "usage": {**usage, "total_tokens": usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0)},
-    }
 
 
 class gateway:
@@ -112,26 +87,23 @@ class gateway:
         return True
 
     # 聊天指令路由
-    async def _chat(self, request: openChatReq, client_type: str = "openai", ua: str = "") -> Any:
-        if request.message_id != 0:
+    async def _dispatch(self, request: openChatReq, client_type: str = "openai", ua: str = "") -> Any:
+        if request.message_id != 0:#指令处理
             admin_req = adminReq(
                 message_id=request.message_id,
                 model=request.model,
                 args=request.args,
             )
             return await self.handler.admin(admin_req, source=client_type)
+        # 聊天处理
         if not request.model or not request.messages:
             raise HTTPException(status_code=400, detail="model 和 messages 不能为空")
-
-        result = await self.handler.chat(_to_chat_request(request), source=f"{client_type}/{ua[:60]}", client=clientAdapter.detectClient(ua))
+        result = await self.handler.chat(_2chatReq(request), source=f"{client_type}/{ua[:60]}", client=clientAdapter.detectClient(ua))
         if result.get("status") == "error":
             raise HTTPException(status_code=int(result.get("code", 500)), detail=result.get("response", "未知错误"))
-        payload = _build_payload(result, request.model, str(self._server_settings().get("think_output", "field")))
-
-        outbound_res = clientAdapter.outbound(openai_resp=payload, client_type=client_type, stream=request.stream, chunk_size=request.stream_delta_chunk_size)
-
+        warnings = result.pop("warnings", None) or []
+        outbound_res = clientAdapter.outbound(openai_resp=result, client_type=client_type, stream=request.stream, chunk_size=request.stream_delta_chunk_size)
         # 调度告警走响应头：不进正文，不改变客户端回传的历史前缀（HTTP 头只能是 latin-1，中文告警用 URL 编码）
-        warnings = result.get("warnings") or []
         headers = {"X-Gateway-Warning": quote("; ".join(warnings))} if warnings else None
         if request.stream:
             return StreamingResponse(outbound_res, media_type="text/event-stream", headers=headers)
@@ -164,7 +136,7 @@ class gateway:
         # 1. OpenAI 协议端点
         @app.post("/v1/chat/completions", response_model=None)
         async def chat_completions(request: openChatReq, raw_req: Request, _: bool = Depends(self._require_api_key)) -> Any:
-            return await self._chat(request, client_type="openai", ua=raw_req.headers.get("user-agent", ""))
+            return await self._dispatch(request, client_type="openai", ua=raw_req.headers.get("user-agent", ""))
 
         # 2. Claude / Anthropic 协议端点
         @app.post("/v1/messages", response_model=None)
@@ -175,7 +147,7 @@ class gateway:
                 raise HTTPException(status_code=400, detail="无效的 JSON 请求体")
             info("[DBG] Claude入站", f"stream={body.get('stream')}", f"字段={sorted(body)}", f"thinking={body.get('thinking')}", f"output_config={body.get('output_config')}")
             request = openChatReq(**clientAdapter.inbound_to_openai(body, client_type="claude"))
-            return await self._chat(request, client_type="claude", ua=raw_req.headers.get("user-agent", ""))
+            return await self._dispatch(request, client_type="claude", ua=raw_req.headers.get("user-agent", ""))
 
         return app
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
@@ -58,7 +59,7 @@ _opFn = Callable[[_taskItem], Awaitable[dict[str, Any]]]
 
 
 class msgHandler:
-    """协议无关的消息入口：解析请求 -> 确保模型就绪 -> 交给 pipeline -> 组装响应。
+    """消息入口：解析请求 -> 确保模型就绪 -> 交给 pipeline -> 组装 OpenAI 聊天响应。
 
     排队、并发上限、模型切换互斥全部由 pipeline 负责，这里不持有队列 / 信号量 / 锁。
     异常边界只有 _run 一处：业务失败（超时 / 模型加载或引擎出错）在那里统一转成带 code 的 error 响应，
@@ -68,7 +69,7 @@ class msgHandler:
         handle()  控制台适配（只解析 data）
           └─ chat() / admin()   解析请求 -> _taskItem
                └─ _run()        唯一的异常边界
-                    └─ _chat() / _model_ops[id]()   具体业务
+                    └─ _process() / _model_ops[id]()   具体业务
     """
 
     def __init__(self) -> None:
@@ -114,7 +115,7 @@ class msgHandler:
                 source=source,
                 client=client,
             ),
-            self._chat,
+            self._process,
         )
 
     async def admin(self, request: adminReq, *, source: str = "unknown") -> dict[str, Any]:
@@ -171,7 +172,7 @@ class msgHandler:
         return self._response(task.model, task.message_id, "ok", "操作成功")
 
     # ------------------------------------------------------------------ chat
-    async def _chat(self, task: _taskItem) -> dict[str, Any]:
+    async def _process(self, task: _taskItem) -> dict[str, Any]:
         """① 校验模型 ② 分级 ③ 确保模型就绪（无超时） ④ 进入 pipeline 后开始计时：排队 + 生成 ⑤ 组装响应。
 
         models.json 里没有的 id：非 agent 来源或没有主模型直接报错；agent 来源且已有主模型则当作客户端别名直接调度。
@@ -181,26 +182,38 @@ class msgHandler:
         await pipe.settled()  # 模型正在加载/切换时先等它结束，再按最新的池状态判断
         if spec is None and (task.client == "other" or not pipe.hasMain()):
             return self._fail(task, 404, f"模型不存在: {task.model}（来源归类={task.client}）")
-
         category = pipe.classify(task.messages, args.get("tools"))
-
         # 模型不在池里 / 没有主模型 / 处于休眠：都在计时开始前加载或唤醒好，冷启动再久也不会撞上超时
         if spec is not None and not (pipe.has(spec) and pipe.hasMain() and spec.isRunning):
             await pipe.ensure([spec], category.is_main or not pipe.hasMain(), args)
-
         self._log_request(task, args)
         task.fail_code = 502  # 模型已就绪，之后的失败属于引擎
         wait_s = task.timeout if task.timeout and task.timeout > 0 else None
         result = await asyncio.wait_for(pipe.run(category, task.messages, args), wait_s)  # 从这里起才计时
 
-        return self._response(task.model, 0, "ok", result.text) | {
-            "tool_calls": result.tool_calls,
-            "finish_reason": result.finish_reason,
-            "reasoning": result.reasoning,
+        # inline：think拼入 content；field：单独字段；both：两者都给。
+        think_output = str(models_mgr.settings.get("server", {}).get("think_output", "field"))
+        reasoning, content = result.reasoning or "", result.text
+        tool_calls = result.tool_calls or []
+        if reasoning and think_output in {"inline", "both"}:
+            content = f"<think>\n{reasoning}\n</think>\n\n{content}".rstrip()
+        message: dict[str, Any] = {"role": "assistant", "content": (content or None) if tool_calls else content}
+        if reasoning and think_output in {"field", "both"}:
+            message["reasoning_content"] = reasoning
+        if tool_calls:
+            message["tool_calls"] = tool_calls
+        # 返回给agent
+        return {
+            "id": f"chatcmpl-{uuid.uuid4().hex}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": task.model,
+            "choices": [{"index": 0, "message": message, "finish_reason": "tool_calls" if tool_calls else result.finish_reason}],
             "warnings": result.warnings,
             "usage": {
                 "prompt_tokens": result.prompt_tokens,
                 "completion_tokens": result.tokens_generated,
+                "total_tokens": result.prompt_tokens + result.tokens_generated,
                 "cached_tokens": result.cached_tokens,
                 "time_seconds": result.time_seconds,
                 "tokens_per_second": round(result.tokens_per_second, 2),

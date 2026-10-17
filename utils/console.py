@@ -225,11 +225,11 @@ class Console:
             return values
         result = self._command_handler(values["id"], values.get("args"))
         result = await result if inspect.isawaitable(result) else result
-        # 业务处理器返回统一响应字典；Console 入口需要把 response 正文显式
-        # 写回终端，否则只能看到“消息处理完成”日志，却看不到模型回答。
-        if isinstance(result, dict) and "response" in result:
+        # 聊天读取 OpenAI message，管理指令和错误读取 response。
+        if isinstance(result, dict) and ("response" in result or "choices" in result):
             status = str(result.get("status", "ok"))
-            response_text = str(result.get("response", ""))
+            message = (result.get("choices") or [{}])[0].get("message", {})
+            response_text = str(message.get("content") or result.get("response", ""))
             color = kColor["red"] if status == "error" else kColor["green"]
             self._write(f"\n{color}{response_text}{kReset}\n")
         return result

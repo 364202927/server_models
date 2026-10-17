@@ -2,14 +2,15 @@ from __future__ import annotations
 
 import gc
 import hashlib
+import inspect
 import json
 import os
 import signal
 import socket
 import subprocess
+import threading
 import time
 from abc import ABC, abstractmethod
-import threading
 from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 from typing import Any
@@ -30,12 +31,12 @@ class GenerationResult:
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
     finish_reason: str = "stop"
     cached_tokens: int = -1
-    reasoning: str = ""  # 本次生成剥离出的思考正文（引擎 reasoning_content 或 <think> 段）；text 永远不含 think
-    warnings: list[str] = field(default_factory=list)  # 调度层告警（如支线被迫占用主会话槽位），由网关带给客户端
-    memo_restored: int = 0  # 本次从记忆库补回 reasoning 的 assistant 条数
-    memo_missed: int = 0  # 未能补回的条数（会导致渲染出的历史与 KV 分叉）
-    memo_pruned: int = 0  # 未命中缓存后清理掉的陈旧指纹条数
-    kv_remaining: int = 0  # 本轮结束后主会话(slot 0)上下文还剩多少 token；非主会话不适用为 0
+    reasoning: str = ""
+    warnings: list[str] = field(default_factory=list)
+    memo_restored: int = 0
+    memo_missed: int = 0
+    memo_pruned: int = 0
+    kv_remaining: int = 0
 
 
 @dataclass
@@ -46,7 +47,7 @@ class RawOutput:
     calls: list[dict[str, Any]] = field(default_factory=list)
     finish_reason: str = "stop"
     cached_tokens: int = -1
-    reasoning: str = ""  # 引擎单独给出的思考正文（reasoning_content），为空说明 think 内联在 text 里
+    reasoning: str = ""
 
 
 @dataclass
@@ -63,8 +64,8 @@ class baseInference(ABC):
     """推理框架抽象基类：Server 模式基类"""
 
     _RAW_MEMO_MAX = 256
-    _STARTUP_TIMEOUT = 180.0  # 引擎启动健康检查上限（秒）；大权重从 /mnt 盘冷读较慢，子类可覆盖
-    _CACHE_LOG_KEYS = ("selected slot", "purging slot", "forcing full", "checkpoint", "prompt cache", "similarity", "cache_ram", "n_past")  # 缓存排查用，定位完可删
+    _STARTUP_TIMEOUT = 180.0
+    _CACHE_LOG_KEYS = ("selected slot", "purging slot", "forcing full", "checkpoint", "prompt cache", "similarity", "cache_ram", "n_past")
 
     def __init__(self) -> None:
         self._server_process: subprocess.Popen | None = None
@@ -76,7 +77,7 @@ class baseInference(ABC):
         self._sleep_capable = False
         self._raw_memo: OrderedDict[str, dict[str, str]] = OrderedDict()
         self._stderr_tail: deque[str] = deque(maxlen=60)
-        self._slot_last: dict[int, dict[str, Any]] = {}  # 槽位号 -> 上次请求的 tools / 逐条消息指纹，仅用于缓存排查日志
+        self._slot_last: dict[int, dict[str, Any]] = {}
 
     @property
     def base_url(self) -> str:
@@ -103,8 +104,6 @@ class baseInference(ABC):
             return s.getsockname()[1]
 
     def _spawn(self, cmd: list[str]) -> None:
-        """拉起 Server 子进程。stderr 由后台线程持续读走并只留末尾几行：
-        管道无人读取时写满 64KB 子进程会阻塞，健康检查超时后再 read() 也会死等。"""
         self._stderr_tail.clear()
         proc = subprocess.Popen(
             cmd,
@@ -119,7 +118,7 @@ class baseInference(ABC):
         def pump() -> None:
             for line in proc.stderr:
                 self._stderr_tail.append(line)
-                if any(key in line for key in self._CACHE_LOG_KEYS):  # 缓存排查：只转发选槽/整段重算/检查点相关行
+                if any(key in line for key in self._CACHE_LOG_KEYS):
                     log_info("[llama-server]", line.strip()[:240])
 
         threading.Thread(target=pump, daemon=True).start()
@@ -132,12 +131,12 @@ class baseInference(ABC):
         start_time = time.time()
         proc = self._server_process
         while time.time() - start_time < timeout:
-            if proc is None or proc.poll() is not None:  # 进程已退出或被别处（如退出清理）卸载
+            if proc is None or proc.poll() is not None:
                 log_error(f"Server 进程已退出，退出码: {proc.returncode if proc else '已卸载'}")
                 return False
             try:
                 resp = httpx.get(health_url, timeout=2.0)
-                if resp.status_code in {200, 404}:  # 404 表明 http server 已成功接管
+                if resp.status_code in {200, 404}:
                     return True
             except httpx.RequestError:
                 pass
@@ -160,7 +159,6 @@ class baseInference(ABC):
 
         if self._server_process:
             try:
-                # 终止子进程组
                 os.killpg(os.getpgid(self._server_process.pid), signal.SIGTERM)
                 self._server_process.wait(timeout=5)
             except Exception:
@@ -202,12 +200,10 @@ class baseInference(ABC):
         log_info("引擎已唤醒", type(self).__name__, f"{round(time.perf_counter() - start, 2)}s")
 
     def _engine_sleep(self) -> None:
-        # 默认使用 SIGSTOP 挂起子进程
         if self._server_process:
             os.killpg(os.getpgid(self._server_process.pid), signal.SIGSTOP)
 
     def _engine_wake(self) -> None:
-        # 默认使用 SIGCONT 恢复子进程
         if self._server_process:
             os.killpg(os.getpgid(self._server_process.pid), signal.SIGCONT)
 
@@ -227,10 +223,18 @@ class baseInference(ABC):
         usage.system_available_mb = round(psutil.virtual_memory().available / (1024**2), 1)
         return usage
 
-    def generate(self, messages: list[dict[str, Any]], gen_cfg: dict[str, Any] | None = None, prune_on_miss: bool = False) -> GenerationResult:
-        """prune_on_miss=True 时，若本次未命中缓存，则只保留仍在本次历史里的 reasoning 记忆（旧会话的指纹不再累积）。"""
+    def generate(
+        self,
+        messages: list[dict[str, Any]],
+        gen_cfg: dict[str, Any] | None = None,
+        prune_on_miss: bool = False,
+        cancel: threading.Event | None = None,
+    ) -> GenerationResult:
+        """支持 cancel 事件与回退清理：当请求在中途被客户端 ESC 取消时，绝不污染 _raw_memo 与 _slot_last。"""
         if not self.is_loaded:
             raise RuntimeError("Model not loaded / Server not running. Call load() first.")
+        if cancel is not None and cancel.is_set():
+            raise RuntimeError("Generation cancelled before execution.")
 
         cfg = dict(gen_cfg or {})
         system_instruction = str(cfg.pop("system_prompt", "") or "")
@@ -241,15 +245,22 @@ class baseInference(ABC):
             system_instruction=system_instruction,
         )
 
-        # 临时注释：先确认引擎能否正确缓存，再做清理逻辑
         live_keys = chatDataFilter.assistant_keys(cleaned_messages)
         cleaned_messages, restored, missed = chatDataFilter.restore_raw_assistant(cleaned_messages, self._raw_memo)
 
         self._log_slot_diff(cleaned_messages, cfg)
 
         start = time.perf_counter()
-        raw = self._response(messages=cleaned_messages, gen_cfg=cfg)
+        # 如果子类 _response 支持 cancel 参数则传入，否则保持兼容调用
+        if cancel is not None and "cancel" in inspect.signature(self._response).parameters:
+            raw = self._response(messages=cleaned_messages, gen_cfg=cfg, cancel=cancel)
+        else:
+            raw = self._response(messages=cleaned_messages, gen_cfg=cfg)
         elapsed = time.perf_counter() - start
+
+        # 如果在生成期间用户按了 ESC 取消了请求，直接抛错退出，防止把废弃分支的回复写入 _raw_memo
+        if cancel is not None and cancel.is_set():
+            raise RuntimeError("Generation cancelled during execution.")
 
         final_text, final_calls, final_reason = chatDataFilter.postprocess_result(raw.text, raw.calls, raw.finish_reason)
         final_reasoning = (raw.reasoning or chatDataFilter.split_raw(raw.text)["reasoning"]).strip()
@@ -258,18 +269,18 @@ class baseInference(ABC):
             cleaned_messages[-1] if cleaned_messages else None,
             {"role": "assistant", "content": final_text, "tool_calls": final_calls},
         )
-        self._raw_memo[key] = {"reasoning": final_reasoning, "content": final_text}  # 引擎已拆出 reasoning 时 split_raw(raw.text) 为空，须存真实值
+        self._raw_memo[key] = {"reasoning": final_reasoning, "content": final_text}
         self._raw_memo.move_to_end(key)
         while len(self._raw_memo) > self._RAW_MEMO_MAX:
             self._raw_memo.popitem(last=False)
 
         pruned = 0
-        # 临时注释：先确认引擎能否正确缓存，再做清理逻辑
-        # if prune_on_miss and cache_verdict(raw.cached_tokens, raw.prompt_tokens)[0] == "未命中":
-        #     stale = [k for k in list(self._raw_memo) if k not in live_keys and k != key]
-        #     for k in stale:
-        #         self._raw_memo.pop(k, None)
-        #     pruned = len(stale)
+        # 当发生未命中或客户端回退重发（missed > 0）时，清理已不在当前分支里的废弃思考指纹
+        if prune_on_miss and (missed > 0 or cache_verdict(raw.cached_tokens, raw.prompt_tokens)[0] in {"未命中", "部分命中"}):
+            stale = [k for k in list(self._raw_memo) if k not in live_keys and k != key]
+            for k in stale:
+                self._raw_memo.pop(k, None)
+            pruned = len(stale)
 
         return GenerationResult(
             text=final_text,
@@ -288,8 +299,6 @@ class baseInference(ABC):
         )
 
     def _log_slot_diff(self, messages: list[dict[str, Any]], cfg: dict[str, Any]) -> None:
-        """缓存排查用：对比本次请求与同一槽位上次请求（发给引擎的最终内容），打印首个分歧位置。
-        槽位为空（未指定 id_slot）时统一记在 -1 号。"""
         slot = cfg.get("id_slot")
         slot = -1 if slot is None else int(slot)
         digest = lambda obj: hashlib.md5(json.dumps(obj, ensure_ascii=False, sort_keys=True, default=str).encode()).hexdigest()[:6]
@@ -322,4 +331,5 @@ class baseInference(ABC):
         return int(self._effective_load.get("context_length", 0)) if self.is_loaded else 0
 
     def remaining_kvCache(self, used_tokens: int, slot: int | None = None) -> int:
-        return max(0, self.context_limit() - used_tokens)
+        slots = max(1, int(self._effective_load.get("parallel_slots", 1)))
+        return max(0, (self.context_limit() // slots) - used_tokens)
