@@ -10,14 +10,31 @@
   "launch": {},
   "group": {},
   "models": {
-    "qwen3.8-27B": {
-      "path": "D:/ai/models/Qwen3.8-27B-Uncensored-GGUF/Qwen3.8-27B-Uncensored-IQ4_XS.gguf",
+    "qwen3.8-27B-code": {
+      "path": "D:/ai/models/Qwen3.8-27b-code/Qwen3.8-27B-Coder390-EfficientThink-Q6_K-MTP.gguf",
       "engine": "llama",
       "launch": true,
       "data_compression": "default",
       "load": {
         "mtp": true,
+        "lora": "",
+        "draft": [],
+        "useVram": 6144,
+        "batch_size": 512,
+        "parallel_slots": 2,
+        "gpu_offload_layers": -1,
+        "tensor_parallel": 1,
         "draft_tokens": 3,
+        "dtype": "bfloat16"
+      }
+    },
+    "qwen3.8-27B": {
+      "path": "D:/ai/models/Qwen3.8-27B-Uncensored-GGUF/Qwen3.8-27B-Uncensored-IQ4_XS.gguf",
+      "engine": "llama",
+      "launch": false,
+      "data_compression": "default",
+      "load": {
+        "mtp": false,
         "lora": "",
         "draft": [],
         "useVram": 4096,
@@ -25,6 +42,7 @@
         "parallel_slots": 2,
         "gpu_offload_layers": -1,
         "tensor_parallel": 1,
+        "draft_tokens": 3,
         "dtype": "bfloat16"
       }
     }
