@@ -4,7 +4,10 @@ import hashlib
 import json
 import re
 import uuid
+from dataclasses import dataclass, field
 from typing import Any
+
+from ..utils.common import warn as log_warn
 
 
 def resolve_think_level(*, think: Any = None, reasoning_effort: Any = None) -> int:
@@ -16,8 +19,30 @@ def resolve_think_level(*, think: Any = None, reasoning_effort: Any = None) -> i
     return levels.get(str(reasoning_effort).lower(), 0)
 
 
+# 可以确定"重新生成一次大概率能好"的失败类别；truncated（被 max_tokens 截断）/ unclosed_think 重试通常无益，只记录
+RETRYABLE_PROBLEMS = frozenset({"json_invalid", "unclosed_call", "unknown_tool", "missing_required", "empty"})
+
+
+@dataclass
+class parsedResult:
+    """模型原文解析结果。problems 非空表示工具调用/输出有问题：(类别, 说明)。"""
+
+    text: str
+    tool_calls: list[dict[str, Any]]
+    finish_reason: str
+    problems: list[tuple[str, str]] = field(default_factory=list)
+
+    @property
+    def retryable(self) -> bool:
+        return any(code in RETRYABLE_PROBLEMS for code, _ in self.problems)
+
+
 class chatDataFilter:
     """聊天数据过滤器：清洗与状态校正。"""
+
+    _HERMES_CALL = re.compile(r"<tool_call>(?!\s*<function=)(.*?)</tool_call>", re.DOTALL)  # 内容不是 JSON 也匹配，才能识别"标签闭合但 JSON 残缺"；XML 包裹形式留给下面的 XML 解析
+    _FUNC_CALL = re.compile(r"<function=([^>]+)>(.*?)(?:(</function>)|(?=<function=)|$)", re.DOTALL)  # 第 3 组：是否有闭合标签
+    _FUNC_PARAM = re.compile(r"<parameter=([^>]+)>(.*?)</parameter>", re.DOTALL)
 
     @staticmethod
     def _canon_args(args: Any) -> str:
@@ -135,6 +160,7 @@ class chatDataFilter:
     @classmethod
     def normalize_tool_call_mappings(cls, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         normalized = []
+        bad = 0
         for msg in messages:
             item = dict(msg)
             if item.get("role") == "assistant" and item.get("tool_calls"):
@@ -146,14 +172,17 @@ class chatDataFilter:
                     if isinstance(args, str):
                         try:
                             fn["arguments"] = json.loads(args) if args.strip() else {}
-                        except Exception:
+                        except json.JSONDecodeError:
                             fn["arguments"] = {}
+                            bad += 1
                     elif not isinstance(args, dict):
                         fn["arguments"] = {}
                     tc_dict["function"] = fn
                     clean_tcs.append(tc_dict)
                 item["tool_calls"] = clean_tcs
             normalized.append(item)
+        if bad:
+            log_warn("[工具调用]", f"历史消息里有 {bad} 个 tool_call 的 arguments 不是合法 JSON，已替换为 {{}}（会改变该处前缀）")
         return normalized
 
     @classmethod
@@ -176,59 +205,132 @@ class chatDataFilter:
         return cleaned
 
     @classmethod
+    def parse_result(
+        cls,
+        raw_text: str,
+        detected_calls: list[dict[str, Any]],
+        finish_reason: str,
+        tools: list[dict[str, Any]] | None = None,
+    ) -> parsedResult:
+        """解析模型原文：取出正文与工具调用，按请求的 tools schema 修正参数类型并校验，问题记入 problems。
+        解析失败的片段保留在正文里（不静默删除），由调用方决定重试还是原样透传。"""
+        problems: list[tuple[str, str]] = []
+        truncated = finish_reason == "length"
+        text = raw_text
+
+        # 约定：返回文本永远不含 think（思考由 split_raw 单独取出）；先剥再解析，避免误解析 think 里的工具标记
+        if "</think>" in text:
+            text = text.split("</think>", 1)[1]
+        elif text.lstrip().startswith("<think>"):
+            problems.append(("truncated" if truncated else "unclosed_think", "思考未闭合，其后的正文/工具调用不可见"))
+            text = ""
+
+        calls = [dict(c) for c in detected_calls or []]
+        if not calls:
+            # Hermes：<tool_call>{json}</tool_call>
+            pieces, last = [], 0
+            for m in cls._HERMES_CALL.finditer(text):
+                pieces.append(text[last : m.start()])
+                last = m.end()
+                body = m.group(1).strip()
+                if not body:
+                    continue  # 空的 <tool_call></tool_call>：直接丢弃
+                try:
+                    data = json.loads(body)
+                except json.JSONDecodeError as exc:
+                    problems.append(("json_invalid", f"<tool_call> 内不是合法 JSON: {exc.msg}"))
+                    pieces.append(m.group(0))
+                    continue
+                if not isinstance(data, dict) or "name" not in data:
+                    problems.append(("json_invalid", "<tool_call> 的 JSON 缺少 name 字段"))
+                    pieces.append(m.group(0))
+                    continue
+                calls.append({"id": f"call_{uuid.uuid4().hex[:8]}", "type": "function", "function": {"name": data["name"], "arguments": data.get("arguments", {})}})
+            pieces.append(text[last:])
+            text = "".join(pieces)
+
+            # XML：<function=name><parameter=k>v</parameter></function>（参数值此时都是字符串，类型在下面按 schema 修正）
+            pieces, last = [], 0
+            matches = list(cls._FUNC_CALL.finditer(text))
+            for i, m in enumerate(matches):
+                pieces.append(text[last : m.start()])
+                last = m.end()
+                name = m.group(1).strip()
+                if truncated and i == len(matches) - 1 and m.group(3) is None:
+                    problems.append(("truncated", f"{name} 调用被截断（缺少 </function>），未下发半截调用"))
+                    pieces.append(m.group(0))
+                    continue
+                if not name:
+                    continue
+                args = {pm.group(1).strip(): pm.group(2).strip() for pm in cls._FUNC_PARAM.finditer(m.group(2))}
+                calls.append({"id": f"call_{uuid.uuid4().hex[:8]}", "type": "function", "function": {"name": name, "arguments": args}})
+            pieces.append(text[last:])
+            text = "".join(pieces)
+
+            if not calls and not problems and text.count("<tool_call>") > text.count("</tool_call>"):
+                problems.append(("truncated" if truncated else "unclosed_call", "<tool_call> 没有闭合，调用不可解析"))
+
+        # 参数规范化 + 按 tools schema 修正类型/校验（无 tools 则只做 JSON 规范化）
+        schemas = {(t.get("function") or t).get("name"): (t.get("function") or t).get("parameters") or {} for t in tools or [] if isinstance(t, dict)}
+        for call in calls:
+            fn = call["function"] = dict(call.get("function", {}))
+            name, raw_args = fn.get("name"), fn.get("arguments", {})
+            args = raw_args
+            if isinstance(raw_args, str):
+                try:
+                    args = json.loads(raw_args) if raw_args.strip() else {}
+                except json.JSONDecodeError as exc:
+                    problems.append(("json_invalid", f"{name} 的 arguments 不是合法 JSON: {exc.msg}"))
+                    continue
+            if not isinstance(args, dict):
+                problems.append(("json_invalid", f"{name} 的 arguments 不是 JSON 对象"))
+                fn["arguments"] = json.dumps(args, ensure_ascii=False)
+                continue
+
+            schema = schemas.get(name) or {}
+            props = schema.get("properties") or {}
+            coerced = False
+            for key, val in args.items():
+                want = (props.get(key) or {}).get("type")
+                want = {want} if isinstance(want, str) else set(want or [])
+                if not isinstance(val, str) or not want or "string" in want:
+                    continue
+                cand = val.strip()
+                if "boolean" in want and cand.lower() in {"true", "false"}:
+                    cand = cand.lower()
+                try:
+                    parsed = json.loads(cand)
+                except json.JSONDecodeError:
+                    continue
+                kind = "boolean" if isinstance(parsed, bool) else "integer" if isinstance(parsed, int) else "number" if isinstance(parsed, float) else "array" if isinstance(parsed, list) else "object" if isinstance(parsed, dict) else "null" if parsed is None else "string"
+                if kind in want or (kind == "integer" and "number" in want):
+                    args[key] = parsed
+                    coerced = True
+
+            if schemas and name not in schemas:
+                problems.append(("unknown_tool", f"工具 {name} 不在请求的 tools 里"))
+            missing = [r for r in schema.get("required") or [] if r not in args]
+            if missing:
+                problems.append(("missing_required", f"{name} 缺少必填参数 {missing}"))
+            if coerced or not isinstance(raw_args, str):
+                fn["arguments"] = json.dumps(args, ensure_ascii=False)
+
+        # 解析成功才清理残留标签；有解析问题时原样保留，不把模型写的东西悄悄吞掉
+        if not {code for code, _ in problems} & {"json_invalid", "unclosed_call", "truncated", "unclosed_think"}:
+            text = re.sub(r"<tool_call>\s*</tool_call>", "", text, flags=re.DOTALL)
+            text = re.sub(r"</?tool_call>", "", text)
+        if not calls and not problems and not text.strip():
+            problems.append(("truncated" if truncated else "empty", "模型没有输出任何正文或工具调用"))
+
+        return parsedResult(text.strip(), calls, "tool_calls" if calls else finish_reason, problems)
+
+    @classmethod
     def postprocess_result(
         cls,
         raw_text: str,
         detected_calls: list[dict[str, Any]],
         finish_reason: str,
     ) -> tuple[str, list[dict[str, Any]], str]:
-        tool_calls = list(detected_calls or [])
-        clean_text = raw_text
-
-        # 约定：返回文本永远不含 think（思考由 split_raw 单独取出）；先剥再解析，避免误解析 think 里的工具标记
-        if "</think>" in clean_text:
-            clean_text = clean_text.split("</think>", 1)[1]
-        elif clean_text.lstrip().startswith("<think>"):
-            clean_text = ""
-
-        if not tool_calls:
-            # Hermes 格式匹配
-            for match in re.finditer(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", clean_text, re.DOTALL):
-                try:
-                    data = json.loads(match.group(1))
-                    if "name" in data:
-                        args = data.get("arguments", {})
-                        tool_calls.append({
-                            "id": f"call_{uuid.uuid4().hex[:8]}",
-                            "type": "function",
-                            "function": {
-                                "name": data["name"],
-                                "arguments": json.dumps(args, ensure_ascii=False) if isinstance(args, dict) else str(args),
-                            },
-                        })
-                except Exception:
-                    pass
-            clean_text = re.sub(r"<tool_call>\s*\{.*?\}\s*</tool_call>", "", clean_text, flags=re.DOTALL)
-
-            for match in re.finditer(r"<function=([^>]+)>(.*?)(?:</function>|(?=<function=)|$)", clean_text, re.DOTALL):
-                fn_name = match.group(1).strip()
-                body = match.group(2)
-                args = {pm.group(1).strip(): pm.group(2).strip() for pm in re.finditer(r"<parameter=([^>]+)>(.*?)</parameter>", body, re.DOTALL)}
-                if fn_name:
-                    tool_calls.append({
-                        "id": f"call_{uuid.uuid4().hex[:8]}",
-                        "type": "function",
-                        "function": {
-                            "name": fn_name,
-                            "arguments": json.dumps(args, ensure_ascii=False),
-                        },
-                    })
-            clean_text = re.sub(r"<function=[^>]+>.*?(?:</function>|$)", "", clean_text, flags=re.DOTALL)
-
-        clean_text = re.sub(r"<tool_call>\s*</tool_call>", "", clean_text, flags=re.DOTALL)
-        clean_text = re.sub(r"</?tool_call>", "", clean_text)
-
-        if tool_calls:
-            finish_reason = "tool_calls"
-
-        return clean_text.strip(), tool_calls, finish_reason
+        """兼容旧调用方：只返回 (正文, 工具调用, finish_reason)；需要 schema 校验/问题列表请用 parse_result。"""
+        parsed = cls.parse_result(raw_text, detected_calls, finish_reason)
+        return parsed.text, parsed.tool_calls, parsed.finish_reason

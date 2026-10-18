@@ -71,6 +71,8 @@ class baseInference(ABC):
     _STARTUP_TIMEOUT = 180.0
     _MIN_GEN_RESERVE = 4096  # 生成预留：prompt + 预留放不进单槽就拒绝
     _WARN_USAGE = 0.80  # prompt 占单槽比例达到此值时打警告日志
+    _TOOL_RETRY = 1  # 工具调用可确定地失败（非法 JSON / 未闭合 / 未知工具 / 缺必填参数 / 空输出）时的静默重试次数；0 = 关闭
+    _RETRY_MAX_SECONDS = 60.0  # 首次生成耗时超过此值就不重试：避免把长生成翻倍后撞上调用方超时
     _GUESS_TOK_PER_CHAR = 0.25  # 尚无实测校准时的乐观比例（约 4 字符/token）：只拦截一定放不下的请求，避免首轮误杀后永远无法校准
     _CACHE_LOG_KEYS = ("selected slot", "purging slot", "forcing full", "checkpoint", "prompt cache", "similarity", "cache_ram", "n_past")
 
@@ -279,21 +281,28 @@ class baseInference(ABC):
 
         self._log_slot_diff(cleaned_messages, cfg)
 
-        start = time.perf_counter()
-        # 如果子类 _response 支持 cancel 参数则传入，否则保持兼容调用
-        if cancel is not None and "cancel" in inspect.signature(self._response).parameters:
-            raw = self._response(messages=cleaned_messages, gen_cfg=cfg, cancel=cancel)
-        else:
-            raw = self._response(messages=cleaned_messages, gen_cfg=cfg)
-        elapsed = time.perf_counter() - start
+        # 子类 _response 支持 cancel 参数则传入，否则保持兼容调用
+        extra = {"cancel": cancel} if cancel is not None and "cancel" in inspect.signature(self._response).parameters else {}
+        for attempt in range(self._TOOL_RETRY + 1):
+            start = time.perf_counter()
+            raw = self._response(messages=cleaned_messages, gen_cfg=cfg, **extra)
+            elapsed = time.perf_counter() - start
 
-        # 如果在生成期间用户按了 ESC 取消了请求，直接抛错退出，防止把废弃分支的回复写入 _raw_memo
-        if cancel is not None and cancel.is_set():
-            raise RuntimeError("Generation cancelled during execution.")
-        if raw.prompt_tokens > 0 and chars > 0:
-            self._tok_ratio[slot] = raw.prompt_tokens / chars  # 用本次实测校准，下次估算按同一量纲
+            # 如果在生成期间用户按了 ESC 取消了请求，直接抛错退出，防止把废弃分支的回复写入 _raw_memo
+            if cancel is not None and cancel.is_set():
+                raise RuntimeError("Generation cancelled during execution.")
+            if raw.prompt_tokens > 0 and chars > 0:
+                self._tok_ratio[slot] = raw.prompt_tokens / chars  # 用本次实测校准，下次估算按同一量纲
 
-        final_text, final_calls, final_reason = chatDataFilter.postprocess_result(raw.text, raw.calls, raw.finish_reason)
+            parsed = chatDataFilter.parse_result(raw.text, raw.calls, raw.finish_reason, cfg.get("tools"))
+            if parsed.problems:
+                log_warn("[工具调用]", f"槽={slot}", f"第{attempt + 1}次", f"问题={parsed.problems}", f"finish={raw.finish_reason}", f"tokens={raw.tokens}", f"{elapsed:.1f}s", f"原文头={raw.text[:300]!r}", f"原文尾={raw.text[-300:]!r}")
+            # 失败的输出不会进入 _raw_memo（memo 只在循环结束后按最终结果写入）；temperature=0 时重试必然得到同样输出，不重试
+            if not parsed.retryable or attempt >= self._TOOL_RETRY or elapsed > self._RETRY_MAX_SECONDS or cfg.get("temperature") == 0:
+                break
+            log_warn("[工具调用]", f"槽={slot}", "静默重试", f"上次耗时{elapsed:.1f}s")
+
+        final_text, final_calls, final_reason = parsed.text, parsed.tool_calls, parsed.finish_reason
         final_reasoning = (raw.reasoning or chatDataFilter.split_raw(raw.text)["reasoning"]).strip()
 
         key = chatDataFilter.memo_key(
