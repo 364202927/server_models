@@ -17,8 +17,12 @@ from typing import Any
 
 import httpx, psutil
 
-from ...utils.common import cache_verdict, info as log_info, error as log_error
+from ...utils.common import cache_verdict, info as log_info, error as log_error, warn as log_warn
 from ..chatDataFilter import chatDataFilter
+
+
+class ContextOverflowError(Exception):
+    """请求（含 tools）放不进单槽上下文：由入口层转成 400 返回客户端，不属于引擎故障（不继承 RuntimeError）。"""
 
 
 @dataclass
@@ -65,6 +69,9 @@ class baseInference(ABC):
 
     _RAW_MEMO_MAX = 256
     _STARTUP_TIMEOUT = 180.0
+    _MIN_GEN_RESERVE = 4096  # 生成预留：prompt + 预留放不进单槽就拒绝
+    _WARN_USAGE = 0.80  # prompt 占单槽比例达到此值时打警告日志
+    _GUESS_TOK_PER_CHAR = 0.25  # 尚无实测校准时的乐观比例（约 4 字符/token）：只拦截一定放不下的请求，避免首轮误杀后永远无法校准
     _CACHE_LOG_KEYS = ("selected slot", "purging slot", "forcing full", "checkpoint", "prompt cache", "similarity", "cache_ram", "n_past")
 
     def __init__(self) -> None:
@@ -78,6 +85,7 @@ class baseInference(ABC):
         self._raw_memo: OrderedDict[str, dict[str, str]] = OrderedDict()
         self._stderr_tail: deque[str] = deque(maxlen=60)
         self._slot_last: dict[int, dict[str, Any]] = {}
+        self._tok_ratio: dict[int, float] = {}  # 槽位 -> 上次实测的 token/字符，用于发送前估算 prompt 大小
 
     @property
     def base_url(self) -> str:
@@ -212,6 +220,7 @@ class baseInference(ABC):
         self._sleeping = False
         self._sleep_capable = False
         self._raw_memo.clear()
+        self._tok_ratio.clear()
 
     def release_cache(self) -> MemoryUsage:
         gc.collect()
@@ -248,6 +257,26 @@ class baseInference(ABC):
         live_keys = chatDataFilter.assistant_keys(cleaned_messages)
         cleaned_messages, restored, missed = chatDataFilter.restore_raw_assistant(cleaned_messages, self._raw_memo)
 
+        # 容量守门：prompt（含 tools）+ 生成预留放不进单槽，就不发给引擎，直接把问题报给客户端（由其压缩/精简后重发）
+        slot = -1 if cfg.get("id_slot") is None else int(cfg["id_slot"])
+        limit = self.slot_limit()
+        dump = lambda obj: len(json.dumps(obj, ensure_ascii=False, default=str))
+        tools_chars = dump(cfg.get("tools") or [])
+        chars = dump(cleaned_messages) + tools_chars
+        per_char = self._tok_ratio.get(slot) or self._GUESS_TOK_PER_CHAR
+        est = int(chars * per_char)
+        anchor = int((tools_chars + dump([m for m in cleaned_messages if m.get("role") == "system"])) * per_char)
+        reserve = min(self._MIN_GEN_RESERVE, limit // 4)
+        used = est / limit if limit > 0 else 0.0
+        if limit > 0:
+            (log_warn if used >= self._WARN_USAGE else log_info)("[容量]", f"槽={slot}", f"prompt≈{est}", f"system+tools≈{anchor}", f"单槽={limit}", f"使用率={used:.0%}", f"预留={reserve}", "实测校准" if slot in self._tok_ratio else "未校准(乐观估算)")
+        if limit > 0 and est + reserve > limit:
+            raise ContextOverflowError(
+                f"This model's maximum context length is {limit} tokens per slot. However, your request needs about {est + reserve} tokens "
+                f"({est} in the messages and tools, {reserve} reserved for the completion). Please reduce the length of the messages or tools. "
+                f"[上下文超限: 估算 {est}+{reserve} > 单槽 {limit}，其中 system+tools 约 {anchor}；请先压缩对话或精简工具后重发]"
+            )
+
         self._log_slot_diff(cleaned_messages, cfg)
 
         start = time.perf_counter()
@@ -261,6 +290,8 @@ class baseInference(ABC):
         # 如果在生成期间用户按了 ESC 取消了请求，直接抛错退出，防止把废弃分支的回复写入 _raw_memo
         if cancel is not None and cancel.is_set():
             raise RuntimeError("Generation cancelled during execution.")
+        if raw.prompt_tokens > 0 and chars > 0:
+            self._tok_ratio[slot] = raw.prompt_tokens / chars  # 用本次实测校准，下次估算按同一量纲
 
         final_text, final_calls, final_reason = chatDataFilter.postprocess_result(raw.text, raw.calls, raw.finish_reason)
         final_reasoning = (raw.reasoning or chatDataFilter.split_raw(raw.text)["reasoning"]).strip()
@@ -330,6 +361,10 @@ class baseInference(ABC):
     def context_limit(self) -> int:
         return int(self._effective_load.get("context_length", 0)) if self.is_loaded else 0
 
+    def slot_limit(self) -> int:
+        """单槽可用上下文：优先用引擎实际下发的单槽配额，否则总上下文 // 并行槽位数。"""
+        per_slot = int(self._effective_load.get("slot_context_length", 0))
+        return per_slot or self.context_limit() // max(1, int(self._effective_load.get("parallel_slots", 1)))
+
     def remaining_kvCache(self, used_tokens: int, slot: int | None = None) -> int:
-        slots = max(1, int(self._effective_load.get("parallel_slots", 1)))
-        return max(0, (self.context_limit() // slots) - used_tokens)
+        return max(0, self.slot_limit() - used_tokens)

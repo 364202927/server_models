@@ -7,30 +7,32 @@ from typing import Any
 
 import httpx
 
-from ...utils.common import info
+from ...utils.common import info, warn
 from .baseInference import RawOutput, baseInference
 
 
 class ninfer(baseInference):
-    """NInfer (ninfer-serve) 转发引擎"""
+    """NInfer (ninfer-serve) 转发引擎。
+
+    约束（来自官方 docs/serving.md）：单 Engine、单常驻序列、请求串行，无连续批处理；
+    因此不存在多槽位 / id_slot 隔离，parallel_slots 恒为 1。
+    """
 
     _FALLBACK_N_CTX = 8192
-    _DTYPE_MAP = {"bfloat16": "bf16", "bf16": "bf16", "float16": "fp16", "fp16": "fp16", "fp8": "fp8"}
-
-    def __init__(self) -> None:
-        super().__init__()
-        self._model_path: str = ""
-        self._model_id: str = "default"
-        self._vision_enabled: bool = False
+    _MAX_N_CTX = 262144  # 注册模型原生上限
+    _MAX_MTP_DRAFT = 5  # --mtp-draft-tokens 取值 0..5
+    _MODEL_ID = "default"  # 请求里的 model 必须与 --model-id 一致
+    _TOP_K_MAX = 20  # 沿用原实现的钳制值（文档未给出上限，以 ninfer-serve --help 为准）
+    _SUPPORTED_KV_DTYPES = {"bf16", "int8"}
 
     @property
     def supported_modalities(self) -> set[str]:
-        return {"text", "image", "video"} if self._vision_enabled else {"text"}
+        return {"text", "image", "video"}  # 两个注册模型均原生支持图像/视频，无需启动参数
 
     def _create(self, model_path: str, load_cfg: dict[str, Any]) -> "ninfer":
         self._unload_engine()
 
-        # 1. 解析 .ninfer 权重文件路径（内联单次调用）
+        # 1. 解析 .ninfer 权重文件（目录则取第一个）
         source = Path(model_path)
         if source.is_dir():
             files = sorted(source.glob("*.ninfer"))
@@ -40,66 +42,34 @@ class ninfer(baseInference):
         if not source.is_file() or source.suffix.lower() != ".ninfer":
             raise ValueError(f"不是有效的 .ninfer 文件: {model_path}")
 
-        ninfer_bin = shutil.which("ninfer-serve") or os.environ.get("NINFER_BIN", "")
-        if not ninfer_bin or not Path(ninfer_bin).is_file():
-            raise FileNotFoundError("未找到 ninfer-serve，请将其加入 PATH 或设置 NINFER_BIN 环境变量")
+        # 官方无安装目标，二进制在 build/apps/ninfer-serve：环境变量优先，其次 PATH
+        ninfer_bin = os.environ.get("NINFER_BIN") or shutil.which("ninfer-serve") or ""
+        if not Path(ninfer_bin).is_file():
+            raise FileNotFoundError("未找到 ninfer-serve，请设置 NINFER_BIN 指向 build/apps/ninfer-serve 或加入 PATH")
+
+        kv_dtype = str(load_cfg.get("kv_dtype") or "bf16").lower()
+        if kv_dtype not in self._SUPPORTED_KV_DTYPES:
+            raise ValueError(f"ninfer 的 kv_dtype 仅支持 {sorted(self._SUPPORTED_KV_DTYPES)}，当前: {kv_dtype}")
+
+        # 2. 公共参数 -> 启动参数（useVram 此处已是 token 数，与 llama.py 口径一致）
+        n_ctx = min(max(int(load_cfg.get("useVram", 0)), self._FALLBACK_N_CTX), self._MAX_N_CTX)
+        mtp_n = min(int(load_cfg.get("draft_tokens", 3)), self._MAX_MTP_DRAFT) if load_cfg.get("mtp") else 0
+        if int(load_cfg.get("parallel_slots", 1)) > 1:
+            warn("[ninfer-serve] 单 Engine 单序列，parallel_slots 已按 1 处理")
 
         self._model_path = str(source)
         self._port = self._find_free_port()
-
-        # 2. 转换 template 公共参数 -> ninfer 启动参数
-        # useVram -> --max-context & --kv-capacity
-        calculated_n_ctx = max(int(load_cfg.get("useVram", 0)), self._FALLBACK_N_CTX)
-        slots = max(1, int(load_cfg.get("parallel_slots", 1)))
-        default_pool = calculated_n_ctx if slots == 1 else calculated_n_ctx * slots
-        kv_capacity = max(int(load_cfg.get("kv_capacity", 0)), default_pool)
-
-        # dtype ("bfloat16") / kv_dtype ("fp8") -> --kv-dtype ("bf16" | "fp16" | "fp8")
-        raw_dtype = str(load_cfg.get("kv_dtype") or load_cfg.get("dtype", "fp8")).lower()
-        kv_dtype = self._DTYPE_MAP.get(raw_dtype, "fp8")
-
-        host_slots = int(load_cfg.get("host_state_slots", 8))
-        host_kv_mib = int(load_cfg.get("host_kv_mib", 8192))
-
         cmd = [
-            ninfer_bin,
-            self._model_path,
-            "--host",
-            self._host,
-            "--port",
-            str(self._port),
-            "--model-id",
-            self._model_id,
-            "--max-context",
-            str(calculated_n_ctx),
-            "--kv-capacity",
-            str(kv_capacity),
-            "--max-concurrency",
-            str(slots),
-            "--kv-dtype",
-            kv_dtype,
-            "--device-state-slots",
-            str(slots),
-            "--host-state-slots",
-            str(host_slots),
-            "--host-kv-mib",
-            str(host_kv_mib),
+            ninfer_bin, self._model_path,
+            "--host", self._host,
+            "--port", str(self._port),
+            "--model-id", self._MODEL_ID,
+            "--max-context", str(n_ctx),
         ]
-
-        if load_cfg.get("preserve_thinking", True):
-            cmd.append("--preserve-thinking")
-
-        self._vision_enabled = bool(load_cfg.get("vision", False))
-        if self._vision_enabled:
-            cmd.append("--vision")
-
-        # 3. 转换 template 的 mtp (bool) 与 draft (list) -> --spec & --draft-tokens
-        draft_cfg = load_cfg.get("draft") or []
-        spec_type = str(draft_cfg[0]).lower() if draft_cfg else ("mtp" if load_cfg.get("mtp", False) else "")
-        if spec_type in {"mtp", "dflash", "dflash2"}:
-            default_draft_n = int(draft_cfg[1]) if len(draft_cfg) > 1 else (3 if spec_type == "mtp" else 7)
-            draft_tokens = int(load_cfg.get("draft_tokens", default_draft_n))
-            cmd += ["--spec", spec_type, "--draft-tokens", str(draft_tokens)]
+        if kv_dtype == "int8":  # 默认 bf16，不传
+            cmd += ["--kv-dtype", "int8"]
+        if mtp_n > 0:  # MTP 默认关闭(0)；--lm-head-draft 只服务于 MTP 提议头
+            cmd += ["--mtp-draft-tokens", str(mtp_n)]
             if load_cfg.get("lm_head_draft", True):
                 cmd.append("--lm-head-draft")
 
@@ -111,27 +81,15 @@ class ninfer(baseInference):
             self._unload_engine()
             raise RuntimeError(f"ninfer-serve 启动失败: {err_msg}")
 
-        self._http_client = httpx.Client(base_url=self.base_url, timeout=120.0)
-        try:
-            models_data = self._http_client.get("/v1/models").json().get("data", [])
-            if models_data and models_data[0].get("id"):
-                self._model_id = str(models_data[0]["id"])
-        except httpx.HTTPError:
-            pass
-
-        info(
-            "[ninfer-serve] 实际并发槽位数",
-            slots,
-            f"(max_ctx={calculated_n_ctx}, kv_capacity={kv_capacity}, kv_dtype={kv_dtype})",
-        )
+        # 非流式长 prefill（27B 262k 约 160s）会超过 120s，读超时放宽
+        self._http_client = httpx.Client(base_url=self.base_url, timeout=httpx.Timeout(600.0, connect=10.0))
         self._effective_load = {
             "engine": "ninfer",
-            "context_length": calculated_n_ctx,
-            "kv_capacity": kv_capacity,
+            "context_length": n_ctx,
             "kv_dtype": kv_dtype,
-            "parallel_slots": slots,
-            "slot_context_length": calculated_n_ctx,
-            "spec_type": spec_type or "none",
+            "parallel_slots": 1,
+            "slot_context_length": n_ctx,
+            "mtp_draft_tokens": mtp_n,
         }
         self._sleep_capable = True
         return self
@@ -141,49 +99,37 @@ class ninfer(baseInference):
         messages: list[dict[str, Any]],
         gen_cfg: dict[str, Any],
     ) -> RawOutput:
-        cfg = dict(gen_cfg)
         payload: dict[str, Any] = {
-            "model": self._model_id,
+            "model": self._MODEL_ID,
             "messages": messages,
             "stream": False,
-            "max_tokens": int(cfg.get("max_tokens", 2048)),
+            "max_tokens": int(gen_cfg.get("max_tokens", 2048)),
         }
 
-        # 1. 透传兼容的采样参数
-        for key in ("temperature", "top_p", "min_p", "presence_penalty", "frequency_penalty"):
-            if cfg.get(key) is not None:
-                payload[key] = cfg[key]
+        # 仅透传文档列出的采样字段；min_p / repetition_penalty 不在 HTTP 字段表内，不转发
+        for key in ("temperature", "top_p", "presence_penalty", "frequency_penalty"):
+            if gen_cfg.get(key) is not None:
+                payload[key] = gen_cfg[key]
+        if gen_cfg.get("top_k") is not None:
+            payload["top_k"] = max(0, min(int(gen_cfg["top_k"]), self._TOP_K_MAX))
 
-        # 2. 转换 template.top_k (默认50) -> 钳制到 NInfer CUDA 算子上限 [0, 20]
-        if cfg.get("top_k") is not None:
-            payload["top_k"] = max(0, min(int(cfg["top_k"]), 20))
-
-        # 3. 转换 template.repetition_penalty (默认1.05) -> 折算为 presence_penalty
-        rep_penalty = float(cfg.get("repetition_penalty", 1.0))
-        if rep_penalty != 1.0 and not payload.get("presence_penalty"):
-            payload["presence_penalty"] = round(max(-2.0, min(2.0, (rep_penalty - 1.0) * 2.0)), 3)
-
-        # 4. 转换 template.stop (list) -> 过滤空串并截断至 NInfer 限制的最多 4 个
-        stop = [s for s in (cfg.get("stop") or []) if s]
+        stop = [s for s in (gen_cfg.get("stop") or []) if s][:4]
         if stop:
-            payload["stop"] = stop[:4]
-
-        if cfg.get("tools"):
-            payload["tools"] = cfg["tools"]
-        if cfg.get("tool_choice"):
-            payload["tool_choice"] = cfg["tool_choice"]
+            payload["stop"] = stop
+        for key in ("tools", "tool_choice"):
+            if gen_cfg.get(key):
+                payload[key] = gen_cfg[key]
 
         resp = self._http_client.post("/v1/chat/completions", json=payload)
         resp.raise_for_status()
         data = resp.json()
 
         choice = data["choices"][0]
-        message = choice.get("message", {})
-        usage = data.get("usage", {})
-
-        cached_tokens = usage.get("prompt_tokens_details", {}).get("cached_tokens")
-        if cached_tokens is None:
-            cached_tokens = data.get("timings", {}).get("cache_n", -1)
+        message = choice.get("message") or {}
+        usage = data.get("usage") or {}
+        cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens")
+        if cached is None:
+            cached = (data.get("timings") or {}).get("cache_n", -1)
 
         return RawOutput(
             text=str(message.get("content") or ""),
@@ -191,16 +137,6 @@ class ninfer(baseInference):
             prompt_tokens=int(usage.get("prompt_tokens", 0)),
             calls=message.get("tool_calls") or [],
             finish_reason=str(choice.get("finish_reason") or "stop"),
-            cached_tokens=int(cached_tokens),
+            cached_tokens=int(cached),
             reasoning=str(message.get("reasoning_content") or ""),
         )
-
-    def remaining_kvCache(self, used_tokens: int, slot: int | None = None) -> int:
-        """动态共享 KV 池下，主会话（slot 0）最大可用为单请求上下文上限与总池容量的较小值。"""
-        if self._effective_load.get("parallel_slots", 1) > 1 and slot != 0:
-            return 0
-        limit = min(
-            int(self._effective_load.get("context_length", 0)),
-            int(self._effective_load.get("kv_capacity", 0)),
-        )
-        return max(0, limit - used_tokens)

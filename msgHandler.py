@@ -11,7 +11,7 @@ from typing import Any, Awaitable, Callable
 import httpx
 
 from . import adim_ID
-from .loader.llmFramework.baseInference import GenerationResult
+from .loader.llmFramework.baseInference import ContextOverflowError, GenerationResult
 from .loader.model_spec import modelSpec
 from .loader.models_mgr import models_mgr
 from .loader.sessionHandle import pipeline
@@ -148,14 +148,16 @@ class msgHandler:
 
     # ------------------------------------------------------------------ 执行壳
     async def _run(self, task: _taskItem, op: _opFn) -> dict[str, Any]:
-        """统一执行壳，也是唯一的异常边界：生成超时 -> 504；模型加载/引擎失败 -> task.fail_code，
-        不回落，直接报给客户端。其余异常属于 bug，原样上抛，由框架打印堆栈。
+        """统一执行壳，也是唯一的异常边界：生成超时 -> 504；请求放不进单槽上下文 -> 400（客户端自行压缩/精简后重发）；
+        模型加载/引擎失败 -> task.fail_code，不回落，直接报给客户端。其余异常属于 bug，原样上抛，由框架打印堆栈。
         这里不计时：计时只围住 _chat 里「进入 pipeline 之后」的那一段，模型加载/唤醒不受超时影响。"""
         info("任务开始执行", task.source, task.task_id, "model=", task.model)
         try:
             return await op(task)
         except asyncio.TimeoutError:
             return self._fail(task, 504, f"生成超时 ({task.timeout}s，从进入 pipeline 起算，不含模型加载)")
+        except ContextOverflowError as exc:
+            return self._fail(task, 400, str(exc))
         except (RuntimeError, MemoryError, httpx.HTTPError) as exc:
             return self._fail(task, task.fail_code, f"{type(exc).__name__}: {exc}")
 
