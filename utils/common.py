@@ -145,7 +145,7 @@ def vm2tokens(
     if vram_num <= 0:
         return align_step
     budget_mb = vram_num * 1024.0 if vram_num < 256.0 else vram_num
-
+ 
     # 2. KV Cache 精度映射
     kv_bytes = {
         "float32": 4.0, "fp32": 4.0, "f32": 4.0,
@@ -154,15 +154,19 @@ def vm2tokens(
         "q8_0": 34 / 32, "q5_1": 24 / 32, "q5_0": 22 / 32, "q4_1": 20 / 32, "q4_0": 18 / 32,
     }
     llama_types = {"f32", "f16", "bf16", "q8_0", "q5_1", "q5_0", "q4_1", "q4_0"}
-
+ 
     engine_name = str(engine).lower().strip()
     dtype_key = str(dtype).lower().strip()
-
+ 
     if engine_name.startswith("llama") and dtype_key not in llama_types:
         dtype_key = "f16"
-    elif engine_name.startswith("ninfer") and dtype_key not in kv_bytes:
-        dtype_key = "fp8"
-
+    elif engine_name.startswith("ninfer"):
+        dtype_key = {"bfloat16": "bf16", "": "bf16"}.get(dtype_key, dtype_key)
+        if dtype_key not in {"bf16", "int8"}:
+            raise ValueError(f"ninfer 的 kv_dtype 仅支持 bf16/int8，当前: {dtype}")
+    # ninfer 的 INT8 KV 为 group-64 量化，每 64 个元素附带 scale；scale 精度未核实，按 fp32 保守估计
+    kv_overhead = 1.0625 if engine_name.startswith("ninfer") and dtype_key == "int8" else 1.0
+ 
     # 3. 辅助内联解析：GGUF 规范
     def spec_gguf(meta: dict) -> tuple[list[int], int, int, int]:
         arch = meta.get("general.architecture")
@@ -174,25 +178,25 @@ def vm2tokens(
         if not n_layer or not n_head_raw:
             raise ValueError(f"GGUF 缺少 block_count / attention.head_count (arch={arch})")
         n_kv_layer = n_layer - int(g("nextn_predict_layers", 0))
-
+ 
         raw_heads = n_head_raw if isinstance(n_head_raw, (list, tuple)) else [int(n_head_raw)] * n_layer
         head_kv_val = g("attention.head_count_kv", n_head_raw)
         raw_heads_kv = head_kv_val if isinstance(head_kv_val, (list, tuple)) else [int(head_kv_val)] * n_layer
         heads = (list(raw_heads) + [raw_heads[-1]] * n_layer)[:n_layer]
         heads_kv = (list(raw_heads_kv) + [raw_heads_kv[-1]] * n_layer)[:n_layer]
-
+ 
         interval = int(g("full_attention_interval", 0))
         kv_heads = [heads_kv[i] for i in range(n_kv_layer) if heads_kv[i] > 0 and (interval <= 0 or (i + 1) % interval == 0)]
         k_dim = int(g("attention.key_length") or int(g("embedding_length")) // max(heads))
         v_dim = int(g("attention.value_length") or k_dim)
-
+ 
         fixed = 0
         d_inner, d_state, d_conv = g("ssm.inner_size"), g("ssm.state_size"), g("ssm.conv_kernel")
         if d_inner and d_state and d_conv:
             state = (int(d_conv) - 1) * (int(d_inner) + 2 * int(g("ssm.group_count", 1)) * int(d_state)) + int(d_state) * int(d_inner)
             fixed = (n_kv_layer - len(kv_heads)) * state * 4
         return kv_heads, k_dim, v_dim, fixed
-
+ 
     # 4. 辅助内联解析：HF / JSON 规范
     def spec_hf(cfg: dict) -> tuple[list[int], int, int, int]:
         cfg = cfg.get("text_config") or cfg
@@ -210,7 +214,7 @@ def vm2tokens(
             n_attn = n_layer
         head_dim = cfg.get("head_dim") or (hidden // n_head)
         return [cfg.get("num_key_value_heads") or n_head] * n_attn, head_dim, head_dim, 0
-
+ 
     # 5. 辅助内联解析：纯 Python GGUF 读取器
     def read_gguf_raw(gguf_path: Path) -> dict:
         meta = {}
@@ -229,7 +233,7 @@ def vm2tokens(
                         for _ in range(c): skip(it)
                 else:
                     f.seek(struct.calcsize(fmt[t]), 1)
-
+ 
             if f.read(4) != b"GGUF" or unpack("I") < 2:
                 raise ValueError(f"无效或不支持的 GGUF: {gguf_path}")
             unpack("Q")
@@ -251,15 +255,15 @@ def vm2tokens(
                 else:
                     skip(t)
         return meta
-
+ 
     # 6. 解析模型路径与格式分发
     p = Path(path)
     if not p.exists():
         raise FileNotFoundError(f"模型路径不存在: {path}")
-
+ 
     kv_heads, k_dim, v_dim, fixed = [], 0, 0, 0
     ggufs = [p] if p.is_file() and p.suffix.lower() == ".gguf" else (sorted(p.glob("*.gguf")) if p.is_dir() else [])
-
+ 
     if ggufs:
         meta = {}
         if importlib.util.find_spec("gguf") is not None:
@@ -274,27 +278,22 @@ def vm2tokens(
         if cfg_file.exists():
             kv_heads, k_dim, v_dim, fixed = spec_hf(json.loads(cfg_file.read_text(encoding="utf-8")))
         elif p.suffix.lower() == ".ninfer" or list(p.glob("*.ninfer") if p.is_dir() else []):
-            # 针对 .ninfer 制品：快速扫头部 JSON 字符串，未找到时套用 Qwen3.8-27B 默认拓扑
+            # .ninfer 是自有二进制格式，不猜头部；已核实的拓扑按文件名内置，其余请把 HF config.json 放到同目录
             target = p if p.is_file() else sorted(p.glob("*.ninfer"))[0]
-            header = target.read_bytes()[:65536].decode("latin-1", errors="ignore")
-            m_layer = re.search(r'"num_hidden_layers":\s*(\d+)', header)
-            m_heads = re.search(r'"num_key_value_heads":\s*(\d+)', header)
-            m_dim = re.search(r'"head_dim":\s*(\d+)', header)
-            
-            n_layers = int(m_layer.group(1)) if m_layer else 64
-            n_kv_heads = int(m_heads.group(1)) if m_heads else 16
-            head_dim = int(m_dim.group(1)) if m_dim else 128
-            kv_heads, k_dim, v_dim, fixed = [n_kv_heads] * n_layers, head_dim, head_dim, 0
+            known = {"qwen3_6_27b": ([4] * 16, 256, 256, 0)}  # 64 层、每 4 层 1 层全注意力(共16层)、4 个 KV 头、head_dim 256
+            if target.stem.lower() not in known:
+                raise ValueError(f"未内置 {target.name} 的 KV 拓扑，请把对应的 HF config.json 放到同目录")
+            kv_heads, k_dim, v_dim, fixed = known[target.stem.lower()]
         else:
             raise ValueError(f"无法识别该模型架构元数据: {path}")
-
+ 
     # 7. 计算 Token 容量
     tp = max(1, int(tensor_parallel))
     heads_per_gpu = sum(max(1, -(-h // tp)) for h in kv_heads)
-    bytes_per_token = heads_per_gpu * (k_dim + v_dim) * kv_bytes.get(dtype_key, 1.0)
+    bytes_per_token = heads_per_gpu * (k_dim + v_dim) * kv_bytes.get(dtype_key, 1.0) * kv_overhead
     if bytes_per_token <= 0:
         raise ValueError(f"注意力层字节计算异常: {path}")
-
+ 
     budget_bytes = budget_mb * 1024 * 1024 - fixed
     tokens = max(0, int(budget_bytes // bytes_per_token)) // align_step * align_step
     return max(align_step, tokens)

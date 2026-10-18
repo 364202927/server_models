@@ -2,19 +2,34 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
 import httpx
 
-from ...utils.common import info, error
+from ...utils.common import info, error, warn
+from ..model_spec import normalize_model_path
 from .baseInference import RawOutput, baseInference
+
+
+@lru_cache(maxsize=4)
+def _help_text(llama_bin: str) -> str:
+    """llama-server --help 每个二进制只取一次：一次加载要探测多个可选参数。"""
+    try:
+        out = subprocess.run([llama_bin, "--help"], capture_output=True, text=True, errors="replace", timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return out.stdout + out.stderr
 
 
 class llama(baseInference):
     """llama.cpp Server 转发引擎"""
 
     _FALLBACK_N_CTX = 8192
+    _DEFAULT_DRAFT_N = 3
+    _MAX_MTP_DRAFT = 6  # MTP 的 --spec-draft-n-max 实测甜点上限，再高收益递减
+    _MAX_DRAFT_N = 64  # 外部草稿模型可承受更长的草稿链
 
     def __init__(self) -> None:
         super().__init__()
@@ -35,11 +50,61 @@ class llama(baseInference):
     @staticmethod
     def _supports_flag(llama_bin: str, flag: str) -> bool:
         """旧版 llama-server 不认识的参数会直接启动失败，先从 --help 里确认再传。"""
-        try:
-            out = subprocess.run([llama_bin, "--help"], capture_output=True, text=True, errors="replace", timeout=30)
-        except (OSError, subprocess.TimeoutExpired):
-            return False
-        return flag in (out.stdout + out.stderr)
+        return flag in _help_text(llama_bin)
+
+    @classmethod
+    def _draft_path(cls, load_cfg: dict[str, Any]) -> Path | None:
+        """draft 兼容字符串/列表，取第一个非空项；目录则取首个 .gguf。"""
+        raw = load_cfg.get("draft") or []
+        items = [raw] if isinstance(raw, str) else list(raw)
+        first = next((str(item).strip() for item in items if str(item).strip()), "")
+        return cls._resolve_gguf_file(normalize_model_path(first)) if first else None
+
+    @staticmethod
+    def _lora_flags(load_cfg: dict[str, Any]) -> list[str]:
+        """LoRA 只接受本地 GGUF 适配器；lora 兼容字符串/列表，可叠加多个。"""
+        raw = load_cfg.get("lora") or ""
+        items = [raw] if isinstance(raw, str) else list(raw)
+        flags: list[str] = []
+        for item in items:
+            value = str(item or "").strip()
+            if not value:
+                continue
+            path = Path(normalize_model_path(value))
+            if not path.is_file():
+                raise FileNotFoundError(f"LoRA 文件不存在: {path}")
+            flags += ["--lora", str(path)]
+        return flags
+
+    @classmethod
+    def _draft_tokens(cls, load_cfg: dict[str, Any], cap: int) -> int:
+        return min(max(1, int(load_cfg.get("draft_tokens", cls._DEFAULT_DRAFT_N))), cap)
+
+    def _spec_flags(self, llama_bin: str, load_cfg: dict[str, Any]) -> tuple[list[str], dict[str, Any]]:
+        """草稿加速：显式 draft 模型优先，其次主模型内置 MTP；返回启动参数与生效信息。"""
+        result = {"draft_model": "", "draft_tokens": 0, "mtp_draft_tokens": 0}
+        draft = self._draft_path(load_cfg)
+        if draft:
+            tokens = self._draft_tokens(load_cfg, self._MAX_DRAFT_N)
+            if self._supports_flag(llama_bin, "draft-simple"):
+                spec = ["--spec-type", "draft-simple", "--spec-draft-n-max", str(tokens)]
+            elif self._supports_flag(llama_bin, "--draft-max"):  # 旧版没有 --spec-type
+                spec = ["--draft-max", str(tokens)]
+            else:
+                warn("[llama-server] 当前版本不支持外部草稿模型，已忽略 draft 配置；请更新 llama.cpp")
+                return [], result
+            if load_cfg.get("mtp"):
+                warn("[llama-server] draft 与 mtp 同时开启，仅使用外部草稿模型")
+            result.update(draft_model=str(draft), draft_tokens=tokens)
+            return ["-md", str(draft), *spec], result
+        if load_cfg.get("mtp"):
+            tokens = self._draft_tokens(load_cfg, self._MAX_MTP_DRAFT)
+            if not self._supports_flag(llama_bin, "draft-mtp"):
+                warn("[llama-server] 当前版本 --spec-type 不支持 draft-mtp，已忽略 mtp；请更新 llama.cpp")
+                return [], result
+            result["mtp_draft_tokens"] = tokens
+            return ["--spec-type", "draft-mtp", "--spec-draft-n-max", str(tokens)], result
+        return [], result
 
     def _create(self, model_path: str, load_cfg: dict[str, Any]) -> "llama":
         self._unload_engine()
@@ -53,6 +118,7 @@ class llama(baseInference):
         slots = max(1, int(load_cfg.get("parallel_slots", 1)))
         slot_ctx = calculated_n_ctx if slots == 1 else calculated_n_ctx // slots // 256 * 256  # 单槽配额
         llama_bin = shutil.which("llama-server")
+        spec_info = {"draft_model": "", "draft_tokens": 0, "mtp_draft_tokens": 0}
         if llama_bin:
             cmd = [
                 llama_bin,
@@ -79,6 +145,9 @@ class llama(baseInference):
                     cmd.append("--no-kv-unified")
                 if self._supports_flag(llama_bin, "--no-cache-idle-slots"):
                     cmd.append("--no-cache-idle-slots")  # 空闲槽 KV 留驻显存，配额已保证不会被清
+            cmd += self._lora_flags(load_cfg)
+            spec_cmd, spec_info = self._spec_flags(llama_bin, load_cfg)
+            cmd += spec_cmd
         else:
             raise FileNotFoundError("未找到 llama-server，请先在当前环境编译安装并加入 PATH")
 
@@ -97,6 +166,10 @@ class llama(baseInference):
         except httpx.HTTPError:
             total_slots = None
         info("[llama-server] 实际槽位数", total_slots, f"(配置 parallel_slots={slots})")
+        if spec_info["mtp_draft_tokens"]:
+            info("[llama-server] MTP 已启用", f"draft_tokens={spec_info['mtp_draft_tokens']}")
+        if spec_info["draft_model"]:
+            info("[llama-server] 外部草稿模型已启用", spec_info["draft_model"], f"draft_tokens={spec_info['draft_tokens']}")
         self._effective_load = {
             "engine": "llama",
             "context_length": calculated_n_ctx,
@@ -104,6 +177,8 @@ class llama(baseInference):
             "batch_size": batch_size,
             "parallel_slots": slots,
             "slot_context_length": slot_ctx,
+            "lora": load_cfg.get("lora") or "",
+            **spec_info,
         }
         self._sleep_capable = True
         return self

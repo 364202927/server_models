@@ -16,7 +16,8 @@
       "launch": true,
       "data_compression": "default",
       "load": {
-        "mtp": false,
+        "mtp": true,
+        "draft_tokens": 3,
         "lora": "",
         "draft": [],
         "useVram": 4096,

@@ -11,6 +11,7 @@
       "parallel_slots": 1,
       "gpu_offload_layers": -1,
       "tensor_parallel": 1,
+      "draft_tokens": 3,
       "dtype": "bfloat16"
     },
     "generation": {
@@ -58,7 +59,6 @@
   "ninfer": {
     "load": {
       "kv_dtype": "int8",
-      "draft_tokens": 3,
       "lm_head_draft": true
     },
     "generation": { }
