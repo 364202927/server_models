@@ -3,13 +3,18 @@ import { Settings, MessageSquare, Activity, Power, Loader2 } from "lucide-react"
 import { useAppStore } from "../store/useAppStore";
 
 export const Sidebar: React.FC = () => {
-  const { activePage, setActivePage, engineState, triggerEngineToggle } = useAppStore();
+  const { activePage, setActivePage, engineState, triggerEngineToggle, processes } = useAppStore();
 
   const navItems = [
-    { id: "config", label: "模型配置", icon: Settings },
-    { id: "test", label: "模型测试", icon: MessageSquare },
     { id: "monitor", label: "硬件与进程监控", icon: Activity },
+    { id: "config", label: "LLM配置", icon: Settings },
+    { id: "test", label: "模型测试", icon: MessageSquare },
   ] as const;
+
+  // 已加载 = 运行中 + 休眠在内存；停止按钮对两者都生效
+  const running = processes.filter((p) => p.state === "RUNNING").length;
+  const sleeping = processes.filter((p) => p.state === "SLEEPING_RAM").length;
+  const stateText = { connecting: "连接中", launching: "处理中", running: "运行中", idle: "空闲", error: "异常" }[engineState];
 
   const btnMeta = {
     connecting: { text: "网关启动中...", bg: "bg-slate-700 text-slate-400 cursor-not-allowed", spin: true },
@@ -45,7 +50,10 @@ export const Sidebar: React.FC = () => {
       <div className="pt-3 border-t border-slate-800">
         <div className="flex items-center justify-between text-xs text-slate-400 mb-2 px-1">
           <span>引擎状态</span>
-          <span className="uppercase font-mono">{engineState}</span>
+          <span className="font-mono">{stateText}</span>
+        </div>
+        <div className="mb-2 px-1 text-xs text-slate-500">
+          {running + sleeping === 0 ? "未加载模型" : `运行 ${running} · 休眠 ${sleeping}`}
         </div>
         <button
           onClick={triggerEngineToggle}

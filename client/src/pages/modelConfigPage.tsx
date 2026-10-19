@@ -3,10 +3,12 @@ import { Save, Plus, Trash2 } from "lucide-react";
 import { useAppStore } from "../store/useAppStore";
 import { ConfigFields, FieldGroup, ValueField, isPlainObject, type Json } from "../components/configFields";
 import { ENGINE_OPTIONS, FIELD_OPTIONS } from "../lib/configOptions";
+import { effectiveOf, engineOf, inheritedOf, overridesOf, type Section } from "../lib/modelConfig";
 
 type Tab = "models" | "settings";
 
 const TAB_LABELS: Record<Tab, string> = { models: "配置", settings: "设定" };
+const SECTIONS: Section[] = ["load", "generation"];
 const FILE_NAMES: Record<Tab, string> = { models: "models.json", settings: "modelSetting.json" };
 
 /** 菜单项：key 对应数据键，alert 为红字高亮（launch 为 true 的模型） */
@@ -129,7 +131,50 @@ export const ModelConfigPage: React.FC = () => {
     setSelected("");
   };
 
-  const renderMiddle = () => {
+  const isModel = tab === "models" && activeKey !== "defaults";
+
+  /** load / generation 分组：模型项展示“template + 引擎”继承后的全部可选项，其余项展示自身数据 */
+  const renderSection = (section: Section) => {
+    if (!isModel) {
+      return (
+        <FieldGroup title={section}>
+          <ConfigFields value={item[section] ?? {}} onChange={(next) => setItem({ ...item, [section]: next })} />
+        </FieldGroup>
+      );
+    }
+    const inherited = inheritedOf(draftSettings, engineOf(item), section);
+    return (
+      <FieldGroup title={section}>
+        <ConfigFields
+          removable={false}
+          value={effectiveOf(draftSettings, item, section)}
+          onChange={(next) => setItem({ ...item, [section]: overridesOf(next, inherited, item[section]) })}
+        />
+      </FieldGroup>
+    );
+  };
+
+  const renderBasics = () => {
+    if (!isModel) return null;
+    return (
+      <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-4">
+        <div className="flex flex-col gap-1 min-w-0">
+          <span className="font-mono text-xs text-slate-400">modelName</span>
+          <span className="truncate rounded border border-slate-800 bg-slate-950 px-2 py-1.5 font-mono text-xs text-blue-300">
+            {activeKey}
+          </span>
+        </div>
+        <ValueField name="engine" value={item.engine} options={FIELD_OPTIONS.engine} plain={false} onChange={(v) => setItem({ ...item, engine: v })} />
+        <ValueField name="launch" value={item.launch} options={FIELD_OPTIONS.launch} plain={false} onChange={(v) => setItem({ ...item, launch: v })} />
+        <ValueField name="data_compression" value={item.data_compression} options={FIELD_OPTIONS.data_compression} plain={false} onChange={(v) => setItem({ ...item, data_compression: v })} />
+        <div className="md:col-span-2 xl:col-span-4">
+          <ValueField name="path" value={item.path} options={[]} plain onChange={(v) => setItem({ ...item, path: v })} />
+        </div>
+      </div>
+    );
+  };
+
+  const renderBody = () => {
     if (tab === "models" && activeKey === "defaults") {
       return (
         <FieldGroup title="defaults">
@@ -137,44 +182,11 @@ export const ModelConfigPage: React.FC = () => {
         </FieldGroup>
       );
     }
-
-    if (tab === "models") {
-      return (
-        <>
-          {!item.path && <p className="text-xs text-amber-400">未填写 path，启动时将跳过该模型</p>}
-          <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
-            <div className="flex flex-col gap-1 min-w-0">
-              <span className="font-mono text-xs text-slate-400">modelName</span>
-              <span className="truncate rounded border border-slate-800 bg-slate-950 px-2 py-1.5 font-mono text-xs text-blue-300">
-                {activeKey}
-              </span>
-            </div>
-            <ValueField name="path" value={item.path} options={[]} plain onChange={(v) => setItem({ ...item, path: v })} />
-            <ValueField
-              name="engine"
-              value={item.engine}
-              options={FIELD_OPTIONS.engine}
-              plain={false}
-              onChange={(v) => setItem({ ...item, engine: v })}
-            />
-            <ValueField
-              name="launch"
-              value={item.launch}
-              options={FIELD_OPTIONS.launch}
-              plain={false}
-              onChange={(v) => setItem({ ...item, launch: v })}
-            />
-          </div>
-          <FieldGroup title="load">
-            <ConfigFields value={item.load ?? {}} onChange={(load) => setItem({ ...item, load })} />
-          </FieldGroup>
-        </>
-      );
-    }
-
     return (
       <>
-        {isDefault && (
+        {isModel && !item.path && <p className="text-xs text-amber-400">未填写 path，启动时将跳过该模型</p>}
+        {renderBasics()}
+        {tab === "settings" && isDefault && (
           <FieldGroup title="team">
             <ConfigFields
               value={item.team ?? {}}
@@ -183,9 +195,10 @@ export const ModelConfigPage: React.FC = () => {
             />
           </FieldGroup>
         )}
-        <FieldGroup title="load">
-          <ConfigFields value={item.load ?? {}} onChange={(load) => setItem({ ...item, load })} />
-        </FieldGroup>
+        {/* load 与 generation 并排等宽，字段网格随容器宽度自适应 */}
+        <div className="grid grid-cols-1 items-start gap-4 xl:grid-cols-2">
+          {SECTIONS.map((section) => <React.Fragment key={section}>{renderSection(section)}</React.Fragment>)}
+        </div>
       </>
     );
   };
@@ -209,7 +222,7 @@ export const ModelConfigPage: React.FC = () => {
       <div className="flex items-start gap-4">
         {/* 左：菜单 */}
         <aside className="w-52 shrink-0 space-y-3 rounded-lg border border-slate-800 bg-slate-900/60 p-3">
-          <div className="px-1 text-xs font-semibold text-slate-400">{tab === "models" ? "models.json" : "modelSetting.json"}</div>
+          <div className="px-1 text-xs font-semibold text-slate-400">{FILE_NAMES[tab]}</div>
           <nav className="max-h-[60vh] space-y-1 overflow-y-auto">
             {menu.map((m) => {
               const active = m.key === activeKey;
@@ -251,41 +264,31 @@ export const ModelConfigPage: React.FC = () => {
           </div>
         </aside>
 
-        {/* 中：所选项的数据 */}
-        <section className="min-w-0 flex-1 space-y-4">
-          <div className="flex items-center justify-between">
-            <h3 className="font-mono text-sm font-bold text-blue-300">
+        {/* 右：标题栏（保存/删除）+ 所选项数据 */}
+        <section key={`${tab}:${activeKey}`} className="min-w-0 flex-1 space-y-4">
+          <div className="flex items-center justify-between gap-3">
+            <h3 className="truncate font-mono text-sm font-bold text-blue-300">
               {isDefault ? "默认设置" : activeKey}
             </h3>
-            {!isDefault && (
-              <button onClick={removeItem} className="text-slate-500 hover:text-rose-400" title="删除">
-                <Trash2 size={15} />
+            <div className="flex shrink-0 items-center gap-3">
+              {tip && <span className={`text-xs ${tip.startsWith("❌") ? "text-rose-400" : "text-emerald-400"}`}>{tip}</span>}
+              {!isDefault && (
+                <button onClick={removeItem} className="text-slate-500 hover:text-rose-400" title="删除">
+                  <Trash2 size={15} />
+                </button>
+              )}
+              <button
+                onClick={handleSave}
+                className="flex items-center gap-2 rounded-lg bg-blue-600 px-4 py-1.5 text-sm font-medium hover:bg-blue-500"
+              >
+                <Save size={15} />
+                <span>保存 {FILE_NAMES[tab]}</span>
+                {dirty && <span className="text-xs text-amber-300">· 未保存</span>}
               </button>
-            )}
+            </div>
           </div>
-          {renderMiddle()}
+          {renderBody()}
         </section>
-
-        {/* 右：generation + 保存 */}
-        <aside className="sticky top-0 w-96 shrink-0 space-y-3 rounded-lg border border-slate-800 bg-slate-900/60 p-3">
-          <div className="flex items-center justify-between gap-2">
-            <span className="font-mono text-xs font-bold text-blue-300">generation</span>
-            {tip && <span className={`text-xs ${tip.startsWith("❌") ? "text-rose-400" : "text-emerald-400"}`}>{tip}</span>}
-          </div>
-          {tab === "models" && activeKey === "defaults" ? (
-            <p className="text-xs text-slate-500">defaults 不包含 generation 设定</p>
-          ) : (
-            <ConfigFields value={item.generation ?? {}} onChange={(generation) => setItem({ ...item, generation })} />
-          )}
-          <button
-            onClick={handleSave}
-            className="flex w-full items-center justify-center gap-2 rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium hover:bg-blue-500"
-          >
-            <Save size={15} />
-            <span>保存 {FILE_NAMES[tab]}</span>
-            {dirty && <span className="text-xs text-amber-300">· 未保存</span>}
-          </button>
-        </aside>
       </div>
     </div>
   );

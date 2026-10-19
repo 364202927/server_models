@@ -68,7 +68,7 @@ class msgHandler:
             adim_ID.eHandshake.value: lambda _: {"status": "ready"},
             adim_ID.eStatus.value: lambda _: models_mgr.status() | {
                 "queue_length": self.pending,
-                "engine_state": "launching" if self._is_launching else ("running" if getattr(models_mgr, "active_models", None) else "idle"),
+                "engine_state": "launching" if self._is_launching else ("running" if any(s.isAlive for s in models_mgr.specs.values()) else "idle"),
             },
             adim_ID.eHardwareInfo.value: lambda _: detect_hardware().to_dict(),
             adim_ID.eModelsList.value: lambda _: {"models": list(models_mgr.specs)},

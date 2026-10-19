@@ -121,10 +121,12 @@ interface ConfigFieldsProps {
   plainKeys?: string[];
   /** 额外候选值，优先于 FIELD_OPTIONS */
   extraOptions?: Record<string, string[]>;
+  /** 为 false 时字段不可删除（继承字段删掉后会被继承值重新补回） */
+  removable?: boolean;
 }
 
 /** 按 JSON 结构递归渲染：嵌套对象成分组，其余成字段；以下划线开头的键（如 _comment）不展示但原样保留。列数按容器宽度变化 */
-export const ConfigFields: React.FC<ConfigFieldsProps> = ({ value, onChange, plainKeys = [], extraOptions = {} }) => {
+export const ConfigFields: React.FC<ConfigFieldsProps> = ({ value, onChange, plainKeys = [], extraOptions = {}, removable = true }) => {
   const [newKey, setNewKey] = useState("");
 
   const setKey = (key: string, next: unknown) => onChange({ ...value, [key]: next });
@@ -150,12 +152,13 @@ export const ConfigFields: React.FC<ConfigFieldsProps> = ({ value, onChange, pla
           .map(([key, child]) =>
             isPlainObject(child) ? (
               <div key={key} className="col-span-full">
-                <FieldGroup title={key} onRemove={() => removeKey(key)}>
+                <FieldGroup title={key} onRemove={removable ? () => removeKey(key) : undefined}>
                   <ConfigFields
                     value={child}
                     onChange={(next) => setKey(key, next)}
                     plainKeys={plainKeys}
                     extraOptions={extraOptions}
+                    removable={removable}
                   />
                 </FieldGroup>
               </div>
@@ -167,7 +170,7 @@ export const ConfigFields: React.FC<ConfigFieldsProps> = ({ value, onChange, pla
                 options={extraOptions[key] ?? FIELD_OPTIONS[key] ?? []}
                 plain={plainKeys.includes(key)}
                 onChange={(next) => setKey(key, next)}
-                onRemove={plainKeys.includes(key) ? undefined : () => removeKey(key)}
+                onRemove={plainKeys.includes(key) || !removable ? undefined : () => removeKey(key)}
               />
             ),
           )}

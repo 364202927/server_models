@@ -9,6 +9,7 @@ import {
   unwrapAdmin,
 } from "../lib/gateway";
 
+export type Page = "config" | "test" | "monitor";
 export type EngineState = "connecting" | "launching" | "running" | "idle" | "error";
 
 export interface LogRecord {
@@ -18,7 +19,7 @@ export interface LogRecord {
 }
 
 interface AppState {
-  activePage: "config" | "test" | "monitor";
+  activePage: Page;
   engineState: EngineState;
   logs: LogRecord[];
   cursor: number;
@@ -29,7 +30,7 @@ interface AppState {
   // 网关 /v1/models 返回的可用模型，不依赖本地配置文件（Mac 预览时也能拿到）
   remoteModelIds: string[];
 
-  setActivePage: (page: "config" | "test" | "monitor") => void;
+  setActivePage: (page: Page) => void;
   appendLog: (tags: string, msg: string) => void;
   loadLocalConfigs: () => Promise<void>;
   loadRemoteModels: () => Promise<void>;
@@ -53,7 +54,7 @@ const toProcessRow = (model: Record<string, any>) => ({
 });
 
 export const useAppStore = create<AppState>((set, get) => ({
-  activePage: "config",
+  activePage: "monitor",
   engineState: "connecting",
   logs: [],
   cursor: 0,
@@ -170,10 +171,13 @@ export const useAppStore = create<AppState>((set, get) => ({
     const status = await sendAdminCmd(ADMIN.status);
     if (status) {
       const models: Record<string, any>[] = Array.isArray(status.models) ? status.models : [];
-      set((state) => ({
+      // 后端 engine_state 只能区分 launching，运行态以各模型 state 为准，避免已加载仍显示“启动模型”
+      const loading = status.engine_state === "launching" || models.some((m) => m.state === "LOADING");
+      const loaded = models.some((m) => m.state === "RUNNING" || m.state === "SLEEPING_RAM");
+      set({
         processes: models.map(toProcessRow),
-        engineState: (status.engine_state as EngineState) || state.engineState,
-      }));
+        engineState: loading ? "launching" : loaded ? "running" : "idle",
+      });
     }
 
     // 1002：硬件信息，回包是 HardwareInfo 字典，降频拉取

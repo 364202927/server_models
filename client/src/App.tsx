@@ -73,6 +73,10 @@ export default function App() {
 
     bootSequence();
 
+    // 取消鼠标右键菜单
+    const blockContextMenu = (e: MouseEvent) => e.preventDefault();
+    document.addEventListener("contextmenu", blockContextMenu);
+
     // 仅桌面端拦截关闭：先发 1099 保存日志释放显存，再关停 WSL
     let unlistenPromise: Promise<() => void> | undefined;
     if (isTauri()) {
@@ -97,6 +101,7 @@ export default function App() {
 
     return () => {
       isCancelled = true;
+      document.removeEventListener("contextmenu", blockContextMenu);
       if (pollTimer) clearInterval(pollTimer);
       unlistenPromise?.then((unlisten) => unlisten());
     };
