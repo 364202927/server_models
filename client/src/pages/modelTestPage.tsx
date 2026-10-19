@@ -6,7 +6,7 @@ import { gatewayBase, gatewayHeaders } from "../lib/gateway";
 export const ModelTestPage: React.FC = () => {
   const { models, settings, remoteModelIds } = useAppStore();
   // 优先用网关实际可用的模型，本地配置仅作回退
-  const modelIds = remoteModelIds.length > 0 ? remoteModelIds : Object.keys(models || {});
+  const modelIds = remoteModelIds.length > 0 ? remoteModelIds : Object.keys(models?.models || {});
   const [pickedModel, setSelectedModel] = useState("");
   const selectedModel = modelIds.includes(pickedModel) ? pickedModel : modelIds[0] || "";
   const [input, setInput] = useState("");
