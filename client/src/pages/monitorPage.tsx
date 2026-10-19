@@ -29,8 +29,9 @@ export const MonitorPage: React.FC = () => {
             {processes.map((proc, idx) => (
               <div key={idx} className="bg-slate-950 border border-slate-800 rounded p-3 text-xs font-mono space-y-1">
                 <div className="text-slate-200 font-bold">Model: {proc.model || "-"}</div>
-                <div className="text-slate-400">PID: {proc.pid || "-"}</div>
-                <div className="text-slate-400">空闲回收倒计时: {proc.idle_left ?? "-"}s</div>
+                <div className="text-slate-400">状态: {proc.state || "-"}</div>
+                <div className="text-slate-400">显存: {proc.vram ?? 0} MB</div>
+                {proc.error ? <div className="text-rose-400">错误: {proc.error}</div> : null}
               </div>
             ))}
           </div>

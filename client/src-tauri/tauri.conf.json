@@ -13,6 +13,7 @@
     "windows": [
       {
         "label": "main",
+        "create": false,
         "title": "SERVER MODELS",
         "width": 1280,
         "height": 800,

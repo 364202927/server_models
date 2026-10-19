@@ -1,6 +1,13 @@
 import { create } from "zustand";
 import { desktopInvoke, isTauri } from "../lib/bridge";
-import { gatewayBase, gatewayHeaders } from "../lib/gateway";
+import {
+  ADMIN,
+  formatHardware,
+  gatewayBase,
+  gatewayHeaders,
+  gatewayState,
+  unwrapAdmin,
+} from "../lib/gateway";
 
 export type EngineState = "connecting" | "launching" | "running" | "idle" | "error";
 
@@ -32,6 +39,18 @@ interface AppState {
   pollStatusAndLogs: () => Promise<void>;
   clearLogs: () => void;
 }
+
+/** 硬件检测含 CUDA 查询，轮询降到约 6s 一次 */
+const HARDWARE_EVERY = 4;
+let pollTick = 0;
+
+/** 本地模型状态转成监控页的进程行 */
+const toProcessRow = (model: Record<string, any>) => ({
+  model: model.id,
+  state: model.state,
+  vram: model.gpu_memory_mb ?? 0,
+  error: model.error,
+});
 
 export const useAppStore = create<AppState>((set, get) => ({
   activePage: "config",
@@ -106,9 +125,14 @@ export const useAppStore = create<AppState>((set, get) => ({
         headers: gatewayHeaders(settings),
         body: JSON.stringify({ message_id: messageId, args }),
       });
-      if (!res.ok) return null;
-      return await res.json();
-    } catch {
+      if (!res.ok) {
+        gatewayState.lastError = `HTTP ${res.status}`;
+        return null;
+      }
+      gatewayState.lastError = "";
+      return unwrapAdmin(await res.json());
+    } catch (err) {
+      gatewayState.lastError = String(err);
       return null;
     }
   },
@@ -119,28 +143,42 @@ export const useAppStore = create<AppState>((set, get) => ({
 
     if (engineState === "running") {
       set({ engineState: "launching" });
-      const res = await sendAdminCmd(1002);
+      const res = await sendAdminCmd(ADMIN.unloadAll);
       set({ engineState: res ? "idle" : "error" });
       return;
     }
 
     set({ engineState: "launching" });
-    const res = await sendAdminCmd(1001);
+    const res = await sendAdminCmd(ADMIN.autolaunch);
     if (!res) set({ engineState: "error" });
   },
 
   pollStatusAndLogs: async () => {
     const { cursor, sendAdminCmd } = get();
-    const res = await sendAdminCmd(1003, { cursor });
-    if (!res) return;
 
-    const newLogs: LogRecord[] = Array.isArray(res.logs) ? res.logs : [];
-    set((state) => ({
-      cursor: res.cursor ?? state.cursor,
-      logs: newLogs.length > 0 ? [...state.logs, ...newLogs].slice(-2000) : state.logs,
-      hardware: res.hardware || state.hardware,
-      processes: res.processes || state.processes,
-      engineState: res.is_running ? "running" : state.engineState === "launching" ? "launching" : "idle",
-    }));
+    // 1008：增量日志，回包为 {cursor, logs}
+    const logRes = await sendAdminCmd(ADMIN.logs, { cursor });
+    const newLogs: LogRecord[] = Array.isArray(logRes?.logs) ? logRes.logs : [];
+    if (logRes) {
+      set((state) => ({
+        cursor: logRes.cursor ?? state.cursor,
+        logs: newLogs.length > 0 ? [...state.logs, ...newLogs].slice(-2000) : state.logs,
+      }));
+    }
+
+    // 1001：系统状态，回包为 {models, queue_length, engine_state}
+    const status = await sendAdminCmd(ADMIN.status);
+    if (status) {
+      const models: Record<string, any>[] = Array.isArray(status.models) ? status.models : [];
+      set((state) => ({
+        processes: models.map(toProcessRow),
+        engineState: (status.engine_state as EngineState) || state.engineState,
+      }));
+    }
+
+    // 1002：硬件信息，回包是 HardwareInfo 字典，降频拉取
+    if (pollTick++ % HARDWARE_EVERY !== 0) return;
+    const text = formatHardware(await sendAdminCmd(ADMIN.hardware));
+    if (text) set({ hardware: text });
   },
 }));

@@ -11,6 +11,11 @@ tauri-build = "=2.7.0"
 [dependencies]
 tauri = "=2.12.0"
 
+# 没有这个 feature 时 tauri 会按 dev 模式编译：不内嵌 dist，改为连 http://localhost:1420
+# tauri build 会自动带上它；直接 cargo build 时必须显式 --features custom-protocol
+[features]
+custom-protocol = ["tauri/custom-protocol"]
+
 [profile.release]
 codegen-units = 1
 lto = true

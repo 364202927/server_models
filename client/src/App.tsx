@@ -2,6 +2,7 @@ import { useEffect } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useAppStore } from "./store/useAppStore";
 import { desktopInvoke, isTauri } from "./lib/bridge";
+import { ADMIN, gatewayState } from "./lib/gateway";
 import { Sidebar } from "./components/sidebar";
 import { LogPanel } from "./components/logPanel";
 import { ModelConfigPage } from "./pages/modelConfigPage";
@@ -19,33 +20,50 @@ export default function App() {
       await loadLocalConfigs();
       // 拉起失败（Mac / 浏览器预览 / 后端已在别处运行）不中断，仍尝试直连网关
       try {
-        await desktopInvoke("start_wsl_backend");
+        const res = await desktopInvoke<string>("start_wsl_backend");
+        appendLog("INFO", `已触发后端拉起: ${res}`);
       } catch (err) {
         appendLog("WARN", `未拉起本地后端，尝试直连网关: ${err}`);
       }
 
-      // 握手探测 (最多等待 15 次，每次间隔 1s)
+      // 握手探测：WSL 冷启动 + conda 激活 + python 加载 torch 通常要 20s 以上，给到 60s
       let connected = false;
-      for (let i = 0; i < 15; i++) {
+      for (let i = 0; i < 60; i++) {
         if (isCancelled) return;
         await new Promise((r) => setTimeout(r, 1000));
-        const pong = await sendAdminCmd(1000);
+        // 回包已在 sendAdminCmd 里拆掉了外层信封，业务状态直接取 status
+        const pong = await sendAdminCmd(ADMIN.handshake);
         if (pong?.status === "ready") {
           connected = true;
+          appendLog("INFO", `网关握手成功（第 ${i + 1} 次，耗时约 ${i + 1}s）`);
           break;
         }
+        if (i > 0 && (i + 1) % 10 === 0) appendLog("INFO", `等待网关握手... 已重试 ${i + 1} 次`);
       }
 
       if (!connected || isCancelled) {
+        const reason = gatewayState.lastError || "无响应";
+        appendLog("ERROR", `网关握手失败：8666 端口 60s 内无响应（最近错误: ${reason}）`);
+        if (isTauri()) {
+          try {
+            const tail = await desktopInvoke<string>("read_backend_log");
+            tail.split("\n").filter(Boolean).forEach((line) => appendLog("BACKEND", line));
+          } catch (err) {
+            appendLog("WARN", `读取后端日志失败: ${err}`);
+          }
+        }
         useAppStore.setState({ engineState: "error" });
         return;
       }
 
       await loadRemoteModels();
+      const modelCount = useAppStore.getState().remoteModelIds.length;
+      appendLog("INFO", `网关返回可用模型 ${modelCount} 个`);
 
-      // 界面完全就绪后，唯一一次自动触发后端加载模型
+      // 后端 autolaunch 会自行加载 launch=true 的模型，这里只拉一次状态并开始轮询
       useAppStore.setState({ engineState: "launching" });
-      await sendAdminCmd(1001);
+      await sendAdminCmd(ADMIN.status);
+      appendLog("INFO", "已请求后端状态，等待模型加载（关注下方轮询日志）");
 
       // 开启 1.5s 状态与日志低频轮询
       pollTimer = window.setInterval(() => {
@@ -64,7 +82,7 @@ export default function App() {
         if (pollTimer) clearInterval(pollTimer);
 
         await Promise.race([
-          sendAdminCmd(1099),
+          sendAdminCmd(ADMIN.stopped),
           new Promise((r) => setTimeout(r, 2000)),
         ]);
 

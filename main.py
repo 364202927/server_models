@@ -37,7 +37,8 @@ if __name__ == "__main__":
     async def _run() -> None:
         tasks = [asyncio.create_task(_reaper(), name="reaper")]
         # 非客户端模式且在交互终端下，才启动终端交互输入
-        if not args.client and sys.stdin.isatty():
+        # 被 GUI 拉起时 fd0 可能已关闭，此时 sys.stdin 为 None，必须判空
+        if not args.client and sys.stdin is not None and sys.stdin.isatty():
             tasks.append(asyncio.create_task(console.run(), name="console"))
         if kApi:
             tasks.append(asyncio.create_task(server.run(), name="fastapi"))

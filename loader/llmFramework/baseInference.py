@@ -68,7 +68,7 @@ class baseInference(ABC):
     """推理框架抽象基类：Server 模式基类"""
 
     _RAW_MEMO_MAX = 256
-    _STARTUP_TIMEOUT = 180.0
+    _STARTUP_TIMEOUT = 600.0  # 大模型（20GB+）从机械盘/WSL 挂载盘加载常超 3 分钟，留足余量
     _MIN_GEN_RESERVE = 4096  # 生成预留：prompt + 预留放不进单槽就拒绝
     _WARN_USAGE = 0.80  # prompt 占单槽比例达到此值时打警告日志
     _TOOL_RETRY = 1  # 工具调用可确定地失败（非法 JSON / 未闭合 / 未知工具 / 缺必填参数 / 空输出）时的静默重试次数；0 = 关闭
