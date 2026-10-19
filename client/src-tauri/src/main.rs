@@ -315,6 +315,16 @@ fn main() {
     install_crash_logger();
 
     tauri::Builder::default()
+        // 单实例守卫必须最先注册：重复启动时新进程只把已有窗口提到前台，随后自行退出
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            use tauri::Manager;
+
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.unminimize();
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }))
         .setup(|app| {
             build_main_window(app)?;
             Ok(())

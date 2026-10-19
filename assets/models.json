@@ -1,4 +1,4 @@
-{
+﻿{
   "defaults": {
     "sleepTime": 0,
     "server": {
@@ -13,7 +13,7 @@
     "qwen3.8-27B-code": {
       "path": "D:/ai/models/Qwen3.8-27b-code/Qwen3.8-27B-Coder390-EfficientThink-Q6_K-MTP.gguf",
       "engine": "llama",
-      "launch": true,
+      "launch": false,
       "data_compression": "default",
       "load": {
         "mtp": true,
