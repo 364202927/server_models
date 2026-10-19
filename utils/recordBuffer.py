@@ -12,16 +12,10 @@ from typing import Any
 
 
 def _now_string() -> str:
-    # 与 Console 日志保持一致，记录时间精确到秒即可。
     return datetime.now().astimezone().isoformat(timespec="seconds")
 
-
 class recordBuffer:
-    """保存日志等结构化记录的有界缓冲区。
-
-    每条记录包含 ``id``、``time``、``tags`` 和 ``data``。内部序号只用于
-    正确追踪新增/未保存记录，即使 ``deque`` 淘汰旧记录也不会错过新日志。
-    """
+    """保存日志等结构化记录的有界缓冲区。"""
 
     def __init__(self, filePath: str = "", max_size: int = 1024) -> None:
         if max_size <= 0:
@@ -67,12 +61,7 @@ class recordBuffer:
                 results.append(actual == expected)
         return all(results) if match else any(results)
 
-    def get(
-        self,
-        se_time: tuple[str, str] | None = None,
-        match: bool = True,
-        **kwargs: Any,
-    ) -> list[dict[str, Any]] | dict[str, Any] | None:
+    def get(self,se_time: tuple[str, str] | None = None,match: bool = True,**kwargs: Any) -> list[dict[str, Any]] | dict[str, Any] | None:
         """按时间、标签或数据字段查询；传入 ``id`` 时返回单条记录。"""
         with self._lock:
             if kwargs.get("id"):
@@ -99,6 +88,17 @@ class recordBuffer:
             if records:
                 self._printed_sequence = int(records[-1]["_sequence"])
             return [self._public_record(record) or {} for record in records]
+
+    def get_since(self, cursor: int) -> tuple[list[dict[str, Any]], int]:
+        """按外部游标 cursor (对应 _sequence) 获取增量日志，不影响 _printed_sequence。"""
+        with self._lock:
+            records = [record for record in self._buffer if int(record.get("_sequence", 0)) > cursor]
+            next_cursor = int(self._buffer[-1]["_sequence"]) if self._buffer else cursor
+            public_records = [
+                dict(self._public_record(r) or {}, seq=int(r.get("_sequence", 0)))
+                for r in records
+            ]
+            return public_records, next_cursor
 
     def update(self, id: str, **kwargs: Any) -> dict[str, Any]:
         with self._lock:
@@ -131,11 +131,16 @@ class recordBuffer:
             for record in unsaved:
                 day = str(record.get("time", ""))[:10] or datetime.now().strftime("%Y-%m-%d")
                 groups[day].append(self._public_record(record) or {})
-            self._filePath.mkdir(parents=True, exist_ok=True)
-            for day, records in groups.items():
-                with (self._filePath / f"{day}.jsonl").open("a", encoding="utf-8") as file:
-                    for record in records:
-                        file.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+            
+            try:
+                self._filePath.mkdir(parents=True, exist_ok=True)
+                for day, records in groups.items():
+                    with (self._filePath / f"{day}.jsonl").open("a", encoding="utf-8") as file:
+                        for record in records:
+                            file.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+            except OSError:
+                return False
+
             self._saved_sequence = int(unsaved[-1]["_sequence"])
             return True
 
@@ -157,26 +162,29 @@ class recordBuffer:
             for filename in files:
                 if not filename.is_file():
                     continue
-                with filename.open("r", encoding="utf-8") as file:
-                    for line in file:
-                        if not line.strip():
-                            continue
-                        try:
-                            record = json.loads(line)
-                        except json.JSONDecodeError:
-                            continue
-                        record_id = str(record.get("id", ""))
-                        if not record_id or record_id in seen:
-                            continue
-                        record["_sequence"] = self._next_sequence
-                        self._next_sequence += 1
-                        evicted = self._buffer[0] if len(self._buffer) == self._buffer.maxlen else None
-                        self._buffer.append(record)
-                        if evicted is not None:
-                            self._index_map.pop(str(evicted.get("id", "")), None)
-                        self._index_map[record_id] = record
-                        seen.add(record_id)
-                        loaded += 1
+                try:
+                    with filename.open("r", encoding="utf-8") as file:
+                        for line in file:
+                            if not line.strip():
+                                continue
+                            try:
+                                record = json.loads(line)
+                            except json.JSONDecodeError:
+                                continue
+                            record_id = str(record.get("id", ""))
+                            if not record_id or record_id in seen:
+                                continue
+                            record["_sequence"] = self._next_sequence
+                            self._next_sequence += 1
+                            evicted = self._buffer[0] if len(self._buffer) == self._buffer.maxlen else None
+                            self._buffer.append(record)
+                            if evicted is not None:
+                                self._index_map.pop(str(evicted.get("id", "")), None)
+                            self._index_map[record_id] = record
+                            seen.add(record_id)
+                            loaded += 1
+                except OSError:
+                    continue
             if self._buffer:
                 last_sequence = int(self._buffer[-1].get("_sequence", 0))
                 self._saved_sequence = last_sequence
@@ -198,7 +206,6 @@ class recordBuffer:
         with self._lock:
             return [self._public_record(record) or {} for record in self._buffer]
 
-    # 新代码可使用 snake_case；保留 camelCase 兼容参考项目调用方式。
     get_new = getNew
     save_to_file = save2File
     read_file = readFile

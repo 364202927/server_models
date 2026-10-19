@@ -20,7 +20,6 @@ from .common import (
     kLog,
     kWarn,
     log,
-    set_console_active,
     warn,
 )
 from .recordBuffer import RecordBuffer
@@ -166,7 +165,6 @@ class Console:
         queue: asyncio.Queue[str] = asyncio.Queue()
         cleanup = self._initInput(loop, queue)
         current_input = ""
-        set_console_active(True)
         self._write(f"{kColor['magenta']}>>> {kReset}")
         try:
             while True:
@@ -197,7 +195,6 @@ class Console:
                     self._write(char)
                 await self._printNew(current_input)
         finally:
-            set_console_active(False)
             cleanup()
             self._log_buffer.save2File()
 

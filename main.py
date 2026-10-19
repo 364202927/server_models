@@ -1,23 +1,15 @@
 from __future__ import annotations
 
-import asyncio,sys
+import argparse
+import asyncio
+import sys
 from pathlib import Path
-if __package__ in (None, ""):
-    # 直接执行 ``python main.py`` 时把项目父目录加入导入路径。
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-    from server_models.loader import models_mgr
-    from server_models.utils.gateway import gateway
-    from server_models.utils.console import Console
-    from server_models.utils.common import kApi, info, save_logs
-    from server_models.utils.hardware import hardware_summary
-    from server_models.msgHandler import msgHandler
-else:
-    from .loader import models_mgr
-    from .utils.gateway import gateway
-    from .utils.console import Console
-    from .utils.common import kApi, info, save_logs
-    from .utils.hardware import hardware_summary
-    from .msgHandler import msgHandler
+from .loader import models_mgr
+from .msgHandler import msgHandler
+from .utils.common import info, kApi, save_logs, set_console_active
+from .utils.console import Console
+from .utils.gateway import gateway
+from .utils.hardware import hardware_summary
 
 
 REAP_INTERVAL_SEC = 30
@@ -33,30 +25,37 @@ async def _reaper() -> None:
         if reaped:
             info("空闲回收", reaped)
 
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(prog="server_models.main", description="模型服务入口")
+    parser.add_argument("--client", action="store_true", help="以客户端辅助模式运行（关闭控制台输入与自动启动）")
+    return parser.parse_args(argv)
+
+# 只能使用-m加载
 if __name__ == "__main__":
+    args = parse_args()
     async def _run() -> None:
-        # 启动顺序:1.初始化并打印硬件 2.按 launch 加载模型
-        print("硬件信息\n" + hardware_summary())
         tasks = [asyncio.create_task(_reaper(), name="reaper")]
-        if sys.stdin.isatty():
+        # 非客户端模式且在交互终端下，才启动终端交互输入
+        if not args.client and sys.stdin.isatty():
             tasks.append(asyncio.create_task(console.run(), name="console"))
         if kApi:
             tasks.append(asyncio.create_task(server.run(), name="fastapi"))
-        if len(tasks) == 1:
-            tasks[0].cancel()
+        if not tasks:
             return
-
-        # 加载模型耗时且可能卡住：放后台线程，不能挡住 console/fastapi 启动，也不进 wait 集合
-        launch = asyncio.create_task(asyncio.to_thread(models_mgr.autolaunch), name="autolaunch")
+        # 客户端模式下不主动拉起模型，等待前端指令触发
+        launch = None
+        if not args.client:
+            launch = asyncio.create_task(asyncio.to_thread(models_mgr.autolaunch), name="autolaunch")
         try:
             done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
             for task in pending:
                 task.cancel()
             await asyncio.gather(*pending, return_exceptions=True)
         finally:
-            # 先杀引擎子进程：加载线程的健康检查随之返回，线程池才能正常收尾；否则退出会死等、显存不释放
             await asyncio.shield(asyncio.to_thread(models_mgr.unload_all))
-            await asyncio.gather(launch, return_exceptions=True)
+            if launch is not None:
+                await asyncio.gather(launch, return_exceptions=True)
 
         for task in done:
             if not task.cancelled():
@@ -64,13 +63,16 @@ if __name__ == "__main__":
                 if exc and not isinstance(exc, (KeyboardInterrupt, asyncio.CancelledError)):
                     raise exc
     #
+    print("硬件信息\n" + hardware_summary())
+    set_console_active(True)
     handler = msgHandler()
     server = gateway(handler)
-    console = Console(command_handler=lambda message_id, args: handler.handle(message_id, args, source="console"))
+    console = Console(command_handler=lambda message_id, msg_args: handler.handle(message_id, msg_args, source="console"))
     app = server.app
     try:
         asyncio.run(_run())
     except KeyboardInterrupt:
         pass
     finally:
-        save_logs()#记录log
+        set_console_active(False)
+        save_logs()
