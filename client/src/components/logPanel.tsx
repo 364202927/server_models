@@ -9,7 +9,7 @@ const TAG_COLORS: Record<string, string> = {
   LOG: "text-slate-200",
 };
 
-export const logPanel: React.FC = () => {
+export const LogPanel: React.FC = () => {
   const { logs, clearLogs } = useAppStore();
   const [visible, setVisible] = useState(true);
   const [filter, setFilter] = useState<string>("ALL");
@@ -77,7 +77,7 @@ export const logPanel: React.FC = () => {
             const colorClass = TAG_COLORS[tag] || "text-slate-200";
             return (
               <div
-                key={item.seq_id ?? idx}
+                key={item.seq_id != null ? `seq-${item.seq_id}` : `local-${idx}`}
                 style={{ contentVisibility: "auto", containIntrinsicSize: "20px" }}
                 className={`leading-relaxed whitespace-pre-wrap break-all ${colorClass}`}
               >

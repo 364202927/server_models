@@ -1,0 +1,18 @@
+[package]
+name = "server-models-client"
+version = "0.1.0"
+description = "SERVER MODELS 桌面控制台"
+edition = "2021"
+
+[build-dependencies]
+# 版本与 @tauri-apps/cli / @tauri-apps/api 的 2.12.0 对齐，升级时需一起改
+tauri-build = "=2.7.0"
+
+[dependencies]
+tauri = "=2.12.0"
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true

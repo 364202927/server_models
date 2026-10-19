@@ -2,7 +2,7 @@ import React from "react";
 import { Cpu, Server } from "lucide-react";
 import { useAppStore } from "../store/useAppStore";
 
-export const monitorPage: React.FC = () => {
+export const MonitorPage: React.FC = () => {
   const { hardware, processes } = useAppStore();
 
   return (

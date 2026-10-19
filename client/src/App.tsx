@@ -1,15 +1,15 @@
-import React, { useEffect } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { useEffect } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useAppStore } from "./store/useAppStore";
-import { Sidebar } from "./components/Sidebar";
-import { LogPanel } from "./components/LogPanel";
-import { ModelConfigPage } from "./pages/modelConfigPage.tsx";
-import { ModelTestPage } from "./pages/ModelTestPage";
-import { MonitorPage } from "./pages/MonitorPage";
+import { desktopInvoke, isTauri } from "./lib/bridge";
+import { Sidebar } from "./components/sidebar";
+import { LogPanel } from "./components/logPanel";
+import { ModelConfigPage } from "./pages/modelConfigPage";
+import { ModelTestPage } from "./pages/modelTestPage";
+import { MonitorPage } from "./pages/monitorPage";
 
 export default function App() {
-  const { activePage, loadLocalConfigs, sendAdminCmd, pollStatusAndLogs } = useAppStore();
+  const { activePage, loadLocalConfigs, loadRemoteModels, sendAdminCmd, pollStatusAndLogs, appendLog } = useAppStore();
 
   useEffect(() => {
     let pollTimer: number | undefined;
@@ -17,11 +17,11 @@ export default function App() {
 
     const bootSequence = async () => {
       await loadLocalConfigs();
+      // 拉起失败（Mac / 浏览器预览 / 后端已在别处运行）不中断，仍尝试直连网关
       try {
-        await invoke("start_wsl_backend");
+        await desktopInvoke("start_wsl_backend");
       } catch (err) {
-        useAppStore.setState({ engineState: "error" });
-        return;
+        appendLog("WARN", `未拉起本地后端，尝试直连网关: ${err}`);
       }
 
       // 握手探测 (最多等待 15 次，每次间隔 1s)
@@ -41,6 +41,8 @@ export default function App() {
         return;
       }
 
+      await loadRemoteModels();
+
       // 界面完全就绪后，唯一一次自动触发后端加载模型
       useAppStore.setState({ engineState: "launching" });
       await sendAdminCmd(1001);
@@ -53,28 +55,32 @@ export default function App() {
 
     bootSequence();
 
-    // 拦截窗口右上角关闭：先发 1099 保存日志释放显存，再关停 WSL
-    const appWindow = getCurrentWindow();
-    const unlistenPromise = appWindow.onCloseRequested(async (event) => {
-      event.preventDefault();
-      if (pollTimer) clearInterval(pollTimer);
+    // 仅桌面端拦截关闭：先发 1099 保存日志释放显存，再关停 WSL
+    let unlistenPromise: Promise<() => void> | undefined;
+    if (isTauri()) {
+      const appWindow = getCurrentWindow();
+      unlistenPromise = appWindow.onCloseRequested(async (event) => {
+        event.preventDefault();
+        if (pollTimer) clearInterval(pollTimer);
 
-      await Promise.race([
-        sendAdminCmd(1099),
-        new Promise((r) => setTimeout(r, 2000)),
-      ]);
+        await Promise.race([
+          sendAdminCmd(1099),
+          new Promise((r) => setTimeout(r, 2000)),
+        ]);
 
-      try {
-        await invoke("stop_wsl_backend");
-      } finally {
+        try {
+          await desktopInvoke("stop_wsl_backend");
+        } catch (err) {
+          console.warn("关停 WSL 失败:", err);
+        }
         await appWindow.destroy();
-      }
-    });
+      });
+    }
 
     return () => {
       isCancelled = true;
       if (pollTimer) clearInterval(pollTimer);
-      unlistenPromise.then((unlisten) => unlisten());
+      unlistenPromise?.then((unlisten) => unlisten());
     };
   }, []);
 

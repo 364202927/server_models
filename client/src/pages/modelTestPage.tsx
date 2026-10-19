@@ -1,11 +1,14 @@
 import React, { useState } from "react";
 import { Send } from "lucide-react";
 import { useAppStore } from "../store/useAppStore";
+import { gatewayBase, gatewayHeaders } from "../lib/gateway";
 
-export const modelTestPage: React.FC = () => {
-  const { models, settings } = useAppStore();
-  const modelIds = Object.keys(models || {});
-  const [selectedModel, setSelectedModel] = useState(modelIds[0] || "");
+export const ModelTestPage: React.FC = () => {
+  const { models, settings, remoteModelIds } = useAppStore();
+  // 优先用网关实际可用的模型，本地配置仅作回退
+  const modelIds = remoteModelIds.length > 0 ? remoteModelIds : Object.keys(models || {});
+  const [pickedModel, setSelectedModel] = useState("");
+  const selectedModel = modelIds.includes(pickedModel) ? pickedModel : modelIds[0] || "";
   const [input, setInput] = useState("");
   const [messages, setMessages] = useState<Array<{ role: string; content: string }>>([]);
   const [loading, setLoading] = useState(false);
@@ -19,16 +22,10 @@ export const modelTestPage: React.FC = () => {
     setInput("");
     setLoading(true);
 
-    const serverCfg = settings?.server || {};
-    const port = serverCfg.api_port || 8666;
-    const apiKey = (serverCfg.api_key || "").trim();
-    const headers: Record<string, string> = { "Content-Type": "application/json" };
-    if (apiKey) headers["x-api-key"] = apiKey;
-
     try {
-      const res = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+      const res = await fetch(`${gatewayBase(settings)}/v1/chat/completions`, {
         method: "POST",
-        headers,
+        headers: gatewayHeaders(settings),
         body: JSON.stringify({
           message_id: 0,
           model: targetModel,

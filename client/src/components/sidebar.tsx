@@ -2,7 +2,7 @@ import React from "react";
 import { Settings, MessageSquare, Activity, Power, Loader2 } from "lucide-react";
 import { useAppStore } from "../store/useAppStore";
 
-export const sidebar: React.FC = () => {
+export const Sidebar: React.FC = () => {
   const { activePage, setActivePage, engineState, triggerEngineToggle } = useAppStore();
 
   const navItems = [

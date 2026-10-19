@@ -2,7 +2,7 @@ import React, { useState, useEffect } from "react";
 import { Save, Plus, Trash2 } from "lucide-react";
 import { useAppStore } from "../store/useAppStore";
 
-export const modelConfigPage: React.FC = () => {
+export const ModelConfigPage: React.FC = () => {
   const { settings, models, saveLocalConfig } = useAppStore();
   const [tab, setTab] = useState<"setting" | "register">("setting");
   const [settingText, setSettingText] = useState("");
