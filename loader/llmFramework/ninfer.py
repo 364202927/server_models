@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import shutil
 from pathlib import Path
@@ -39,6 +40,29 @@ def _search_roots() -> list[Path]:
             roots.append(parent)
             roots += sorted(parent.glob("ninfer*"))
     return roots
+
+
+def _stringify_tool_arguments(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """把历史 assistant.tool_calls 的 arguments 还原成 JSON 字符串。
+
+    共用过滤器为了按 schema 修正参数类型，把它反序列化成了 dict；ninfer 严格校验
+    "function tool_calls must contain string arguments"，否则整条请求 400。
+    """
+    fixed: list[dict[str, Any]] = []
+    for msg in messages:
+        calls = msg.get("tool_calls")
+        if msg.get("role") != "assistant" or not isinstance(calls, list) or not calls:
+            fixed.append(msg)
+            continue
+        item = {**msg, "tool_calls": []}
+        for call in calls:
+            fn = dict(call.get("function") or {})
+            args = fn.get("arguments")
+            if not isinstance(args, str):
+                fn["arguments"] = json.dumps({} if args is None else args, ensure_ascii=False)
+            item["tool_calls"].append({**call, "function": fn})
+        fixed.append(item)
+    return fixed
 
 
 class ninfer(baseInference):
@@ -166,7 +190,7 @@ class ninfer(baseInference):
     ) -> RawOutput:
         payload: dict[str, Any] = {
             "model": self._MODEL_ID,
-            "messages": messages,
+            "messages": _stringify_tool_arguments(messages),
             "stream": False,
             "max_tokens": int(gen_cfg.get("max_tokens", 2048)),
         }
@@ -186,7 +210,9 @@ class ninfer(baseInference):
                 payload[key] = gen_cfg[key]
 
         resp = self._http_client.post("/v1/chat/completions", json=payload)
-        resp.raise_for_status()
+        if not resp.is_success:
+            # ninfer 的报错体写明是哪个字段不合法，必须带出来，否则只剩一句 400 Bad Request
+            raise RuntimeError(f"ninfer-serve 返回 {resp.status_code}: {resp.text[:800]}")
         data = resp.json()
 
         choice = data["choices"][0]

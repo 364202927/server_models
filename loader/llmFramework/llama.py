@@ -137,14 +137,14 @@ class llama(baseInference):
                 "--alias",
                 "default",
             ]
-            if slots > 1:  # 多槽位：给每槽封顶 pool/np，任一槽占满都挤不掉其他槽的 KV
-                cmd += ["-np", str(slots)]
-                if self._supports_flag(llama_bin, "--kv-unified-per-slot"):
-                    cmd += ["--kv-unified", "--kv-unified-per-slot", str(slot_ctx)]
-                else:  # 旧版没有单槽封顶，退回非统一 KV，按 np 硬等分
-                    cmd.append("--no-kv-unified")
-                if self._supports_flag(llama_bin, "--no-cache-idle-slots"):
-                    cmd.append("--no-cache-idle-slots")  # 空闲槽 KV 留驻显存，配额已保证不会被清
+            # if slots > 1:  # 多槽位：给每槽封顶 pool/np，任一槽占满都挤不掉其他槽的 KV
+            cmd += ["-np", str(slots)]
+            # if self._supports_flag(llama_bin, "--kv-unified-per-slot"):
+            #     cmd += ["--kv-unified", "--kv-unified-per-slot", str(slot_ctx)]
+            # else:  # 旧版没有单槽封顶，退回非统一 KV，按 np 硬等分
+            #     cmd.append("--no-kv-unified")
+            # if self._supports_flag(llama_bin, "--no-cache-idle-slots"):
+            #     cmd.append("--no-cache-idle-slots")  # 空闲槽 KV 留驻显存，配额已保证不会被清
             cmd += self._lora_flags(load_cfg)
             spec_cmd, spec_info = self._spec_flags(llama_bin, load_cfg)
             cmd += spec_cmd
