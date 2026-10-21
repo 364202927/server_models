@@ -45,11 +45,12 @@ interface AppState {
 const HARDWARE_EVERY = 4;
 let pollTick = 0;
 
-/** 本地模型状态转成监控页的进程行 */
+/** 本地模型状态转成监控页的进程行；kv 为后端给出的 slot 0 显存 KV（token 总数 / 剩余） */
 const toProcessRow = (model: Record<string, any>) => ({
   model: model.id,
   state: model.state,
   vram: model.gpu_memory_mb ?? 0,
+  kv: model.kv_cache ?? null,
   error: model.error,
 });
 
@@ -139,6 +140,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   triggerEngineToggle: async () => {
+    return; // TODO: 暂时屏蔽按钮点击逻辑，恢复时删除本行
     const { engineState, sendAdminCmd } = get();
     if (engineState === "connecting" || engineState === "launching") return;
 

@@ -245,6 +245,7 @@ class modelSpec:
 
     # ------------------------------------------------------------------ 展示/序列化
     def public_dict(self) -> dict[str, Any]:
+        running = self.state == "RUNNING" and self.loader is not None
         return {
             "id": self.model_id,
             "state": self.state,
@@ -253,6 +254,7 @@ class modelSpec:
             "data_compression": self.data_compression,
             "last_used_at": datetime.fromtimestamp(self.last_used_at, tz=timezone.utc).isoformat(),
             "gpu_memory_mb": self.estimated_vram_mb if self.state == "RUNNING" else 0,
+            "kv_cache": self.loader.kv_cache_info() if running else {"total": 0, "remaining": 0},
             "sleep_location": self.sleep_location,
             "error": self.error,
         }

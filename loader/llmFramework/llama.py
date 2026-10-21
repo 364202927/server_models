@@ -242,3 +242,19 @@ class llama(baseInference):
         if self._effective_load.get("parallel_slots", 1) > 1 and slot != 0:
             return 0
         return max(0, self._effective_load.get("slot_context_length", 0) - used_tokens)
+
+    def kv_cache_info(self) -> dict[str, int]:
+        """slot 0 的占用取 /slots 实时值与最近一次请求用量的较大者：空闲槽 KV 被引擎释放后 n_past 归零，
+        直接用它会把“已用过”误报成“全空闲”（日志里显示的剩余才是请求结束时的真实值）。"""
+        info = super().kv_cache_info()
+        if not info["total"] or self._http_client is None:
+            return info
+        try:
+            slots = self._http_client.get("/slots", timeout=2.0).json()
+        except (httpx.HTTPError, ValueError):
+            return info
+        slot0 = next((s for s in slots if isinstance(s, dict) and int(s.get("id", -1)) == 0), None)
+        if not slot0:
+            return info
+        used = max(int(slot0.get("n_past") or 0), self._kv_used.get(0, 0))
+        return {"total": info["total"], "remaining": max(0, info["total"] - used)}

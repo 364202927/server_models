@@ -8,7 +8,37 @@ from typing import Any
 import httpx
 
 from ...utils.common import info, warn
+from ..model_spec import normalize_model_path
 from .baseInference import RawOutput, baseInference
+
+# ninfer 官方无 install 目标：编译产物相对仓库根 / 构建目录的位置，按顺序探测
+_BIN_NAME = "ninfer-serve"
+_BIN_PATHS = tuple(f"{prefix}{_BIN_NAME}" for prefix in ("", "build/", "apps/", "build/apps/", "build/bin/"))
+
+
+def _pick_bin(candidate: Path) -> str:
+    """candidate 可以是二进制本身、build 目录或仓库根目录；命中返回路径，否则空串。"""
+    for path in ([candidate] if candidate.is_file() else [candidate / rel for rel in _BIN_PATHS]):
+        if not path.is_file():
+            continue
+        if not os.access(path, os.X_OK):
+            raise PermissionError(f"{path} 存在但没有执行权限，请执行 chmod +x {path}")
+        return str(path)
+    return ""
+
+
+def _search_roots() -> list[Path]:
+    """可能存放 ninfer 检出的目录：当前目录、家目录、/opt、/usr/local 及其下的 llmEngine 布局（含 ninfer* 多份检出）。"""
+    bases = [Path.cwd(), Path.home(), Path("/opt"), Path("/usr/local")]
+    mount = Path("/mnt")
+    if mount.is_dir():
+        bases += sorted(mount.glob("*"))
+    roots: list[Path] = []
+    for base in bases:
+        for parent in (base, base / "llmEngine"):
+            roots.append(parent)
+            roots += sorted(parent.glob("ninfer*"))
+    return roots
 
 
 class ninfer(baseInference):
@@ -20,14 +50,47 @@ class ninfer(baseInference):
 
     _FALLBACK_N_CTX = 8192
     _MAX_N_CTX = 262144  # 注册模型原生上限
-    _MAX_MTP_DRAFT = 5  # --mtp-draft-tokens 取值 0..5
+    _MAX_MTP_DRAFT = 15  # --draft-tokens 取值 1..15
     _MODEL_ID = "default"  # 请求里的 model 必须与 --model-id 一致
     _TOP_K_MAX = 20  # 沿用原实现的钳制值（文档未给出上限，以 ninfer-serve --help 为准）
-    _SUPPORTED_KV_DTYPES = {"bf16", "int8"}
+    _SUPPORTED_KV_DTYPES = {"bf16", "int8", "fp8", "rk8v4", "rk4v4", "rk4v4-e8", "rk2v4-e8", "nvfp4", "k8v4"}
 
     @property
     def supported_modalities(self) -> set[str]:
         return {"text", "image", "video"}  # 两个注册模型均原生支持图像/视频，无需启动参数
+
+    @staticmethod
+    def _resolve_bin() -> str:
+        """定位 ninfer-serve：NINFER_BIN -> NINFER_HOME/NINFER_ROOT -> PATH -> 常见检出位置。"""
+        explicit = str(os.environ.get("NINFER_BIN") or "").strip()
+        if explicit:
+            value = normalize_model_path(explicit)
+            hit = (shutil.which(value) if os.sep not in value else "") or _pick_bin(Path(value))
+            if hit:
+                return hit
+            raise FileNotFoundError(f"NINFER_BIN={explicit} 未指向可执行的 {_BIN_NAME}（支持二进制路径 / build 目录 / 仓库根目录）")
+
+        homes = [Path(normalize_model_path(raw)) for raw in (str(os.environ.get(key) or "").strip() for key in ("NINFER_HOME", "NINFER_ROOT")) if raw]
+        if homes:
+            hit = next((found for found in map(_pick_bin, homes) if found), "")
+            if hit:
+                return hit
+            raise FileNotFoundError(f"NINFER_HOME/NINFER_ROOT 下没有可执行的 {_BIN_NAME}: {', '.join(map(str, homes))}")
+
+        hit = shutil.which(_BIN_NAME)
+        if hit:
+            return hit
+
+        candidates = _search_roots()
+        hits = [found for found in map(_pick_bin, candidates) if found]
+        if not hits:
+            raise FileNotFoundError(f"未找到 {_BIN_NAME}：请设置 NINFER_BIN 指向 build/apps/{_BIN_NAME}，" f"或设置 NINFER_HOME 指向 ninfer 仓库根目录，或把 build/apps 加入 PATH；" f"已自动探测 {len(candidates)} 处（如 {', '.join(map(str, candidates[:4]))} 等）")
+        # 多份检出（如 ninfer / ninfer-all）时取最近构建的那份：旧构建可能不认新 artifact 的布局
+        best = max(hits, key=lambda found: Path(found).stat().st_mtime)
+        if len(hits) > 1:
+            warn(f"[ninfer-serve] 发现 {len(hits)} 份 {_BIN_NAME}，取最新构建: {best}（其余: {', '.join(h for h in hits if h != best)}）")
+        info(f"[ninfer-serve] 自动定位到 {best}（可用 NINFER_BIN / NINFER_HOME 覆盖）")
+        return best
 
     def _create(self, model_path: str, load_cfg: dict[str, Any]) -> "ninfer":
         self._unload_engine()
@@ -42,10 +105,7 @@ class ninfer(baseInference):
         if not source.is_file() or source.suffix.lower() != ".ninfer":
             raise ValueError(f"不是有效的 .ninfer 文件: {model_path}")
 
-        # 官方无安装目标，二进制在 build/apps/ninfer-serve：环境变量优先，其次 PATH
-        ninfer_bin = os.environ.get("NINFER_BIN") or shutil.which("ninfer-serve") or ""
-        if not Path(ninfer_bin).is_file():
-            raise FileNotFoundError("未找到 ninfer-serve，请设置 NINFER_BIN 指向 build/apps/ninfer-serve 或加入 PATH")
+        ninfer_bin = self._resolve_bin()
 
         kv_dtype = str(load_cfg.get("kv_dtype") or "bf16").lower()
         if kv_dtype not in self._SUPPORTED_KV_DTYPES:
@@ -60,18 +120,23 @@ class ninfer(baseInference):
         self._model_path = str(source)
         self._port = self._find_free_port()
         cmd = [
-            ninfer_bin, self._model_path,
-            "--host", self._host,
-            "--port", str(self._port),
-            "--model-id", self._MODEL_ID,
-            "--max-context", str(n_ctx),
+            ninfer_bin,
+            self._model_path,
+            "--host",
+            self._host,
+            "--port",
+            str(self._port),
+            "--model-id",
+            self._MODEL_ID,
+            "--max-context",
+            str(n_ctx),
         ]
-        if kv_dtype == "int8":  # 默认 bf16，不传
-            cmd += ["--kv-dtype", "int8"]
-        if mtp_n > 0:  # MTP 默认关闭(0)；--lm-head-draft 只服务于 MTP 提议头
-            cmd += ["--mtp-draft-tokens", str(mtp_n)]
-            if load_cfg.get("lm_head_draft", True):
-                cmd.append("--lm-head-draft")
+        if kv_dtype != "bf16":  # 默认 bf16，不传
+            cmd += ["--kv-dtype", kv_dtype]
+        if mtp_n > 0:  # MTP 默认关闭；--lm-head-draft 不再是独立开关：artifact 带 proposal 头时引擎默认就用
+            cmd += ["--spec", "mtp", "--draft-tokens", str(mtp_n)]
+            if not load_cfg.get("lm_head_draft", True):
+                cmd.append("--full-draft-head")
 
         info(f"[ninfer-serve] 正在拉起服务: {' '.join(cmd)}")
         self._spawn(cmd)

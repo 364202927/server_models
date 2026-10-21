@@ -88,6 +88,7 @@ class baseInference(ABC):
         self._stderr_tail: deque[str] = deque(maxlen=60)
         self._slot_last: dict[int, dict[str, Any]] = {}
         self._tok_ratio: dict[int, float] = {}  # 槽位 -> 上次实测的 token/字符，用于发送前估算 prompt 大小
+        self._kv_used: dict[int, int] = {}  # 槽位 -> 上次请求占用的 token 数，用于状态接口推算剩余 KV
 
     @property
     def base_url(self) -> str:
@@ -322,6 +323,8 @@ class baseInference(ABC):
                 self._raw_memo.pop(k, None)
             pruned = len(stale)
 
+        kv_used = (raw.prompt_tokens or 0) + (raw.tokens or 0)
+        self._kv_used[slot if slot >= 0 else 0] = kv_used
         return GenerationResult(
             text=final_text,
             tokens_generated=raw.tokens,
@@ -377,3 +380,10 @@ class baseInference(ABC):
 
     def remaining_kvCache(self, used_tokens: int, slot: int | None = None) -> int:
         return max(0, self.slot_limit() - used_tokens)
+
+    def kv_cache_info(self) -> dict[str, int]:
+        """slot 0 的 KV Cache 统计（token）：total 为单槽配额，remaining 按最近一次请求的占用量推算。"""
+        total = self.slot_limit()
+        if not total or not self.is_loaded:
+            return {"total": 0, "remaining": 0}
+        return {"total": total, "remaining": max(0, total - self._kv_used.get(0, 0))}

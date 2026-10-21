@@ -20,7 +20,10 @@ const CREATE_UNICODE_ENVIRONMENT: u32 = 0x0000_0400;
 // Windows 下的项目根目录（用于直接读写 assets/*.json）
 #[cfg(windows)]
 const PROJECT_WIN_PATH: &str = r"F:\code\server_models";
-// WSL 发行版 / conda 环境 / 启动命令统一由项目根下的 start_backend.bat、stop_backend.bat 维护
+// 调用 start/stop_backend.bat 的口令，脚本里校验同一个值；双击脚本没有参数，会直接退出
+#[cfg(windows)]
+const BACKEND_TOKEN: &str = "SM-6f1a9c3e8b2d4705";
+// WSL 发行版 / conda 环境 / 启动命令统一由 client 目录下的 start_backend.bat、stop_backend.bat 维护
 
 /// 追加一行到日志文件；失败静默，日志本身不能影响主流程
 fn append_log(path: &std::path::Path, line: &str) {
@@ -123,10 +126,16 @@ fn config_path(filename: &str) -> Result<PathBuf, String> {
     Ok(assets_dir()?.join(filename))
 }
 
+/// 启动/关闭脚本放在 client 目录，脚本内校验口令，只有桌面端能调用（双击无效）
+#[cfg(windows)]
+fn backend_bat(name: &str) -> PathBuf {
+    PathBuf::from(PROJECT_WIN_PATH).join("client").join(name)
+}
+
 #[cfg(windows)]
 #[tauri::command]
 fn start_wsl_backend() -> Result<String, String> {
-    let bat = PathBuf::from(PROJECT_WIN_PATH).join("start_backend.bat");
+    let bat = backend_bat("start_backend.bat");
     if !bat.is_file() {
         return Err(format!("缺少启动脚本: {}", bat.display()));
     }
@@ -171,13 +180,14 @@ fn backend_ready() -> bool {
     }
 }
 
-/// 执行项目内的 .bat：隐藏窗口，stdin 给 null，输出交由调用方接管
+/// 执行 client 下的 .bat：隐藏窗口，stdin 给 null，输出交由调用方接管，首个参数是脚本要求的调用口令
 #[cfg(windows)]
 fn run_bat(bat: &std::path::Path) -> Result<std::process::Child, String> {
     // 必须带上 CREATE_UNICODE_ENVIRONMENT，否则 creation_flags 会覆盖 Rust 默认值，环境块编码错乱
     Command::new("cmd.exe")
         .arg("/c")
         .arg(bat)
+        .arg(BACKEND_TOKEN)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -215,7 +225,7 @@ fn read_backend_log() -> Result<String, String> {
 #[cfg(windows)]
 #[tauri::command]
 fn stop_wsl_backend() -> Result<String, String> {
-    let bat = PathBuf::from(PROJECT_WIN_PATH).join("stop_backend.bat");
+    let bat = backend_bat("stop_backend.bat");
     if !bat.is_file() {
         return Err(format!("缺少关闭脚本: {}", bat.display()));
     }
@@ -234,7 +244,9 @@ fn stop_wsl_backend() -> Result<String, String> {
 #[tauri::command]
 fn read_json_config(filename: String) -> Result<String, String> {
     let path = config_path(&filename)?;
-    fs::read_to_string(&path).map_err(|e| format!("读取文件失败 {:?}: {}", path, e))
+    let text = fs::read_to_string(&path).map_err(|e| format!("读取文件失败 {:?}: {}", path, e))?;
+    // 编辑器另存为 UTF-8 with BOM 时会在开头留 U+FEFF，前端 JSON.parse 会直接报错
+    Ok(text.trim_start_matches('\u{feff}').to_string())
 }
 
 #[tauri::command]

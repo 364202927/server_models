@@ -31,6 +31,9 @@ export const MonitorPage: React.FC = () => {
                 <div className="text-slate-200 font-bold">Model: {proc.model || "-"}</div>
                 <div className="text-slate-400">状态: {proc.state || "-"}</div>
                 <div className="text-slate-400">显存: {proc.vram ?? 0} MB</div>
+                <div className="text-slate-400">
+                  KV Cache(0 slot): {proc.kv?.total ? `${proc.kv.total} / ${proc.kv.remaining}` : "-"}
+                </div>
                 {proc.error ? <div className="text-rose-400">错误: {proc.error}</div> : null}
               </div>
             ))}

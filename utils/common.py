@@ -34,16 +34,17 @@ def readFile(pathFile, model='r'):
         return None
     fileType, _ = getFileExtension(pathFile)
     def _read_json() -> Any:
-        with open(pathFile, model, encoding="utf-8") as file:
+        # utf-8-sig 兼容带 BOM 的文件（编辑器另存为 UTF-8 with BOM 时会出现），不带 BOM 也能正常读
+        with open(pathFile, model, encoding="utf-8-sig") as file:
             return json.load(file)
     def _read_jsonl() -> list[Any]:
-        with open(pathFile, model, encoding="utf-8") as file:
+        with open(pathFile, model, encoding="utf-8-sig") as file:
             return [json.loads(line) for line in file if line.strip()]
     def _read_pickle(p) -> Any:
         with open(pathFile, "rb") as file:
             return pickle.load(file)
     def _read_text() -> str:
-        with open(pathFile, model, encoding="utf-8") as file:
+        with open(pathFile, model, encoding="utf-8-sig") as file:
             return file.read()
     def _read_gzip() -> Any:
         with gzip.open(pathFile, "rb") as file:
@@ -130,6 +131,30 @@ def ensure_asset_dirs() -> None:
     for path in (RUNTIME_DIR, CACHE_DIR, CHAT_HISTORY_DIR):
         path.mkdir(parents=True, exist_ok=True)
 
+# NInfer v3 入口头 32 字节：magic + 目录 JSON 字节数(u64) + artifact id(16B)，随后紧跟目录 JSON
+_NINFER_MAGIC = b"NINFER\x00\x03"
+_NINFER_HEADER = struct.Struct("<8sQ16s")
+_NINFER_JSON_MAX = 64 << 20  # 实际目录 JSON 几百 KB，超限视为头损坏
+
+
+def read_ninfer_directory(artifact: str | os.PathLike[str]) -> dict:
+    """解析 .ninfer 自描述的目录 JSON（组件 config / resources / proposal 等）。"""
+    path = Path(artifact)
+    with open(path, "rb") as f:
+        head = f.read(_NINFER_HEADER.size)
+        if len(head) != _NINFER_HEADER.size:
+            raise ValueError(f"{path.name} 不是 NInfer v3 权重（头长度不足 {_NINFER_HEADER.size} 字节）")
+        magic, json_bytes, _ = _NINFER_HEADER.unpack(head)
+        if magic != _NINFER_MAGIC:
+            raise ValueError(f"{path.name} 不是 NInfer v3 权重（magic={magic!r}），请用 tools/upgrade_ninfer_v2_to_v3.py 升级")
+        if not 0 < json_bytes <= _NINFER_JSON_MAX:
+            raise ValueError(f"{path.name} 目录 JSON 长度异常: {json_bytes}")
+        raw = f.read(json_bytes)
+    if len(raw) != json_bytes:
+        raise ValueError(f"{path.name} 目录 JSON 被截断: {len(raw)}/{json_bytes}")
+    return json.loads(raw)
+
+
 #显存转换成token
 def vm2tokens(
     engine: str,
@@ -215,6 +240,15 @@ def vm2tokens(
         head_dim = cfg.get("head_dim") or (hidden // n_head)
         return [cfg.get("num_key_value_heads") or n_head] * n_attn, head_dim, head_dim, 0
  
+    # 4b. 辅助内联解析：.ninfer（NInfer v3）入口头内嵌的 HF config
+    def spec_ninfer(artifact: Path) -> tuple[list[int], int, int, int]:
+        # 只有文本组件记录 num_hidden_layers；vision 用 depth，mtp 只有 architectures
+        components = read_ninfer_directory(artifact).get("components") or {}
+        cfg = next((c.get("config") for c in components.values() if "num_hidden_layers" in (c.get("config") or {})), None)
+        if cfg is None:
+            raise ValueError(f"{artifact.name} 目录中未找到文本组件的 HF config")
+        return spec_hf(cfg)
+
     # 5. 辅助内联解析：纯 Python GGUF 读取器
     def read_gguf_raw(gguf_path: Path) -> dict:
         meta = {}
@@ -262,9 +296,13 @@ def vm2tokens(
         raise FileNotFoundError(f"模型路径不存在: {path}")
  
     kv_heads, k_dim, v_dim, fixed = [], 0, 0, 0
-    ggufs = [p] if p.is_file() and p.suffix.lower() == ".gguf" else (sorted(p.glob("*.gguf")) if p.is_dir() else [])
+    ninfer_files = [p] if p.suffix.lower() == ".ninfer" else (sorted(p.glob("*.ninfer")) if p.is_dir() else [])
+    ggufs = [p] if p.suffix.lower() == ".gguf" else (sorted(p.glob("*.gguf")) if p.is_dir() else [])
+    cfg_file = (p if p.is_dir() else p.parent) / "config.json"
  
-    if ggufs:
+    if ninfer_files and engine_name.startswith("ninfer"):  # 引擎自己的格式优先，避免同目录 GGUF 抢先
+        kv_heads, k_dim, v_dim, fixed = spec_ninfer(ninfer_files[0])
+    elif ggufs:
         meta = {}
         if importlib.util.find_spec("gguf") is not None:
             from gguf import GGUFReader
@@ -272,20 +310,12 @@ def vm2tokens(
         else:
             meta = read_gguf_raw(ggufs[0])
         kv_heads, k_dim, v_dim, fixed = spec_gguf(meta)
+    elif cfg_file.exists():
+        kv_heads, k_dim, v_dim, fixed = spec_hf(json.loads(cfg_file.read_text(encoding="utf-8")))
+    elif ninfer_files:
+        kv_heads, k_dim, v_dim, fixed = spec_ninfer(ninfer_files[0])
     else:
-        # 兼容 config.json 或 .ninfer 文件
-        cfg_file = (p if p.is_dir() else p.parent) / "config.json"
-        if cfg_file.exists():
-            kv_heads, k_dim, v_dim, fixed = spec_hf(json.loads(cfg_file.read_text(encoding="utf-8")))
-        elif p.suffix.lower() == ".ninfer" or list(p.glob("*.ninfer") if p.is_dir() else []):
-            # .ninfer 是自有二进制格式，不猜头部；已核实的拓扑按文件名内置，其余请把 HF config.json 放到同目录
-            target = p if p.is_file() else sorted(p.glob("*.ninfer"))[0]
-            known = {"qwen3_6_27b": ([4] * 16, 256, 256, 0)}  # 64 层、每 4 层 1 层全注意力(共16层)、4 个 KV 头、head_dim 256
-            if target.stem.lower() not in known:
-                raise ValueError(f"未内置 {target.name} 的 KV 拓扑，请把对应的 HF config.json 放到同目录")
-            kv_heads, k_dim, v_dim, fixed = known[target.stem.lower()]
-        else:
-            raise ValueError(f"无法识别该模型架构元数据: {path}")
+        raise ValueError(f"无法识别该模型架构元数据: {path}")
  
     # 7. 计算 Token 容量
     tp = max(1, int(tensor_parallel))
