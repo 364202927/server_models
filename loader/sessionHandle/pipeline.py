@@ -93,7 +93,7 @@ class pipeline:
         pool, other = (self._main, self._sub) if isMain else (self._sub, self._main)
         unique = list({spec.model_id: spec for spec in models}.values())
         removed = {lane.spec.model_id for lane in pool.lanes} - {s.model_id for s in unique} - {l.spec.model_id for l in other.lanes}
-        pool.lanes = [_lane(spec, max(1, int(spec.full_load().get("parallel_slots", 1)))) for spec in unique]
+        pool.lanes = [_lane(spec, self._lane_slots(spec)) for spec in unique]
         cleared = self._classifier.unbind(removed)
         info(
             "[调度] 登记",
@@ -145,6 +145,12 @@ class pipeline:
 
     def hasMain(self) -> bool:
         return bool(self._main.alive)
+
+    @staticmethod
+    def _lane_slots(spec: modelSpec) -> int:
+        """槽位数以引擎实测为准（-np 可能不被老版本接受），回退到配置值。"""
+        actual = int(spec.loader.effective_load.get("parallel_slots", 0)) if spec.loader and spec.isAlive else 0
+        return max(1, actual or int(spec.full_load().get("parallel_slots", 1)))
 
     def has(self, spec: modelSpec) -> bool:
         return spec.isAlive and any(lane.spec is spec for pool in (self._main, self._sub) for lane in pool.lanes)
@@ -199,22 +205,27 @@ class pipeline:
         return min(free, key=lambda item: item[0].running / item[0].slots, default=None)
     
     def _abort_stale_main_session(self, pool: _pool, category: sessionCategory) -> None:
-        """主会话独占 Slot 0：当同会话重发，或用户 ESC 后直接 /clear、/resume 开启新主会话时，
-        立即清退队列里残留的主会话旧票据，并通知 Slot 0 上还在跑的旧主会话任务立刻中止。"""
+        """主会话独占 Slot 0：用户 ESC 回退重编辑、/clear、/resume 开启新主会话时，
+        清退队列里别的会话残留票据，并通知 Slot 0 上还在跑的旧任务中止。
+        同前缀等长的重发（extended 且非 rewound）是客户端超时重试，旧任务结果仍然有用，不中止，排队等它跑完。"""
         if not category.is_main:
             return
-        # 1. 只要新来了主会话请求，排队中同 sid（或所有旧主会话）的未放行票据直接作废
+        # 1. 新主会话请求到来：别的会话排队中的票据直接作废；同会话的票据保留（可能是同一次重试，FIFO 依次服务）
         for t in list(pool.waiting):
-            if t.category.is_main and not t.granted.done():
+            if t.category.is_main and t.category.session_id != category.session_id and not t.granted.done():
                 t.granted.cancel()
                 pool.waiting.remove(t)
                 warn("[调度] 清理残留的主会话排队请求", f"旧#{t.category.session_id} -> 新#{category.session_id}")
-        # 2. 若当前是同会话重发，或 /clear、/resume 切换了新主会话（not extended），直接掐断 Slot 0 上的旧任务
+        # 2. 只有"旧任务确定作废"才掐断：ESC 回退重编辑（rewound），或 /clear、/resume 换了会话（无血缘新会话）
         for lane in pool.lanes:
             active = lane.active_leases.get(0)
-            if active and not active.cancel.is_set() and (active.sid == category.session_id or not category.extended):
-                warn("[调度] 主会话重发或切换(/clear|/resume)，中止 Slot 0 旧任务", f"旧#{active.sid} -> 新#{category.session_id}")
-                active.cancel.set()
+            if not active or active.cancel.is_set():
+                continue
+            if not category.rewound and (category.extended or active.sid == category.session_id):
+                info("[调度] 同前缀重发（客户端重试/追加）不中止在跑的旧任务，排队等待 Slot 0", f"#{category.session_id}")
+                continue
+            warn("[调度] 主会话重发或切换(/clear|/resume)，中止 Slot 0 旧任务", f"旧#{active.sid} -> 新#{category.session_id}")
+            active.cancel.set()
 
     def _pump(self, pool: _pool) -> None:
         for ticket in sorted(pool.waiting, key=self._rank):
@@ -266,7 +277,7 @@ class pipeline:
                 ahead,
                 prev_sid,
                 prev_bound,
-                slot if pool.isMain and lane.slots >= 2 else None,
+                slot,  # 槽号始终下发给引擎：支路清理要知道清哪个槽，主/支路也才不会被引擎随机挑槽
                 [warning] if warning else [],
                 sid=category.session_id,
             )
@@ -291,6 +302,7 @@ class pipeline:
             warn("[调度]", self._who(category), warning)
         async with self._acquire(pool, category, want, warning) as grant:
             cfg = dict(overrides)
+            cfg["branch"] = not category.is_main
             if grant.slot is not None:
                 cfg["id_slot"] = grant.slot
             self._log_dispatch(category, grant)

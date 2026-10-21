@@ -131,6 +131,26 @@ class chatDataFilter:
             cleaned.append(msg)
         return cleaned
 
+    @staticmethod
+    def trim_history(messages: list[dict[str, Any]], budget_chars: int) -> list[dict[str, Any]]:
+        """按锚点裁剪历史：保留 system + 首轮（子代理任务书通常在这里）+ 最近 2 轮，
+        从中间最旧的整轮开始丢，直到塞进 budget_chars；没有中间轮可丢时原样返回。"""
+        size = lambda msgs: sum(len(json.dumps(m, ensure_ascii=False, default=str)) for m in msgs)
+        system = [m for m in messages if m.get("role") == "system"]
+        rounds: list[list[dict[str, Any]]] = []
+        for msg in (m for m in messages if m.get("role") != "system"):
+            if not rounds or msg.get("role") == "user":  # 每轮从 user 开始，工具消息跟随其所属轮次一起丢
+                rounds.append([msg])
+            else:
+                rounds[-1].append(msg)
+        if len(rounds) <= 3:
+            return messages
+        head, middle, tail = rounds[:1], rounds[1:-2], rounds[-2:]
+        flat = lambda groups: [m for group in groups for m in group]
+        while middle and size(system + flat(head + middle + tail)) > budget_chars:
+            middle.pop(0)
+        return system + flat(head + middle + tail)
+
     @classmethod
     def sanitize_multimodal(cls, messages: list[dict[str, Any]], supported_modalities: set[str]) -> list[dict[str, Any]]:
         if "image" in supported_modalities and "video" in supported_modalities:

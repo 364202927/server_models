@@ -14,7 +14,7 @@ from typing import Any, Callable
 
 from ..utils.common import aContainB, info, require, vm2tokens
 from ..utils.hardware import query_gpu_used_mb
-from .llmFramework.baseInference import GenerationResult, baseInference
+from .llmFramework.baseInference import GenerationCancelled, GenerationResult, baseInference
 
 
 @dataclass(eq=False)
@@ -225,16 +225,20 @@ class modelSpec:
         overrides = overrides or {}
         cancelled = cancel.is_set if cancel is not None else (lambda: False)
         if cancelled():
-            raise RuntimeError(f"生成已取消: {self.model_id}")
+            raise GenerationCancelled(f"生成已取消: {self.model_id}")
         with self._lock:
             self.ensure()
             self.active_requests += 1
         try:
             if cancelled():  # ensure 可能阻塞很久（等锁/冷启动），醒来时请求可能已经超时
-                raise RuntimeError(f"生成已取消: {self.model_id}")
+                raise GenerationCancelled(f"生成已取消: {self.model_id}")
             cfg = self.full_generation()
-            cfg.update({k: v for k, v in overrides.items() if k in cfg and v is not None})
-            cfg.update({k: overrides[k] for k in ("tools", "tool_choice", "id_slot") if k in overrides})
+            # max_tokens 不参与通用覆盖：模板值是上限/动态哨兵，客户端值单独存，交 loader 按剩余空间裁决
+            cfg.update({k: v for k, v in overrides.items() if k in cfg and k != "max_tokens" and v is not None})
+            client_max = overrides.get("max_completion_tokens") or overrides.get("max_tokens")
+            if isinstance(client_max, int) and client_max > 0:
+                cfg["max_tokens_request"] = client_max
+            cfg.update({k: overrides[k] for k in ("tools", "tool_choice", "id_slot", "branch") if k in overrides})
             extra = {"cancel": cancel} if cancel is not None and self.cancellable else {}
             result = self.loader.generate(messages, cfg, prune_on_miss, **extra)
             self.last_used_at = time.time()

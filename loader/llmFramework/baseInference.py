@@ -13,6 +13,7 @@ import time
 from abc import ABC, abstractmethod
 from collections import OrderedDict, deque
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import httpx, psutil
@@ -23,6 +24,13 @@ from ..chatDataFilter import chatDataFilter
 
 class ContextOverflowError(Exception):
     """请求（含 tools）放不进单槽上下文：由入口层转成 400 返回客户端，不属于引擎故障（不继承 RuntimeError）。"""
+
+
+class GenerationCancelled(Exception):
+    """请求已被客户端作废（超时重发 / ESC / 断连）：不是引擎故障，入口层按 499 静默处理，不计 502。"""
+
+
+_DUMP_DIR = Path(__file__).resolve().parents[2] / "assets" / "runtime" / "debug"
 
 
 @dataclass
@@ -74,6 +82,12 @@ class baseInference(ABC):
     _TOOL_RETRY = 1  # 工具调用可确定地失败（非法 JSON / 未闭合 / 未知工具 / 缺必填参数 / 空输出）时的静默重试次数；0 = 关闭
     _RETRY_MAX_SECONDS = 60.0  # 首次生成耗时超过此值就不重试：避免把长生成翻倍后撞上调用方超时
     _GUESS_TOK_PER_CHAR = 0.25  # 尚无实测校准时的乐观比例（约 4 字符/token）：只拦截一定放不下的请求，避免首轮误杀后永远无法校准
+    _BRANCH_KV_RECLAIM = 0.80  # 支路单槽水位达到此比例就清空该槽 KV（仅多槽；1 槽支路与主会话共用槽 0，一律不动）
+    _BRANCH_TRIM_TARGET = 0.55  # 支路 prompt 放不进单槽时裁剪到的目标水位
+    _SMALL_GEN_TOKENS = 256  # 客户端请求的 max_tokens 低于此值（如内部折叠调用 128）视为明确要短输出，动态模式下照它的来
+    _DEFAULT_GEN_TOKENS = 2048  # 模板未给 max_tokens 时的兜底
+    _SLOT_PURGE = False  # 引擎是否支持单独清槽 KV（支路清理的前提，目前只有 llama-server 实现）
+    _DUMP_MAX = 20  # “空正文”请求快照最多留几份，免得反复踩同一个坑把磁盘写满
     _CACHE_LOG_KEYS = ("selected slot", "purging slot", "forcing full", "checkpoint", "prompt cache", "similarity", "cache_ram", "n_past")
 
     def __init__(self) -> None:
@@ -89,6 +103,7 @@ class baseInference(ABC):
         self._slot_last: dict[int, dict[str, Any]] = {}
         self._tok_ratio: dict[int, float] = {}  # 槽位 -> 上次实测的 token/字符，用于发送前估算 prompt 大小
         self._kv_used: dict[int, int] = {}  # 槽位 -> 上次请求占用的 token 数，用于状态接口推算剩余 KV
+        self._dumped: set[str] = set()  # 已落盘的“空正文”请求指纹，同一 prompt 只留一份快照
 
     @property
     def base_url(self) -> str:
@@ -159,8 +174,9 @@ class baseInference(ABC):
         pass
 
     def load(self, model_path: str, load_cfg: dict[str, Any]) -> "baseInference":
+        start_time = time.perf_counter()
         self._create(model_path, load_cfg)
-        log_info("加载完成:", model_path)
+        log_info("加载时间:", time.perf_counter() - start_time)
         return self
 
     def _unload_engine(self) -> None:
@@ -224,6 +240,8 @@ class baseInference(ABC):
         self._sleep_capable = False
         self._raw_memo.clear()
         self._tok_ratio.clear()
+        self._kv_used.clear()
+        self._slot_last.clear()
 
     def release_cache(self) -> MemoryUsage:
         gc.collect()
@@ -246,7 +264,7 @@ class baseInference(ABC):
         if not self.is_loaded:
             raise RuntimeError("Model not loaded / Server not running. Call load() first.")
         if cancel is not None and cancel.is_set():
-            raise RuntimeError("Generation cancelled before execution.")
+            raise GenerationCancelled("请求在进入引擎前已被放弃")
 
         cfg = dict(gen_cfg or {})
         system_instruction = str(cfg.pop("system_prompt", "") or "")
@@ -265,14 +283,36 @@ class baseInference(ABC):
         limit = self.slot_limit()
         dump = lambda obj: len(json.dumps(obj, ensure_ascii=False, default=str))
         tools_chars = dump(cfg.get("tools") or [])
-        chars = dump(cleaned_messages) + tools_chars
         per_char = self._tok_ratio.get(slot) or self._GUESS_TOK_PER_CHAR
-        est = int(chars * per_char)
-        anchor = int((tools_chars + dump([m for m in cleaned_messages if m.get("role") == "system"])) * per_char)
         reserve = min(self._MIN_GEN_RESERVE, limit // 4)
+        # 支路清理总开关：实测槽位 ≥2 才成立。1 槽时支路与主会话共用槽 0，清理会连主会话缓存一起毁掉，故一律不动
+        branch = bool(cfg.pop("branch", False)) and self._SLOT_PURGE and self.is_loaded and int(self._effective_load.get("parallel_slots", 1)) >= 2
+        chars = dump(cleaned_messages) + tools_chars
+        est = int(chars * per_char)
+        # 支路兜底：prompt 放不进单槽时按锚点裁剪（system + 首条 user 任务书 + 最近 2 轮），否则支路迟早顶爆上下文
+        if branch and limit > 0 and est + reserve > limit:
+            before = len(cleaned_messages)
+            trimmed = chatDataFilter.trim_history(cleaned_messages, int(limit * self._BRANCH_TRIM_TARGET / per_char) - tools_chars)
+            if len(trimmed) < before:
+                cleaned_messages = trimmed
+                chars = dump(trimmed) + tools_chars
+                est = int(chars * per_char)
+                log_warn("[支路清理]", f"槽={slot}", f"裁剪 {before}→{len(trimmed)} 条", f"水位={est / limit:.0%}")
+        anchor = int((tools_chars + dump([m for m in cleaned_messages if m.get("role") == "system"])) * per_char)
         used = est / limit if limit > 0 else 0.0
+        # max_tokens：模板 -1 = 动态吃满单槽剩余；正数模板 = 上限，客户端更小的请求值优先
+        want = int(cfg.get("max_tokens") or self._DEFAULT_GEN_TOKENS)
+        client_want = int(cfg.get("max_tokens_request") or 0)
+        draft = int(self._effective_load.get("mtp_draft_tokens") or self._effective_load.get("draft_tokens") or 0)
+        room = max(0, limit - est - reserve - draft) if limit > 0 else (want if want > 0 else self._DEFAULT_GEN_TOKENS)
+        if want < 0:  # 动态：按单槽剩余给满；只有客户端明确要极短（≤_SMALL_GEN_TOKENS，如内部折叠）才照它的来
+            cfg["max_tokens"] = max(1, client_want if 0 < client_want <= self._SMALL_GEN_TOKENS else room)
+        else:  # 固定：模板是上限，客户端更短的要求优先，最后再被剩余空间截顶
+            cfg["max_tokens"] = max(1, min([room, want] + ([client_want] if client_want > 0 else [])))
         if limit > 0:
-            (log_warn if used >= self._WARN_USAGE else log_info)("[容量]", f"槽={slot}", f"prompt≈{est}", f"system+tools≈{anchor}", f"单槽={limit}", f"使用率={used:.0%}", f"预留={reserve}", "实测校准" if slot in self._tok_ratio else "未校准(乐观估算)")
+            (log_warn if used >= self._WARN_USAGE else log_info)(
+                "[容量]", f"槽={slot}", f"prompt≈{est}", f"system+tools≈{anchor}", f"单槽={limit}", f"使用率={used:.0%}", f"预留={reserve}", f"max_tokens={cfg['max_tokens']}({'动态' if want < 0 else '固定'})", "实测校准" if slot in self._tok_ratio else "未校准(乐观估算)"
+            )
         if limit > 0 and est + reserve > limit:
             raise ContextOverflowError(
                 f"This model's maximum context length is {limit} tokens per slot. However, your request needs about {est + reserve} tokens "
@@ -285,19 +325,28 @@ class baseInference(ABC):
         # 子类 _response 支持 cancel 参数则传入，否则保持兼容调用
         extra = {"cancel": cancel} if cancel is not None and "cancel" in inspect.signature(self._response).parameters else {}
         for attempt in range(self._TOOL_RETRY + 1):
+            # 上一轮生成期间客户端可能已经重发/ESC：别再启动新一轮，白花的每一秒都占着唯一槽位
+            if cancel is not None and cancel.is_set():
+                raise GenerationCancelled("请求已放弃，停止重试")
             start = time.perf_counter()
             raw = self._response(messages=cleaned_messages, gen_cfg=cfg, **extra)
             elapsed = time.perf_counter() - start
 
             # 如果在生成期间用户按了 ESC 取消了请求，直接抛错退出，防止把废弃分支的回复写入 _raw_memo
             if cancel is not None and cancel.is_set():
-                raise RuntimeError("Generation cancelled during execution.")
+                raise GenerationCancelled("请求在生成期间被放弃")
             if raw.prompt_tokens > 0 and chars > 0:
                 self._tok_ratio[slot] = raw.prompt_tokens / chars  # 用本次实测校准，下次估算按同一量纲
 
             parsed = chatDataFilter.parse_result(raw.text, raw.calls, raw.finish_reason, cfg.get("tools"))
             if parsed.problems:
                 log_warn("[工具调用]", f"槽={slot}", f"第{attempt + 1}次", f"问题={parsed.problems}", f"finish={raw.finish_reason}", f"tokens={raw.tokens}", f"{elapsed:.1f}s", f"原文头={raw.text[:300]!r}", f"原文尾={raw.text[-300:]!r}")
+            # 正文空但思考非空：思考型模型把答案写进了思考通道，重试只会再烧一遍同样的算力，直接把思考回填成正文
+            if {code for code, _ in parsed.problems} <= {"empty", "unclosed_think"} and parsed.problems and (raw.reasoning or "").strip():
+                log_warn("[输出]", f"槽={slot}", f"只有思考没有正文(思考{len(raw.reasoning)}字/{raw.tokens} tokens)", "按思考回填正文，不再重试")
+                self._dump_empty_prompt(cleaned_messages, cfg, raw.reasoning)
+                parsed.text, parsed.tool_calls, parsed.problems = raw.reasoning.strip(), [], []
+                raw.reasoning = ""  # 已进正文，避免客户端同时收到 content 与 reasoning_content 两份
             # 失败的输出不会进入 _raw_memo（memo 只在循环结束后按最终结果写入）；temperature=0 时重试必然得到同样输出，不重试
             if not parsed.retryable or attempt >= self._TOOL_RETRY or elapsed > self._RETRY_MAX_SECONDS or cfg.get("temperature") == 0:
                 break
@@ -325,6 +374,12 @@ class baseInference(ABC):
 
         kv_used = (raw.prompt_tokens or 0) + (raw.tokens or 0)
         self._kv_used[slot if slot >= 0 else 0] = kv_used
+        # 支路水位到线就清空该槽 KV：支路缓存可弃，留着只会在下一轮把上下文顶爆
+        if branch and limit > 0 and kv_used >= limit * self._BRANCH_KV_RECLAIM:
+            cleared = self.purge_slot(slot)
+            if cleared:
+                self._kv_used[slot if slot >= 0 else 0] = 0
+            (log_info if cleared else log_warn)("[支路清理]", f"槽={slot}", f"水位={kv_used}/{limit}({kv_used / limit:.0%})", "已清空 KV" if cleared else "清空失败，已跳过")
         return GenerationResult(
             text=final_text,
             tokens_generated=raw.tokens,
@@ -362,6 +417,27 @@ class baseInference(ABC):
             f"tools#{last['tools']}->#{now['tools']}" + ("(变了，整段前缀失效)" if last["tools"] != now["tools"] else "(不变)"),
         )
 
+    def _dump_empty_prompt(self, messages: list[dict[str, Any]], cfg: dict[str, Any], reasoning: str) -> None:
+        """正文为空但思考非空：留一份请求快照，便于复盘是什么 prompt 让模型只思考不落答案。"""
+        digest = hashlib.md5(json.dumps(messages, ensure_ascii=False, sort_keys=True, default=str).encode()).hexdigest()[:12]
+        if digest in self._dumped or len(self._dumped) >= self._DUMP_MAX:
+            return
+        self._dumped.add(digest)
+        snapshot = {
+            "messages": messages,
+            "tools": cfg.get("tools"),
+            "gen_cfg": {k: v for k, v in cfg.items() if k != "tools"},
+            "reasoning": reasoning,
+        }
+        path = _DUMP_DIR / f"empty-{time.strftime('%Y%m%d-%H%M%S')}-{digest}.json"
+        try:
+            _DUMP_DIR.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(snapshot, ensure_ascii=False, indent=1, default=str), encoding="utf-8")
+        except OSError as exc:  # 只有磁盘写入会失败，记一笔即可，不影响本次回复
+            log_warn("[输出] 空正文快照写入失败", type(exc).__name__, str(exc))
+            return
+        log_warn("[输出] 已保存空正文请求快照", str(path))
+
     @abstractmethod
     def _response(
         self,
@@ -380,6 +456,10 @@ class baseInference(ABC):
 
     def remaining_kvCache(self, used_tokens: int, slot: int | None = None) -> int:
         return max(0, self.slot_limit() - used_tokens)
+
+    def purge_slot(self, slot: int) -> bool:
+        """清空指定槽的 KV（引擎不支持时为空实现）：返回是否真的清掉了。"""
+        return False
 
     def kv_cache_info(self) -> dict[str, int]:
         """slot 0 的 KV Cache 统计（token）：total 为单槽配额，remaining 按最近一次请求的占用量推算。"""

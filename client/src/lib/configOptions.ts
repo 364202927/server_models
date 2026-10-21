@@ -30,7 +30,7 @@ export const FIELD_OPTIONS: Record<string, string[]> = {
   presence_penalty: ["0", "0.5", "1"],
   frequency_penalty: ["0", "0.5", "1"],
   mirostat: ["0", "1", "2"],
-  max_tokens: ["1024", "2048", "4096", "8192", "16384"],
+  max_tokens: ["-1", "1024", "2048", "4096", "8192", "16384"],
   sleepTime: ["0", "60", "300", "600", "1800"],
   host: ["0.0.0.0", "127.0.0.1"],
   api_port: ["8666"],
@@ -74,7 +74,7 @@ export const FIELD_HINTS: Record<string, string> = {
   top_p: "Top-P",
   top_k: "Top-K",
   repetition_penalty: "重复惩罚",
-  max_tokens: "最大生成 token",
+  max_tokens: "最大生成 token（-1 为按剩余上下文动态）",
   stop: "停止词",
   system_prompt: "系统提示词",
   // modelSetting.json

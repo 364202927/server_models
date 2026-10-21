@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import threading
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -10,7 +12,7 @@ import httpx
 
 from ...utils.common import info, warn
 from ..model_spec import normalize_model_path
-from .baseInference import RawOutput, baseInference
+from .baseInference import GenerationCancelled, RawOutput, baseInference
 
 # ninfer 官方无 install 目标：编译产物相对仓库根 / 构建目录的位置，按顺序探测
 _BIN_NAME = "ninfer-serve"
@@ -18,7 +20,6 @@ _BIN_PATHS = tuple(f"{prefix}{_BIN_NAME}" for prefix in ("", "build/", "apps/", 
 
 
 def _pick_bin(candidate: Path) -> str:
-    """candidate 可以是二进制本身、build 目录或仓库根目录；命中返回路径，否则空串。"""
     for path in ([candidate] if candidate.is_file() else [candidate / rel for rel in _BIN_PATHS]):
         if not path.is_file():
             continue
@@ -29,7 +30,6 @@ def _pick_bin(candidate: Path) -> str:
 
 
 def _search_roots() -> list[Path]:
-    """可能存放 ninfer 检出的目录：当前目录、家目录、/opt、/usr/local 及其下的 llmEngine 布局（含 ninfer* 多份检出）。"""
     bases = [Path.cwd(), Path.home(), Path("/opt"), Path("/usr/local")]
     mount = Path("/mnt")
     if mount.is_dir():
@@ -43,11 +43,6 @@ def _search_roots() -> list[Path]:
 
 
 def _stringify_tool_arguments(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """把历史 assistant.tool_calls 的 arguments 还原成 JSON 字符串。
-
-    共用过滤器为了按 schema 修正参数类型，把它反序列化成了 dict；ninfer 严格校验
-    "function tool_calls must contain string arguments"，否则整条请求 400。
-    """
     fixed: list[dict[str, Any]] = []
     for msg in messages:
         calls = msg.get("tool_calls")
@@ -65,13 +60,29 @@ def _stringify_tool_arguments(messages: list[dict[str, Any]]) -> list[dict[str, 
     return fixed
 
 
+class _streamUnsupported(Exception):
+    """引擎不认 stream_options（400）：回退非流式。"""
+
+
+def _merge_calls(deltas: list[dict[str, Any]] | None, calls: dict[int, dict[str, Any]]) -> None:
+    """把流式 tool_call 增量按 index 合并：name 一般整段给一次，arguments 逐块追加。"""
+    for item in deltas or []:
+        call = calls.setdefault(int(item.get("index") or 0), {"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
+        if item.get("id"):
+            call["id"] = str(item["id"])
+        fn = item.get("function") or {}
+        name = str(fn.get("name") or "")
+        if name and not call["function"]["name"].endswith(name):  # 有的引擎每块都重发整个 name
+            call["function"]["name"] += name
+        if fn.get("arguments"):
+            call["function"]["arguments"] += str(fn["arguments"])
+
+
 class ninfer(baseInference):
-    """NInfer (ninfer-serve) 转发引擎。
+    """NInfer (ninfer-serve) 转发引擎。"""
 
-    约束（来自官方 docs/serving.md）：单 Engine、单常驻序列、请求串行，无连续批处理；
-    因此不存在多槽位 / id_slot 隔离，parallel_slots 恒为 1。
-    """
-
+    _stream_rejected = False  # 引擎拒绝 stream_options 后固定走非流式
+    _stream_usage_warned = False  # 引擎不回流式 usage 只提醒一次
     _FALLBACK_N_CTX = 8192
     _MAX_N_CTX = 262144  # 注册模型原生上限
     _MAX_MTP_DRAFT = 15  # --draft-tokens 取值 1..15
@@ -187,11 +198,24 @@ class ninfer(baseInference):
         self,
         messages: list[dict[str, Any]],
         gen_cfg: dict[str, Any],
+        cancel: threading.Event | None = None,
     ) -> RawOutput:
+        payload = self._payload(messages, gen_cfg)
+        if self._stream_rejected:  # 该引擎不认 stream_options：固定走非流式
+            return self._post(payload)
+        try:
+            return self._stream(payload, cancel)
+        except _streamUnsupported:
+            self._stream_rejected = True
+            warn("[ninfer-serve] 不接受 stream_options，改用非流式：cancel 只能等整段生成结束才生效")
+            return self._post(payload)
+
+    def _payload(self, messages: list[dict[str, Any]], gen_cfg: dict[str, Any]) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "model": self._MODEL_ID,
             "messages": _stringify_tool_arguments(messages),
-            "stream": False,
+            "stream": True,
+            "stream_options": {"include_usage": True},
             "max_tokens": int(gen_cfg.get("max_tokens", 2048)),
         }
 
@@ -208,20 +232,81 @@ class ninfer(baseInference):
         for key in ("tools", "tool_choice"):
             if gen_cfg.get(key):
                 payload[key] = gen_cfg[key]
+        return payload
 
-        resp = self._http_client.post("/v1/chat/completions", json=payload)
+    def _stream(self, payload: dict[str, Any], cancel: threading.Event | None) -> RawOutput:
+        """SSE 拉取：每读一行检查 cancel，取消时退出 with 直接断开连接，引擎随即停止生成。
+        引擎若忽略 stream 而回整体 JSON，则按非流式解析，行为与旧实现一致。"""
+        mode: bool | None = None  # None=尚未判定；True=SSE；False=整体 JSON
+        body: list[str] = []
+        text: list[str] = []
+        think: list[str] = []
+        calls: dict[int, dict[str, Any]] = {}
+        finish, usage, events = "stop", {}, 0
+        with self._http_client.stream("POST", "/v1/chat/completions", json=payload) as resp:
+            if not resp.is_success:
+                detail = resp.read().decode("utf-8", "replace")
+                if "stream_options" in detail or "include_usage" in detail:
+                    raise _streamUnsupported(detail)
+                # ninfer 的报错体写明是哪个字段不合法，必须带出来，否则只剩一句 400 Bad Request
+                raise RuntimeError(f"ninfer-serve 返回 {resp.status_code}: {detail[:800]}")
+            for raw_line in resp.iter_lines():
+                if cancel is not None and cancel.is_set():
+                    raise GenerationCancelled("客户端已放弃该请求，已断开引擎连接")
+                line = raw_line.strip()
+                if not line or line.startswith(":"):  # 空行与 SSE 注释/心跳
+                    continue
+                if mode is None:  # 首行是 { 或 [ 说明引擎忽略了 stream，回的是整体 JSON
+                    mode = not line.startswith(("{", "["))
+                if not mode:
+                    body.append(line)
+                    continue
+                event = self._event(line)
+                if event is None:
+                    continue
+                events += 1
+                usage = event.get("usage") or usage
+                choice = (event.get("choices") or [{}])[0]
+                delta = choice.get("delta") or {}
+                text.append(delta.get("content") or "")
+                think.append(delta.get("reasoning_content") or "")
+                _merge_calls(delta.get("tool_calls"), calls)
+                finish = choice.get("finish_reason") or finish
+
+        if not mode:  # 引擎没按 SSE 回：整体 JSON 解析
+            return self._parse(json.loads("\n".join(body)))
+        if not usage and not self._stream_usage_warned:
+            self._stream_usage_warned = True
+            warn("[ninfer-serve] 流式响应未带 usage，token 统计按事件数近似")
+        merged = [calls[index] for index in sorted(calls)]
+        for call in merged:
+            call["id"] = call.get("id") or f"call_{uuid.uuid4().hex[:8]}"
+        cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens")
+        return RawOutput(
+            text="".join(text),
+            tokens=int(usage.get("completion_tokens") or events),
+            prompt_tokens=int(usage.get("prompt_tokens") or 0),
+            calls=merged,
+            finish_reason=finish,
+            cached_tokens=int(cached if cached is not None else -1),
+            reasoning="".join(think),
+        )
+
+    def _post(self, payload: dict[str, Any]) -> RawOutput:
+        body = {k: v for k, v in payload.items() if k != "stream_options"} | {"stream": False}
+        resp = self._http_client.post("/v1/chat/completions", json=body)
         if not resp.is_success:
-            # ninfer 的报错体写明是哪个字段不合法，必须带出来，否则只剩一句 400 Bad Request
             raise RuntimeError(f"ninfer-serve 返回 {resp.status_code}: {resp.text[:800]}")
-        data = resp.json()
+        return self._parse(resp.json())
 
+    @staticmethod
+    def _parse(data: dict[str, Any]) -> RawOutput:
         choice = data["choices"][0]
         message = choice.get("message") or {}
         usage = data.get("usage") or {}
         cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens")
         if cached is None:
             cached = (data.get("timings") or {}).get("cache_n", -1)
-
         return RawOutput(
             text=str(message.get("content") or ""),
             tokens=int(usage.get("completion_tokens", 0)),
@@ -231,3 +316,14 @@ class ninfer(baseInference):
             cached_tokens=int(cached),
             reasoning=str(message.get("reasoning_content") or ""),
         )
+
+    @staticmethod
+    def _event(line: str) -> dict[str, Any] | None:
+        """SSE 一行 -> JSON 事件；[DONE]、注释行、坏行都返回 None。"""
+        body = line[5:].strip() if line.startswith("data:") else line
+        if not body or body == "[DONE]":
+            return None
+        try:
+            return json.loads(body)
+        except json.JSONDecodeError:
+            return None

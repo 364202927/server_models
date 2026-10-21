@@ -1,5 +1,5 @@
 {
-  "_comment": "这是一个model模版文件,team是同时加载一组模型,useVram默认kvcache占用4g显存,max_tokens上下文2g,",
+  "_comment": "这是一个model模版文件,team是同时加载一组模型,useVram默认kvcache占用4g显存,max_tokens上下文2g; generation.max_tokens=-1 表示按单槽剩余上下文动态给,正数表示上限",
   "template": {
     "team": { "mian": [ ], "sub": [ ] },
     "load": {
@@ -19,7 +19,7 @@
       "top_p": 0.95,
       "top_k": 50,
       "repetition_penalty": 1.05,
-      "max_tokens": 2048,
+      "max_tokens": -1,
       "stop": [ ],
       "system_prompt": ""
     }
