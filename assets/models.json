@@ -1,4 +1,4 @@
-﻿{
+{
   "defaults": {
     "sleepTime": 0,
     "server": {
@@ -49,7 +49,7 @@
     "qw3.8-nin-code": {
       "path": "D:/ai/models/Qwen3.8-27b-code/Qwen3.8-27B-Coder390-EfficientThink-Q4LynnStyle-Q8MTP.ninfer",
       "engine": "ninfer",
-      "launch": true,
+      "launch": false,
       "data_compression": "default",
       "load": {
         "mtp": true,
@@ -64,9 +64,11 @@
         "dtype": "bfloat16"
       },
       "generation": {
-        "temperature": 0.3,
+        "temperature": 0.6,
         "top_p": 0.95,
-        "top_k": 50,
+        "top_k": 20,
+        "reasoning_effort": "",
+        "post_thinking": { "temperature": 0.1 },
         "repetition_penalty": 1.05,
         "stop": [],
         "system_prompt": ""

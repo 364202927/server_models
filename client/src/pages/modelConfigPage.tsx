@@ -1,9 +1,11 @@
 import React, { useEffect, useState } from "react";
-import { Save, Plus, Trash2 } from "lucide-react";
+import { FolderOpen, Play, Power, Save, Plus, Trash2 } from "lucide-react";
 import { useAppStore } from "../store/useAppStore";
 import { ConfigFields, FieldGroup, ValueField, isPlainObject, type Json } from "../components/configFields";
 import { ENGINE_OPTIONS, FIELD_OPTIONS } from "../lib/configOptions";
 import { effectiveOf, engineOf, inheritedOf, overridesOf, type Section } from "../lib/modelConfig";
+import { isTauri, pickDirectory } from "../lib/bridge";
+import { ADMIN, gatewayState } from "../lib/gateway";
 
 type Tab = "models" | "settings";
 
@@ -11,14 +13,17 @@ const TAB_LABELS: Record<Tab, string> = { models: "配置", settings: "设定" }
 const SECTIONS: Section[] = ["load", "generation"];
 const FILE_NAMES: Record<Tab, string> = { models: "models.json", settings: "modelSetting.json" };
 
-/** 菜单项：key 对应数据键，alert 为红字高亮（launch 为 true 的模型） */
+/** 菜单项：key 对应数据键，running 为绿字高亮（后端状态 RUNNING） */
 interface MenuItem {
   key: string;
-  alert?: boolean;
+  running?: boolean;
 }
 
 /** 首项“默认设置”在 models.json 对应 defaults，在 modelSetting.json 对应 template */
 const DEFAULT_KEY: Record<Tab, string> = { models: "defaults", settings: "template" };
+
+/** 已占用显存的状态：RUNNING 或休眠驻留，均允许卸载 */
+const LOADED_STATES = new Set(["RUNNING", "SLEEPING_RAM"]);
 
 const copyOf = (v: unknown): Json => JSON.parse(JSON.stringify(v ?? {}));
 
@@ -41,13 +46,14 @@ const engineKeysOf = (settings: Json): string[] =>
   Object.keys(settings).filter((k) => k !== "template" && !k.startsWith("_") && isPlainObject(settings[k]));
 
 export const ModelConfigPage: React.FC = () => {
-  const { settings, models, saveLocalConfig } = useAppStore();
+  const { settings, models, processes, saveLocalConfig, sendAdminCmd, pollStatusAndLogs } = useAppStore();
   const [tab, setTab] = useState<Tab>("models");
   const [selected, setSelected] = useState("");
   const [draftModels, setDraftModels] = useState<Json>({});
   const [draftSettings, setDraftSettings] = useState<Json>({});
   const [newName, setNewName] = useState("");
   const [tip, setTip] = useState("");
+  const [runBusy, setRunBusy] = useState(false);
 
   // 两份草稿分别同步：保存其中一个文件时，不覆盖另一个尚未保存的修改
   useEffect(() => {
@@ -63,9 +69,13 @@ export const ModelConfigPage: React.FC = () => {
   const modelIds = Object.keys(modelMap);
   const engines = engineKeysOf(draftSettings);
 
-  // 左侧菜单：配置页为 defaults + models.json 中的模型（launch 为 true 红字），设定页为 template + 引擎
+  /** 后端 1001 回包里的模型状态，未加载或网关不可达时为 UNLOADED */
+  const stateOf = (id: string): string => processes.find((p) => p.model === id)?.state ?? "UNLOADED";
+  const isLoaded = (id: string) => LOADED_STATES.has(stateOf(id));
+
+  // 左侧菜单：配置页为 defaults + models.json 中的模型（运行中绿字），设定页为 template + 引擎
   const menu: MenuItem[] = tab === "models"
-    ? [{ key: "defaults" }, ...modelIds.map((id) => ({ key: id, alert: modelMap[id]?.launch === true }))]
+    ? [{ key: "defaults" }, ...modelIds.map((id) => ({ key: id, running: stateOf(id) === "RUNNING" }))]
     : [{ key: "template" }, ...engines.map((name) => ({ key: name }))];
   const activeKey = menu.some((i) => i.key === selected) ? selected : menu[0].key;
   const isDefault = activeKey === DEFAULT_KEY[tab];
@@ -118,17 +128,48 @@ export const ModelConfigPage: React.FC = () => {
     setNewName("");
   };
 
-  const removeItem = () => {
+  /** 删除模型立即写回 models.json（连同草稿里其他未保存的修改一并落盘） */
+  const removeItem = async () => {
     if (tab === "models") {
       const next = { ...modelMap };
       delete next[activeKey];
-      setDraftModels({ ...draftModels, models: next });
-    } else {
-      const next = { ...draftSettings };
-      delete next[activeKey];
-      setDraftSettings(next);
+      const nextModels = { ...draftModels, models: next };
+      setDraftModels(nextModels);
+      setSelected("");
+      const ok = await saveLocalConfig("models.json", nextModels);
+      setTip(ok ? "✅ 已从 models.json 删除" : "❌ 删除后写入 models.json 失败");
+      return;
     }
+    const next = { ...draftSettings };
+    delete next[activeKey];
+    setDraftSettings(next);
     setSelected("");
+  };
+
+  /** 激活 / 卸载当前模型，指令返回后立即刷新一次状态 */
+  const toggleModelRun = async () => {
+    const unload = isLoaded(activeKey);
+    setRunBusy(true);
+    try {
+      const res = await sendAdminCmd(unload ? ADMIN.unload : ADMIN.ensureLoaded, null, activeKey);
+      setTip(res ? (unload ? "✅ 已卸载模型" : "✅ 模型已激活") : `❌ 模型操作失败: ${gatewayState.lastError}`);
+      await pollStatusAndLogs();
+    } finally {
+      setRunBusy(false);
+    }
+  };
+
+  const choosePath = async () => {
+    if (!isTauri()) {
+      setTip("❌ 目录选择仅在桌面端可用");
+      return;
+    }
+    try {
+      const dir = await pickDirectory();
+      if (dir) setItem({ ...item, path: dir });
+    } catch (err) {
+      setTip(`❌ 选择目录失败: ${err}`);
+    }
   };
 
   const isModel = tab === "models" && activeKey !== "defaults";
@@ -157,20 +198,49 @@ export const ModelConfigPage: React.FC = () => {
   const renderBasics = () => {
     if (!isModel) return null;
     return (
-      <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-4">
-        <div className="flex flex-col gap-1 min-w-0">
-          <span className="font-mono text-xs text-slate-400">modelName</span>
-          <span className="truncate rounded border border-slate-800 bg-slate-950 px-2 py-1.5 font-mono text-xs text-blue-300">
-            {activeKey}
-          </span>
-        </div>
+      <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
         <ValueField name="engine" value={item.engine} options={FIELD_OPTIONS.engine} plain={false} onChange={(v) => setItem({ ...item, engine: v })} />
         <ValueField name="launch" value={item.launch} options={FIELD_OPTIONS.launch} plain={false} onChange={(v) => setItem({ ...item, launch: v })} />
         <ValueField name="data_compression" value={item.data_compression} options={FIELD_OPTIONS.data_compression} plain={false} onChange={(v) => setItem({ ...item, data_compression: v })} />
-        <div className="md:col-span-2 xl:col-span-4">
-          <ValueField name="path" value={item.path} options={[]} plain onChange={(v) => setItem({ ...item, path: v })} />
+        <div className="md:col-span-3">
+          <ValueField
+            name="path"
+            value={item.path}
+            options={[]}
+            plain
+            onChange={(v) => setItem({ ...item, path: v })}
+            trailing={
+              <button
+                onClick={choosePath}
+                title="选择模型目录"
+                className="flex shrink-0 items-center gap-1 rounded border border-slate-700 bg-slate-800 px-2 py-1.5 text-xs text-slate-300 hover:bg-slate-700"
+              >
+                <FolderOpen size={14} />
+                <span>选择目录</span>
+              </button>
+            }
+          />
         </div>
       </div>
+    );
+  };
+
+  /** 标题旁的模型开关：RUNNING 显示卸载，其余显示激活，加载/请求中禁用 */
+  const renderRunButton = () => {
+    if (!isModel) return null;
+    const loaded = isLoaded(activeKey);
+    const loading = stateOf(activeKey) === "LOADING";
+    return (
+      <button
+        onClick={toggleModelRun}
+        disabled={runBusy || loading}
+        className={`flex shrink-0 items-center gap-1 rounded-lg px-2.5 py-1 text-xs font-medium text-white disabled:opacity-50 ${
+          loaded ? "bg-rose-600 hover:bg-rose-500" : "bg-emerald-600 hover:bg-emerald-500"
+        }`}
+      >
+        {loaded ? <Power size={13} /> : <Play size={13} />}
+        <span>{runBusy ? "处理中…" : loading ? "加载中…" : loaded ? "卸载模型" : "激活模型"}</span>
+      </button>
     );
   };
 
@@ -226,7 +296,7 @@ export const ModelConfigPage: React.FC = () => {
           <nav className="max-h-[60vh] space-y-1 overflow-y-auto">
             {menu.map((m) => {
               const active = m.key === activeKey;
-              const color = m.alert ? "text-rose-400" : active ? "text-white" : "text-slate-300";
+              const color = m.running ? "text-emerald-400" : active ? "text-white" : "text-slate-300";
               const label = m.key === DEFAULT_KEY[tab] ? "默认设置" : m.key;
               return (
                 <button
@@ -267,9 +337,12 @@ export const ModelConfigPage: React.FC = () => {
         {/* 右：标题栏（保存/删除）+ 所选项数据 */}
         <section key={`${tab}:${activeKey}`} className="min-w-0 flex-1 space-y-4">
           <div className="flex items-center justify-between gap-3">
-            <h3 className="truncate font-mono text-sm font-bold text-blue-300">
-              {isDefault ? "默认设置" : activeKey}
-            </h3>
+            <div className="flex min-w-0 items-center gap-3">
+              <h3 className="truncate font-mono text-sm font-bold text-blue-300">
+                {isDefault ? "默认设置" : activeKey}
+              </h3>
+              {renderRunButton()}
+            </div>
             <div className="flex shrink-0 items-center gap-3">
               {tip && <span className={`text-xs ${tip.startsWith("❌") ? "text-rose-400" : "text-emerald-400"}`}>{tip}</span>}
               {!isDefault && (

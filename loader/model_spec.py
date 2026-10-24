@@ -159,16 +159,17 @@ class modelSpec:
                 self.error = str(exc)
                 raise RuntimeError(f"模型 {self.model_id} 加载失败: {exc}") from exc
 
-            # 加载已成功：显存估算与落盘属于附带动作，不再放进失败清理的范围，也只在估算值真的变了才写盘
-            measured = self.update_estimated_vram(used_before, used_after, force=self.needs_remeasure)
+            # 加载已成功：显存估算只保留在内存（供显存准入与状态展示），不再自动写回 models.json
+            self.update_estimated_vram(used_before, used_after, force=self.needs_remeasure)
             self.state, self.error, self.last_used_at, self.needs_remeasure = (
                 "RUNNING",
                 None,
                 time.time(),
                 False,
             )
-            if measured:
-                self.persist()
+            # 加载后自动落盘已停用，如需恢复取消下面两行注释
+            # if measured:
+            #     self.persist()
             return self
 
     def _wake(self) -> bool:

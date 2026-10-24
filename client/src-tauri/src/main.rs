@@ -7,7 +7,9 @@ use std::path::PathBuf;
 use std::os::windows::process::CommandExt;
 #[cfg(windows)]
 use std::process::{Command, Stdio};
-use tauri::WebviewWindowBuilder;
+use tauri::menu::{Menu, MenuItem};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri::{Manager, WebviewWindowBuilder};
 
 // 前端允许读写的配置文件白名单，防止传入任意路径
 const CONFIG_FILES: [&str; 2] = ["modelSetting.json", "models.json"];
@@ -259,6 +261,54 @@ fn write_json_config(filename: String, content: String) -> Result<(), String> {
     fs::rename(&temp, &target).map_err(|e| format!("覆盖配置文件失败: {}", e))
 }
 
+/// 目录选择：复用系统 FolderBrowserDialog，避免为单个功能引入 dialog 插件依赖
+/// 选中结果写入临时文件再读回，规避控制台编码对中文路径的影响；取消选择返回 None
+#[tauri::command]
+async fn pick_directory() -> Result<Option<String>, String> {
+    #[cfg(not(windows))]
+    return Ok(None);
+
+    #[cfg(windows)]
+    {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let out_file = std::env::temp_dir().join(format!("sm-pick-{}-{}.txt", std::process::id(), stamp));
+        // 单引号字符串里的 ' 需要写成 ''，防止临时路径带引号时脚本被截断
+        let target = out_file.display().to_string().replace('\'', "''");
+        let script = format!(
+            "Add-Type -AssemblyName System.Windows.Forms\n\
+             $dialog = New-Object System.Windows.Forms.FolderBrowserDialog\n\
+             $dialog.Description = '选择模型路径'\n\
+             if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {{\n\
+                [System.IO.File]::WriteAllText('{target}', $dialog.SelectedPath, [System.Text.UTF8Encoding]::new($false))\n\
+             }}"
+        );
+
+        let output = tauri::async_runtime::spawn_blocking(move || {
+            Command::new("powershell.exe")
+                .args(["-NoProfile", "-STA", "-NonInteractive", "-Command", &script])
+                .creation_flags(CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT)
+                .output()
+        })
+        .await
+        .map_err(|e| format!("目录选择任务异常: {e}"))?
+        .map_err(|e| format!("启动目录选择失败: {e}"))?;
+
+        let selected = fs::read_to_string(&out_file)
+            .ok()
+            .map(|text| text.trim().to_string())
+            .filter(|text| !text.is_empty());
+        let _ = fs::remove_file(&out_file);
+
+        if !output.status.success() {
+            return Err(format!("目录选择失败: {}", decode_output(&output.stderr)));
+        }
+        Ok(selected)
+    }
+}
+
 /// release 构建无控制台，启动失败时看不到原因，这里把 panic 与启动现场落盘便于排查
 #[cfg(windows)]
 fn install_crash_logger() {
@@ -322,6 +372,60 @@ fn build_main_window(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Err
     Ok(())
 }
 
+/// 从托盘恢复主窗口：必须先解除最小化，否则窗口显示出来仍是最小化状态
+fn show_main_window(app: &tauri::AppHandle) {
+    let Some(window) = app.get_webview_window("main") else { return };
+    let _ = window.unminimize();
+    let _ = window.show();
+    let _ = window.set_focus();
+}
+
+/// 托盘“退出”复用窗口关闭流程，前端 onCloseRequested 负责保存日志、释放显存、停后端
+fn request_quit(app: &tauri::AppHandle) {
+    let Some(window) = app.get_webview_window("main") else {
+        app.exit(0);
+        return;
+    };
+    let _ = window.close();
+}
+
+/// 托盘图标：左键单击恢复窗口，右键菜单提供“显示主界面 / 退出”
+fn setup_tray(app: &mut tauri::App) -> tauri::Result<()> {
+    let show = MenuItem::with_id(app, "show", "显示主界面", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&show, &quit])?;
+
+    let mut tray = TrayIconBuilder::with_id("main-tray")
+        .tooltip("SERVER MODELS")
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, event| match event.id.as_ref() {
+            "show" => show_main_window(app),
+            "quit" => request_quit(app),
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            // 只响应左键抬起，避免右键菜单与单击恢复互相干扰
+            let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            else {
+                return;
+            };
+            show_main_window(tray.app_handle());
+        });
+
+    // 复用 exe 内嵌的应用图标；取不到时仍建托盘，至少右键菜单可用
+    if let Some(icon) = app.default_window_icon() {
+        tray = tray.icon(icon.clone());
+    }
+
+    tray.build(app)?;
+    Ok(())
+}
+
 fn main() {
     #[cfg(windows)]
     install_crash_logger();
@@ -329,16 +433,22 @@ fn main() {
     tauri::Builder::default()
         // 单实例守卫必须最先注册：重复启动时新进程只把已有窗口提到前台，随后自行退出
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
-            use tauri::Manager;
-
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = window.unminimize();
-                let _ = window.show();
-                let _ = window.set_focus();
-            }
+            show_main_window(app);
         }))
+        // 最小化即隐藏到托盘：Windows 最小化会触发 Resized，此时窗口已是最小化状态
+        .on_window_event(|window, event| {
+            if window.label() != "main" {
+                return;
+            }
+            if let tauri::WindowEvent::Resized(_) = event {
+                if window.is_minimized().unwrap_or(false) {
+                    let _ = window.hide();
+                }
+            }
+        })
         .setup(|app| {
             build_main_window(app)?;
+            setup_tray(app)?;
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -346,7 +456,8 @@ fn main() {
             stop_wsl_backend,
             read_json_config,
             write_json_config,
-            read_backend_log
+            read_backend_log,
+            pick_directory
         ])
         .run(tauri::generate_context!())
         .expect("Tauri 运行异常");

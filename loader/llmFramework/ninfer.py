@@ -88,6 +88,7 @@ class ninfer(baseInference):
     _MAX_MTP_DRAFT = 15  # --draft-tokens 取值 1..15
     _MODEL_ID = "default"  # 请求里的 model 必须与 --model-id 一致
     _TOP_K_MAX = 20  # 沿用原实现的钳制值（文档未给出上限，以 ninfer-serve --help 为准）
+    _EFFORTS = frozenset({"none", "minimal", "low", "medium", "high", "xhigh", "max"})  # 引擎只认这几个 effort 值
     _SUPPORTED_KV_DTYPES = {"bf16", "int8", "fp8", "rk8v4", "rk4v4", "rk4v4-e8", "rk2v4-e8", "nvfp4", "k8v4"}
 
     @property
@@ -219,12 +220,20 @@ class ninfer(baseInference):
             "max_tokens": int(gen_cfg.get("max_tokens", 2048)),
         }
 
-        # 仅透传文档列出的采样字段；min_p / repetition_penalty 不在 HTTP 字段表内，不转发
+        # 仅透传文档列出的采样字段；repetition_penalty 不在 HTTP 字段表内，不转发
         for key in ("temperature", "top_p", "presence_penalty", "frequency_penalty"):
             if gen_cfg.get(key) is not None:
                 payload[key] = gen_cfg[key]
         if gen_cfg.get("top_k") is not None:
             payload["top_k"] = max(0, min(int(gen_cfg["top_k"]), self._TOP_K_MAX))
+        if gen_cfg.get("min_p") is not None:  # 引擎只接受 [0,1]，越界直接 400
+            payload["min_p"] = min(max(float(gen_cfg["min_p"]), 0.0), 1.0)
+        effort = str(gen_cfg.get("reasoning_effort") or "").lower()
+        if effort in self._EFFORTS:  # 模板不认识的档位由引擎折算到最近档，非法值直接 400，故先过滤
+            payload["reasoning_effort"] = effort
+        post = gen_cfg.get("post_thinking")
+        if isinstance(post, dict) and post:  # 思考闭合后切到该采样档；空对象等于用引擎预设
+            payload["post_thinking"] = post
 
         stop = [s for s in (gen_cfg.get("stop") or []) if s][:4]
         if stop:

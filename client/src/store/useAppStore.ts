@@ -35,7 +35,7 @@ interface AppState {
   loadLocalConfigs: () => Promise<void>;
   loadRemoteModels: () => Promise<void>;
   saveLocalConfig: (filename: "modelSetting.json" | "models.json", data: any) => Promise<boolean>;
-  sendAdminCmd: (messageId: number, args?: any) => Promise<any>;
+  sendAdminCmd: (messageId: number, args?: any, model?: string) => Promise<any>;
   triggerEngineToggle: () => Promise<void>;
   pollStatusAndLogs: () => Promise<void>;
   clearLogs: () => void;
@@ -119,20 +119,27 @@ export const useAppStore = create<AppState>((set, get) => ({
     }
   },
 
-  sendAdminCmd: async (messageId, args = null) => {
+  sendAdminCmd: async (messageId, args = null, model = "") => {
     const { settings } = get();
     try {
       const res = await fetch(`${gatewayBase(settings)}/v1/chat/completions`, {
         method: "POST",
         headers: gatewayHeaders(settings),
-        body: JSON.stringify({ message_id: messageId, args }),
+        // 1005/1006 等单模型指令必须带 model，全局指令留空即可
+        body: JSON.stringify(model ? { message_id: messageId, args, model } : { message_id: messageId, args }),
       });
       if (!res.ok) {
         gatewayState.lastError = `HTTP ${res.status}`;
         return null;
       }
+      const body = await res.json();
+      // 管理指令的业务失败同样是 HTTP 200，按信封 status 判定，原因交给调用方展示
+      if (body?.status === "error") {
+        gatewayState.lastError = String(body.response ?? "指令失败");
+        return null;
+      }
       gatewayState.lastError = "";
-      return unwrapAdmin(await res.json());
+      return unwrapAdmin(body);
     } catch (err) {
       gatewayState.lastError = String(err);
       return null;

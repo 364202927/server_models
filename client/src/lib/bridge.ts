@@ -8,3 +8,6 @@ export const desktopInvoke = <T = void>(cmd: string, args?: Record<string, unkno
   if (!isTauri()) return Promise.reject(new Error("当前不是桌面端环境"));
   return invoke<T>(cmd, args);
 };
+
+/** 弹出系统目录选择框，取消返回 null；非桌面端直接拒绝 */
+export const pickDirectory = (): Promise<string | null> => desktopInvoke<string | null>("pick_directory");

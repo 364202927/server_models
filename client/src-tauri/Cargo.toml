@@ -9,7 +9,9 @@ edition = "2021"
 tauri-build = { version = "=2.7.0", features = [] }
 
 [dependencies]
-tauri = { version = "=2.12.0", features = [] }
+# tray-icon：最小化后隐藏到系统托盘，需要 tray 能力
+# 图标直接复用 exe 内嵌的应用图标资源（default_window_icon），无需 image 解码 feature
+tauri = { version = "=2.12.0", features = ["tray-icon"] }
 tauri-plugin-single-instance = "2.5.4"
 
 # 没有这个 feature 时 tauri 会按 dev 模式编译：不内嵌 dist，改为连 http://localhost:1420

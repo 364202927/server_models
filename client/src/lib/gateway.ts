@@ -6,6 +6,8 @@ export const ADMIN = {
   status: 1001,
   hardware: 1002,
   models: 1003,
+  unload: 1005,
+  ensureLoaded: 1006,
   logs: 1008,
   autolaunch: 1009,
   unloadAll: 1010,

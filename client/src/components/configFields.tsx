@@ -36,10 +36,12 @@ interface ValueFieldProps {
   plain: boolean;
   onChange: (next: unknown) => void;
   onRemove?: () => void;
+  /** 输入框右侧的操作按钮（如路径选择） */
+  trailing?: React.ReactNode;
 }
 
 /** 单个字段：除 plain 外均为下拉可输入（input + datalist） */
-export const ValueField: React.FC<ValueFieldProps> = ({ name, value, options, plain, onChange, onRemove }) => {
+export const ValueField: React.FC<ValueFieldProps> = ({ name, value, options, plain, onChange, onRemove, trailing }) => {
   const inputId = useId();
   const listId = `${inputId}-list`;
   const [kind] = useState(() => kindOf(name, value));
@@ -70,14 +72,17 @@ export const ValueField: React.FC<ValueFieldProps> = ({ name, value, options, pl
           </button>
         )}
       </div>
-      <input
-        id={inputId}
-        list={hasList ? listId : undefined}
-        value={text}
-        onChange={(e) => handleInput(e.target.value)}
-        placeholder={plain ? "" : kind === "list" ? "多个值用逗号分隔" : "可下拉选择，也可直接输入"}
-        className="w-full min-w-0 rounded border border-slate-800 bg-slate-950 px-2 py-1.5 font-mono text-xs text-slate-200 focus:border-blue-500 focus:outline-none"
-      />
+      <div className="flex items-center gap-2">
+        <input
+          id={inputId}
+          list={hasList ? listId : undefined}
+          value={text}
+          onChange={(e) => handleInput(e.target.value)}
+          placeholder={plain ? "" : kind === "list" ? "多个值用逗号分隔" : "可下拉选择，也可直接输入"}
+          className="w-full min-w-0 flex-1 rounded border border-slate-800 bg-slate-950 px-2 py-1.5 font-mono text-xs text-slate-200 focus:border-blue-500 focus:outline-none"
+        />
+        {trailing}
+      </div>
       {hasList && (
         <datalist id={listId}>
           {options.map((o) => <option key={o} value={o} />)}

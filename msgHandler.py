@@ -3,9 +3,11 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 import time
 import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 import httpx
@@ -20,9 +22,35 @@ from .utils.hardware import detect_hardware
 
 _ADMIN_IDS = {e.value for e in adim_ID}
 
+# 请求参数导出：客户端报上下文/缓存类错误时，靠这份快照复现“它到底发了什么”
+_DUMP_DIR = Path(__file__).resolve().parent / "assets" / "runtime" / "req-dump"
+_DUMP_ON = os.getenv("AI_DUMP_REQ", "1").strip().lower() not in {"0", "false", "no", "off"}
+_DUMP_MAX = 200  # 只留最近多少份，避免长跑把磁盘写满
+
 
 def _digest(obj: Any) -> str:
     return hashlib.md5(json.dumps(obj, ensure_ascii=False, sort_keys=True).encode()).hexdigest()[:8]
+
+
+def _save_snapshot(snapshot: dict[str, Any]) -> None:
+    """把一次聊天请求的入参（含生成的 usage/错误）落盘，路径与文件名里带 task_id 便于对日志。"""
+    if not _DUMP_ON:
+        return
+    try:
+        _DUMP_DIR.mkdir(parents=True, exist_ok=True)
+        files = sorted(_DUMP_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime)
+        excess = len(files) - _DUMP_MAX + 1
+        for path in files[: max(0, excess)]:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+        name = f"{time.strftime('%Y%m%d-%H%M%S')}-{snapshot['task_id']}.json"
+        (_DUMP_DIR / name).write_text(json.dumps(snapshot, ensure_ascii=False, indent=1, default=str), encoding="utf-8")
+    except OSError as exc:  # 只有磁盘读写会失败，记一笔即可，不影响本次回复
+        warn("[导出] 请求参数快照写入失败", type(exc).__name__, str(exc))
+        return
+    info("[导出] 请求参数快照", name)
 
 
 @dataclass
@@ -235,9 +263,18 @@ class msgHandler:
             await pipe.ensure([spec], category.is_main or not pipe.hasMain(), args)
 
         self._log_request(task, args)
+        snapshot = self._snapshot(task, category, args)
         task.fail_code = 502
         wait_s = task.timeout if task.timeout and task.timeout > 0 else None
-        result = await asyncio.wait_for(pipe.run(category, task.messages, args), wait_s)
+        try:
+            result = await asyncio.wait_for(pipe.run(category, task.messages, args), wait_s)
+        except Exception as exc:  # 只为把失败原因一并写进快照，异常继续上抛，由 _run 统一转错误码
+            snapshot["error"] = f"{type(exc).__name__}: {exc}"
+            _save_snapshot(snapshot)
+            raise
+        usage = self._usage(result)
+        snapshot["usage"] = usage
+        _save_snapshot(snapshot)
 
         think_output = str(models_mgr.settings.get("server", {}).get("think_output", "field"))
         reasoning, content = result.reasoning or "", result.text
@@ -258,7 +295,37 @@ class msgHandler:
             "model": task.model,
             "choices": [{"index": 0, "message": message, "finish_reason": "tool_calls" if tool_calls else result.finish_reason}],
             "warnings": result.warnings,
-            "usage": self._usage(result),
+            "usage": usage,
+        }
+
+    @staticmethod
+    def _snapshot(task: _taskItem, category: Any, args: dict[str, Any]) -> dict[str, Any]:
+        """请求快照：参数全量 + 上下文计数 + 逐条指纹，用于复现客户端报的“上下文/缓存”错误。"""
+        tools = args.get("tools") or []
+        return {
+            "time": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "task_id": task.task_id,
+            "source": task.source,
+            "client": task.client,
+            "model": task.model,
+            "timeout": task.timeout,
+            "category": {
+                "is_main": category.is_main,
+                "reason": category.reason,
+                "session_id": category.session_id,
+                "extended": category.extended,
+                "rewound": category.rewound,
+            },
+            "context": {
+                "messages": len(task.messages),
+                "roles": [m.get("role") for m in task.messages],
+                "chars": len(json.dumps(task.messages, ensure_ascii=False, default=str)),
+                "tools": len(tools),
+                "tool_names": [(t.get("function") or {}).get("name") for t in tools],
+                "digests": [_digest(m) for m in task.messages],
+            },
+            "params": args,
+            "messages": task.messages,
         }
 
     @staticmethod
